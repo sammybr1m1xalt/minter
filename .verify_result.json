@@ -1,0 +1,53 @@
+{
+  "timestamp": "2026-09-07 20:21:52 WAT",
+  "project_dir": "/home/anon/minter",
+  "total_checks": 11,
+  "passed": 11,
+  "failed": [],
+  "checks": [
+    {
+      "label": "tsc --noEmit clean",
+      "passed": true
+    },
+    {
+      "label": "tsc full build",
+      "passed": true
+    },
+    {
+      "label": "wizard.ts dotenv import+config before ethers import",
+      "passed": true
+    },
+    {
+      "label": "slug-resolver.ts: REST-primary + GraphQL-fallback",
+      "passed": true
+    },
+    {
+      "label": "No *** placeholders in src/",
+      "passed": true
+    },
+    {
+      "label": "resolveContractToSlug exported from slug-resolver",
+      "passed": true
+    },
+    {
+      "label": "resolveContractToSlug wired into wizard phase discovery",
+      "passed": true
+    },
+    {
+      "label": "e2e-test.cjs passes (27/27)",
+      "passed": true
+    },
+    {
+      "label": "dist/index.js loads without syntax error",
+      "passed": true
+    },
+    {
+      "label": "wizard.ts dotenv.path uses __dirname",
+      "passed": true
+    },
+    {
+      "label": "resolveContractToSlug(nftContract, ...) in phase discovery",
+      "passed": true
+    }
+  ]
+}
