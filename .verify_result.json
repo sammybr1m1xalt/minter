@@ -1,9 +1,12 @@
 {
-  "timestamp": "2026-09-07 20:21:52 WAT",
+  "timestamp": "2026-09-09 22:38:20 WAT",
   "project_dir": "/home/anon/minter",
   "total_checks": 11,
-  "passed": 11,
-  "failed": [],
+  "passed": 9,
+  "failed": [
+    "resolveContractToSlug wired into wizard phase discovery",
+    "resolveContractToSlug(nftContract, ...) in phase discovery"
+  ],
   "checks": [
     {
       "label": "tsc --noEmit clean",
@@ -31,7 +34,7 @@
     },
     {
       "label": "resolveContractToSlug wired into wizard phase discovery",
-      "passed": true
+      "passed": false
     },
     {
       "label": "e2e-test.cjs passes (27/27)",
@@ -47,7 +50,7 @@
     },
     {
       "label": "resolveContractToSlug(nftContract, ...) in phase discovery",
-      "passed": true
+      "passed": false
     }
   ]
 }

@@ -32,12 +32,30 @@ async function restCollectionBySlug(slugOrAddress: string, apiKey = ""): Promise
   }
   const json = (await res.json()) as any;
   if (json.errors && json.errors.length > 0) return null;
-  const c = json as any;
-  if (!c.address) return null;
+
+  // REST v2 /collections/{slug} returns:
+  //   { collection: "<slug>", contracts: [{ address, chain }], ... }
+  // not { slug, address, chain } as the old parser expected.
+  const collection = (json.collection ?? json.slug) as string | undefined;
+  const contracts = json.contracts;
+  let address = "";
+  let chainId = 0;
+  let chainIdentifier = "";
+  if (Array.isArray(contracts) && contracts.length > 0) {
+    const c = contracts[0] as any;
+    address = c.address as string || "";
+    chainIdentifier = (c.chain as string) || "";
+    // chain may be a string like "ethereum" or an object { identifier, networkId }
+    if (typeof c.chain === "object" && c.chain !== null) {
+      chainIdentifier = (c.chain.identifier as string) || chainIdentifier;
+      chainId = Number(c.chain.networkId || c.chain.chainId || 0);
+    }
+  }
+  if (!address) return null;
   return {
-    slug: c.slug ?? slugOrAddress,
-    address: c.address,
-    chain: c.chain ?? { identifier: "", networkId: 0 },
+    slug: collection ?? slugOrAddress,
+    address,
+    chain: { identifier: chainIdentifier, networkId: chainId },
   };
 }
 
@@ -181,14 +199,28 @@ export async function resolveContractToSlug(
   apiKey = "",
   timeoutMs = 10000
 ): Promise<string | null> {
-  // 1. REST v2 — sometimes OpenSea accepts CA directly
+  // REST v2 /collections/{slug or CA} returns:
+  //   { collection: "<slug>", contracts: [{ address, chain }], ... }
+  // not { slug, address } as the old parser expected.
   const headers: Record<string, string> = { accept: "application/json" };
   if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
   try {
     const res = await fetch(`${REST_URL}/${nftContract}`, { headers, signal: AbortSignal.timeout(timeoutMs) });
     if (res.ok) {
       const json = (await res.json()) as any;
-      if (json.slug) return json.slug;
+      if (json.errors && json.errors.length > 0) return null;
+      const collection = (json.collection ?? json.slug) as string | undefined;
+      if (collection) return collection;
+      // If it's a CA lookup that returned the collection object, also
+      // extract slug from contracts array as a fallback
+      const contracts = json.contracts;
+      if (Array.isArray(contracts) && contracts.length > 0) {
+        const c = contracts[0] as any;
+        const addr = (c.address as string) || "";
+        if (addr.toLowerCase() === nftContract.toLowerCase()) {
+          return collection ?? null;
+        }
+      }
     }
   } catch (err: any) {
     console.error("[resolveContractToSlug] REST failed:", err?.message || err);

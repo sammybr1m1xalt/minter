@@ -21,7 +21,6 @@ import {
 } from "./seadrop-onchain";
 import {
   fetchSignedPayload,
-  preFetchSignedPayloads,
   identifyAllowlistPreFetchCandidates,
   classifyMintMode,
   buildFcfsMintPlan,

@@ -450,25 +450,8 @@ export function identifyAllowlistPreFetchCandidates(
   const candidates: AllowlistPreFetchCandidate[] = [];
 
   for (const d of onChainDrops) {
-    // Skip public drops — they're fully on-chain, no pre-fetch needed.
-    // Use isPublicStage (which keys off stageType, not signed-data absence) so
-    // a signed/allowlist stage that happens to have null mintData is not
-    // misclassified as public.
     if (d.isPublicStage) continue;
-    // Skip drops that already have signed data — they're fireable now
     if (d.mintData && d.mintSignature) continue;
-
-    // Allowlist/OVR/token-gated drops with no mintData — need off-chain fetch
-    const merkleRoot = d.allowlistHash || null;
-    const feeRecipient = d.feeRecipient || null;
-
-    candidates.push({
-      drop: d,
-      merkleRoot,
-      feeRecipient,
-      needsAllowlistData: !!(merkleRoot || d.allowlistedAddresses.length > 0),
-      needsSignature: true, // signed/allowlist phases almost always need a signature
-    });
   }
 
   return candidates;
