@@ -1,15 +1,7 @@
-// ── Allowlist/FCFS/OVR branch (independent) ───────────────────────────────
-// Rewritten to:
-//   (a) Fetch ALL active phases for the collection, not just the first one
-//   (b) Show eligibility + allocation status for each phase
-//   (c) Poll current gas state and recommend settings
-//   (d) Let the user pick which phase to target (or auto-pick the best targetable one)
-//   (e) Handle "no OpenSea key available" gracefully — show what's possible
-//       without a key, and what would need a key
-
 import chalk from "chalk";
 import { Wallet, formatEther } from "ethers";
 import { ChainProfile, resolveChain } from "./chains";
+import { RunLogger } from "./logger";
 import {
   fetchAllActiveDrops,
   DropPhase,
@@ -24,16 +16,27 @@ import {
   GasRecommendation,
 } from "./fcfs-drops";
 import {
-  fetchFcfsSignedPayloadKeyOnly,
+  fetchOnChainDrops,
+  fetchSingleOnChainDrop,
+} from "./seadrop-onchain";
+import {
+  fetchSignedPayload,
+  preFetchSignedPayloads,
+  identifyAllowlistPreFetchCandidates,
+  classifyMintMode,
   buildFcfsMintPlan,
+  FcfsMintPlan,
   executeFcfsSnipe,
 } from "./fcfs-mint";
 import { getValidApiKey } from "./opensea-key";
 import {
   askText,
+  askHidden,
   askYesNo,
   closePrompts,
 } from "./prompt";
+import { resolveRpcsForChain } from "./rpc-resolver";
+import { parseNftLink } from "./nft-link";
 import {
   promptGasGwei,
   promptTiming,
@@ -44,6 +47,7 @@ import { formatRemaining, toIST } from "./time-format";
 // ── Main FCFS branch entry ──────────────────────────────────────────────────
 
 export async function runFcfsBranch(
+  log: RunLogger,
   walletKeys: string[],
   chainProfile: ChainProfile,
   chainKey: string,
@@ -52,6 +56,15 @@ export async function runFcfsBranch(
   rpcUrls: string[],
   target: { label: string },
 ): Promise<void> {
+  log.info("FCFS branch: started");
+  log.field("nftContract", nftContract);
+  log.field("chain", chainKey);
+  log.field("chainProfile", chainProfile.name);
+  log.field("quantity", quantity);
+  log.field("wallet_count", walletKeys.length);
+  log.field("rpc_count", rpcUrls.length);
+  log.field("api_key_set", !!(process.env.OPENSEA_API_KEY));
+
   const wallets = walletKeys.map((k) => new Wallet(k));
   const ourWallet = wallets[0].address.toLowerCase();
 
@@ -82,21 +95,48 @@ export async function runFcfsBranch(
 
   if (inventory.drops.length === 0) {
     console.log(chalk.yellow(`\n  ⚠ No active phases found for ${nftContract}.`));
-    console.log(chalk.gray(`    Possible reasons:`));
-    console.log(chalk.gray(`    • The collection has no OpenSea-managed phases`));
-    console.log(chalk.gray(`    • The API key doesn't have access (try a different key)`));
-    console.log(chalk.gray(`    • The collection isn't on this chain`));
-    console.log(chalk.gray(`    • OpenSea rate-limited the request\n`));
 
-    if (!apiKey) {
-      console.log(chalk.yellow(`  Try: get an OpenSea free API key and re-run.`));
-      console.log(chalk.gray(`    Without a key, OpenSea may not return phase data.\n`));
+    // When OpenSea REST/GraphQL drops aren't available, fall through to the
+    // on-chain SEADROP check. Some collections (like de-bots) register their
+    // phases on-chain rather than through OpenSea's drops API.
+    console.log(chalk.gray(`    OpenSea REST drops 404'd — trying on-chain SEADROP fallback...`));
+
+    const onChainDrops = await fetchOnChainDrops(nftContract, 12000);
+    if (onChainDrops.length > 0) {
+      console.log(chalk.green(`  ✓ Found ${onChainDrops.length} on-chain phase(s).`));
+      // Create a synthetic inventory from on-chain data
+      inventory.drops = onChainDrops;
+      inventory.fetchedAt = Date.now();
+      inventory.apiKeyUsed = false;
+    } else {
+      console.log(chalk.yellow(`\n  ⚠ No on-chain phases found either.`));
+
+      if (!apiKey) {
+        console.log(chalk.yellow(`  Try: get an OpenSea free API key and re-run.`));
+
+        // For collections like de-bots that use signed minting, also check
+        // the on-chain singleton directly for this specific contract
+        console.log(chalk.gray(`    Also checking single-contract on-chain drop...`));
+        const singleDrop = await fetchSingleOnChainDrop(nftContract, 8000);
+        if (singleDrop) {
+          console.log(chalk.green(`  ✓ Found on-chain drop for this contract.`));
+          inventory.drops = [singleDrop];
+          inventory.fetchedAt = Date.now();
+          inventory.apiKeyUsed = false;
+        }
+      }
+
+      if (inventory.drops.length === 0) {
+        console.log(chalk.gray(`    The collection may not have any OpenSea-managed phases,`));
+        console.log(chalk.gray(`    or the API key doesn't have access to them.`));
+        console.log(chalk.gray(`    Try the public mint path, or check the collection page manually.\n`));
+
+        // Don't throw — fall through to let the user proceed to public mint
+        // or other paths. The FCFS wizard is one option; public mint is another.
+        console.log(chalk.yellow(`  ⚠ No targetable phases. Falling through to public mint path...\n`));
+        return; // exit the wizard function gracefully
+      }
     }
-
-    throw new Error(
-      `No active phases found for ${nftContract}. ` +
-        `Either the collection has no OpenSea-managed phases, or the API key doesn't have access.`,
-    );
   }
 
   // ── Step 1b: Try to detect the actual chain from OpenSea's response ──────
@@ -197,6 +237,10 @@ export async function runFcfsBranch(
   // ── Step 7: Fetch the signed payload for the selected phase ──────────────
   // The inventory only tells us a phase EXISTS and is targetable. To actually
   // mint, we need the per-wallet signed payload. Fetch it now.
+  //
+  // This step is OPTIONAL: if the signed payload can't be fetched (no key,
+  // rate-limited, etc.), we show what we know and let the user decide whether
+  // to skip this phase and try another, or abort.
 
   console.log(chalk.bold.white(`\n  Fetching signed mint data for selected phase...`));
   console.log(chalk.gray(`    Phase: ${selectedDrop.name || `phase #${selectedIndex + 1}`}`));
@@ -204,12 +248,12 @@ export async function runFcfsBranch(
   console.log(chalk.gray(`    Drop ID: ${selectedDrop.dropId}`));
 
   // The inventory may have told us the mintData/mintSignature exist, but the
-  // actual fetchFcfsSignedPayloadKeyOnly call is what gets the wallet-specific
+  // actual fetchSignedPayload call is what gets the wallet-specific
   // signature. The inventory's mintData is the generic template; the real call
   // needs to go through OpenSea's mintSigned flow.
 
   // Try with the key first
-  const payload = await fetchFcfsSignedPayloadKeyOnly(
+  const payload = await fetchSignedPayload(
     nftContract,
     quantity,
     apiKey || undefined,
@@ -229,8 +273,10 @@ export async function runFcfsBranch(
       console.log(chalk.gray(`    Without a key, OpenSea won't return signed mint data.\n`));
     }
 
-    // Even without a payload, show what we know about the phase so the user
-    // has something useful
+    // ── Optional: allow the user to skip this phase and try the next one ─────
+    // Instead of throwing, offer to pick a different phase. This is important
+    // for allowlist/OVR phases where the signed payload may not be available
+    // without a valid key, but public mint phases might still be fireable.
     console.log(chalk.bold.white(`\n  What we know about this phase:`));
     console.log(chalk.gray(`    name:       ${selectedDrop.name || "unnamed"}`));
     console.log(chalk.gray(`    type:       ${selectedDrop.type || "unknown"}`));
@@ -247,6 +293,23 @@ export async function runFcfsBranch(
       console.log(chalk.gray(`    allowlist hash: ${selectedDrop.allowlistHash.slice(0, 16)}...`));
     }
     console.log();
+
+    // Check if there are other targetable phases we could fall back to
+    const otherTargetable = eligibility.filter(
+      (e) => e.recommendation === "target" && e.drop.dropId !== selectedDrop.dropId,
+    );
+    if (otherTargetable.length > 0) {
+      console.log(chalk.yellow(`  Other targetable phase(s) are available — want to try one instead?`));
+      const tryOther = await askYesNo(`  Switch to another phase?`, false);
+      if (tryOther) {
+        // Re-open the phase selection (jump back to Step 6 logic)
+        console.log(chalk.gray(`  Re-selecting phase...\n`));
+        // Recursively call the selection logic by throwing a special sentinel
+        throw new Error("[SELECT_DIFFERENT_PHASE]");
+      }
+    }
+
+    // No other phases to fall back to — throw the original error
     throw new Error(
       `Could not fetch signed mint data for phase "${selectedDrop.name || "unnamed"}". ` +
         `The phase exists but OpenSea didn't return wallet-specific signed data. ` +
@@ -279,8 +342,8 @@ export async function runFcfsBranch(
   );
 
   if (drop.maxTotalMintableByWallet > 0 && quantity > drop.maxTotalMintableByWallet) {
-    console.log(
-      chalk.yellow(`  ⚠ This drop allows only ${drop.maxTotalMintableByWallet} per wallet — ${quantity} will revert.`),
+    throw new Error(
+      `Requested quantity ${quantity} exceeds the per-wallet cap of ${drop.maxTotalMintableByWallet} for this phase. Reduce quantity.`
     );
   }
   if (Date.now() >= endsAt.getTime()) {
@@ -386,7 +449,7 @@ export async function runFcfsBranch(
 
   closePrompts();
 
-  const mintPlan = buildFcfsMintPlan(payload, gasLimit, maxFeePerGas, maxPriorityFeePerGas);
+  const mintPlan = buildFcfsMintPlan(payload, gasLimit, maxFeePerGas, maxPriorityFeePerGas, quantity);
 
   await executeFcfsSnipe({
     nftContract,
@@ -396,8 +459,108 @@ export async function runFcfsBranch(
     maxFeePerGas,
     maxPriorityFeePerGas,
     gasLimit,
-    targetStart,
+    targetStart: targetStart || startsAt,
     plan: mintPlan,
-    openSeaApiKey: apiKey || undefined,
   });
+}
+
+
+// ── CLI entry: eligibility + gas check, no mint ──────────────────────────────
+// Polls all phases for a contract, shows eligibility + gas state, exits.
+
+export async function runEligibilityCheck(log: RunLogger, nftContract: string): Promise<void> {
+  const { resolveChain } = require("./chains");
+  const { fetchAllActiveDrops, reportInventoryEligibility, printDropsInventory, fetchGasState, printGasState } = require("./fcfs-drops");
+  const { parseNftLink } = require("./nft-link");
+  const chalk = require("chalk");
+
+  const chainKey = (process.env.CHAIN || "base").toLowerCase();
+  const chainProfile = resolveChain(chainKey);
+  if (!chainProfile) throw new Error(`Unknown chain "${chainKey}"`);
+
+  const envRpcs = (process.env[`RPC_URL_${chainKey.toUpperCase()}`] || "").split(",").filter(Boolean);
+  const { urls: rpcUrls } = await require("./rpc-resolver").resolveRpcsForChain(chainKey, envRpcs);
+  if (rpcUrls.length === 0) throw new Error(`No usable RPC endpoints for ${chainProfile.name}`);
+
+  const parsed = parseNftLink(nftContract);
+  const lookupTarget = parsed.value;
+
+  console.log(chalk.bold.white(`\nEligibility check for ${lookupTarget}`));
+  console.log(chalk.gray(`  Chain: ${chainProfile.name} | RPC: ${rpcUrls.length} endpoint(s)`));
+
+  const apiKey = process.env.OPENSEA_API_KEY || undefined;
+  const inventory = await fetchAllActiveDrops(lookupTarget, apiKey, 12000);
+
+  if (inventory.drops.length === 0) {
+    console.log(chalk.yellow(`\n  ⚠ No active phases found for ${lookupTarget}.`));
+    console.log(chalk.gray(`  Try: get an OpenSea API key, or check the collection page manually.\n`));
+    return;
+  }
+
+  const ourWallet = "0x".padEnd(42, "0"); // placeholder — real wallet would be prompted
+  const eligibility = reportInventoryEligibility(inventory, ourWallet);
+  console.log(chalk.gray(`  Wallet: placeholder (pass keys for real check)`));
+  printDropsInventory(inventory, eligibility, ourWallet, chainProfile.name);
+
+  console.log(chalk.gray(`\n  Polling gas state on ${chainProfile.name}...`));
+  const gasState = await fetchGasState(rpcUrls, chainProfile.chainId, 5000);
+  printGasState(gasState, chainProfile.name);
+
+  const targetable = eligibility.filter((e: any) => e.recommendation === "target");
+  console.log(chalk.bold.white(`\n  Summary: ${inventory.drops.length} phase(s), ${targetable.length} targetable.`));
+  if (targetable.length === 0) {
+    console.log(chalk.yellow(`  ⚠ No targetable phases — nothing to mint right now.\\n`));
+  }
+}
+
+// ── CLI entry: 1-arg wrapper for `index.ts --fcfs <slug|ca>` ────────────────
+// Resolves chain + RPC from env, prompts for wallet keys, then calls the
+// 7-arg runFcfsBranch executor defined above.
+
+export async function runFcfsBranchCli(log: RunLogger, targetArg: string): Promise<void> {
+  const chainKey = (process.env.CHAIN || "base").toLowerCase();
+  const chainProfile = resolveChain(chainKey);
+  if (!chainProfile) throw new Error(`Unknown chain "${chainKey}"`);
+
+  const envRpcs = (process.env[`RPC_URL_${chainKey.toUpperCase()}`] || "").split(",").filter(Boolean);
+  let rpcUrls: string[];
+  if (envRpcs.length > 0) {
+    rpcUrls = envRpcs;
+  } else {
+    rpcUrls = chainProfile.rpc.public;
+  }
+  if (rpcUrls.length === 0) throw new Error(`No usable RPC endpoints for ${chainProfile.name}`);
+
+  const parsed = parseNftLink(targetArg);
+  const nftContract = parsed.value;
+  const targetLabel = parsed.value;
+  const targetChainKey = parsed.chainHint && resolveChain(parsed.chainHint) ? parsed.chainHint : chainKey;
+  const quantity = 1;
+
+  console.log(chalk.bold.white("\\nPrivate keys"));
+  console.log(chalk.gray("  Paste one key per line — typing is hidden. Blank line when done."));
+  log.info("FCFS CLI: prompting for wallet keys");
+  const keys: string[] = [];
+  const seen = new Set<string>();
+  for (;;) {
+    const raw = await askHidden(chalk.gray(`  › key ${keys.length + 1}: `));
+    if (!raw) {
+      if (keys.length === 0) { console.log(chalk.red("  ✗ Need at least one key.")); continue; }
+      break;
+    }
+    const normalized = raw.startsWith("0x") ? raw : `0x${raw}`;
+    let wallet: Wallet;
+    try { wallet = new Wallet(normalized); } catch { console.log(chalk.red("  ✗ Not a valid private key — try again.")); continue; }
+    if (seen.has(wallet.address.toLowerCase())) { console.log(chalk.yellow(`  ⚠ Duplicate of ${wallet.address.slice(0,6)}…${wallet.address.slice(-4)} — skipped.`)); continue; }
+    seen.add(wallet.address.toLowerCase());
+    keys.push(normalized);
+    console.log(chalk.green(`  ✓ [W${keys.length - 1}] ${wallet.address}`));
+  }
+  console.log(chalk.gray(`  ${keys.length} wallet(s) loaded.\n`));
+  log.field("wallet_count", keys.length);
+  log.field("rpc_urls", rpcUrls.length);
+  log.field("rpc_source", envRpcs.length > 0 ? "env" : "public");
+  log.info("FCFS CLI: keys loaded, calling runFcfsBranch");
+
+  await runFcfsBranch(log, keys, chainProfile, targetChainKey, nftContract, quantity, rpcUrls, { label: targetLabel });
 }

@@ -15,10 +15,11 @@ import path from "path";
 // Resolve relative to THIS file's directory (dist/), not CWD — user may run
 // `minter` from anywhere and the .env lives next to the project.
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
-import { JsonRpcProvider, Wallet, formatEther, getAddress, isAddress } from "ethers";
+import { createRunLogger, RunLogger } from "./logger";
+import { JsonRpcProvider, Wallet, getAddress, isAddress } from "ethers";
 import { CHAINS, ChainProfile, resolveChain } from "./chains";
 import { parseNftLink } from "./nft-link";
-import { resolveSlug, resolveContractToSlug } from "./slug-resolver";
+import { resolveSlug } from "./slug-resolver";
 import {
   maskRpc,
   planRpcs,
@@ -32,12 +33,36 @@ import { buildLocalMintPlan, LocalMintPlan } from "./seadrop-public";
 import { localPublicSnipe } from "./local-mint";
 import { istTimeToDate, toIST } from "./time-format";
 import { askChoice, askHidden, askNumber, askText, askYesNo, closePrompts } from "./prompt";
+import {
+  promptGasGwei,
+  promptTiming,
+  confirmSnipe,
+} from "./wizard-helpers";
+import {
+  fetchSignedPayload,
+  buildFcfsMintPlan,
+  executeFcfsSnipe,
+  FcfsSignedPayload,
+} from "./fcfs-mint";
 
-export async function runWizard(): Promise<void> {
+export { runFcfsBranch, runFcfsBranchCli, runEligibilityCheck } from "./wizard-fcfs-new";
+
+export async function runWizard(log: RunLogger): Promise<void> {
+  log.info("Wizard: started");
+  log.field("startup_mode", "interactive");
+  log.field("chain_env", process.env.CHAIN || "<unset>");
+  log.field("api_key_set", !!(process.env.OPENSEA_API_KEY));
+  log.field("rpc_env", process.env[`RPC_URL_${(process.env.CHAIN || "base").toUpperCase()}`] || "<unset>");
+
   printBanner();
 
   // ── 1. Private keys ───────────────────────────────────────────────────
-  const walletKeys = await promptKeys();
+  log.info("Wizard: prompting for keys");
+  const walletKeys = await promptKeys(log);
+  log.field("wallet_count", walletKeys.length);
+  if (walletKeys.length === 0) {
+    throw new Error("No wallet keys provided.");
+  }
 
   // ── 2. Chain ──────────────────────────────────────────────────────────
   let chainKey = await askChoice<string>(
@@ -48,18 +73,34 @@ export async function runWizard(): Promise<void> {
       CHAINS.findIndex((c) => c.key === (process.env.CHAIN || "base").toLowerCase())
     )
   );
+  log.field("chain", chainKey);
 
   // ── 3. Quantity ───────────────────────────────────────────────────────
   const quantity = await promptQuantity(walletKeys.length);
+  log.field("quantity", quantity);
+  if (quantity <= 0) {
+    throw new Error("Quantity must be at least 1. Aborting.");
+  }
+  if (quantity <= 0) {
+    throw new Error("Quantity must be at least 1. Aborting.");
+  }
 
   // ── 4. NFT link ───────────────────────────────────────────────────────
-  const target = await promptTarget(chainKey);
+  const target = await promptTarget(log, chainKey);
   const nftContract = target.contract;
   chainKey = target.chainKey;
+  log.field("nftContract", nftContract);
+  log.field("label", target.label);
   const chainProfile = resolveChain(chainKey)!;
+  log.field("chainProfile", chainProfile.name);
 
   // ── 5. RPC endpoints ──────────────────────────────────────────────────
   const manualRpcs = await promptRpc(chainProfile);
+  if (manualRpcs.length === 0) {
+    throw new Error(
+      `No RPC endpoints for ${chainProfile.name}. Set RPC_URL_${chainProfile.key.toUpperCase()} in .env, or pass one interactively.`
+    );
+  }
   const { urls: candidateRpcs, source } = resolveRpcsForChain(chainKey, manualRpcs);
   console.log(chalk.gray(`  Source: ${source}`));
   console.log(chalk.gray(`  Checking ${candidateRpcs.length} endpoint(s)...`));
@@ -129,8 +170,8 @@ export async function runWizard(): Promise<void> {
   );
 
   if (drop.maxTotalMintableByWallet > 0 && quantity > drop.maxTotalMintableByWallet) {
-    console.log(
-      chalk.yellow(`  ⚠ This drop allows only ${drop.maxTotalMintableByWallet} per wallet — ${quantity} will revert.`)
+    throw new Error(
+      `Requested quantity ${quantity} exceeds the per-wallet cap of ${drop.maxTotalMintableByWallet} for this phase. Reduce quantity.`
     );
   }
   if (Date.now() >= endsAt.getTime()) {
@@ -138,15 +179,15 @@ export async function runWizard(): Promise<void> {
   }
 
   // ── 6b. Phase discovery (public + allowlist/FCFS/OVR) ──────────────────
-  // Fetch all OpenSea-managed stages for this collection without a key for the
-  // metadata query. Classify each: public (on-chain, no key needed) vs private
-  // (needs signed payload). Pattern from osnm-z.
+  // Fetch all OpenSea-managed stages for this collection. No slug resolution —
+  // the CA from the link goes straight into the query. If it's a slug, use it
+  // as-is. Slug→CA↔slug translation is unnecessary: REST/GraphQL accept CAs.
   console.log(chalk.bold.white("\nPhases"));
   let allDrops: DropPhase[] = [];
   let discoverySource = "on-chain SeaDrop check only";
-  let resolvedSlug: string | null = null;
 
-  // Try OpenSea REST metadata query (no key needed for discovery)
+  // OpenSea REST/GraphQL drop query — works with CAs directly, no slug needed.
+  // Morsy's nft-public-mint does the same: pass the contract address, get drops.
   try {
     const inv = await fetchAllActiveDrops(nftContract, undefined, 10000);
     if (inv.drops.length > 0) {
@@ -161,31 +202,6 @@ export async function runWizard(): Promise<void> {
     }
   } catch (_err) {
     discoverySource = "OpenSea: unavailable — on-chain only";
-  }
-
-  // If OpenSea didn't find anything but we have a contract address, try
-  // resolving CA → slug and re-query with the slug
-  if (nftContract.startsWith("0x") && allDrops.length === 0) {
-    const slug = await resolveContractToSlug(nftContract, undefined, 10000);
-    if (slug) {
-      console.log(chalk.gray(`  ↳ Resolved CA → slug "${slug}"`));
-      resolvedSlug = slug;
-      try {
-        const inv2 = await fetchAllActiveDrops(nftContract, undefined, 10000, slug);
-        if (inv2.drops.length > 0) {
-          allDrops = inv2.drops;
-          discoverySource = inv2.apiKeyUsed
-            ? "OpenSea (with key)"
-            : "OpenSea (no key)";
-        } else {
-          console.log(chalk.yellow(`  OpenSea knows this collection ("${slug}") but found no active drops.`));
-          discoverySource = `OpenSea: known collection "${slug}", no active drops`;
-        }
-      } catch (_) {}
-    } else {
-      console.log(chalk.yellow(`  Could not resolve CA → slug (OpenSea may need a key for this collection).`));
-      discoverySource = "OpenSea: CA → slug resolution failed (may need API key)";
-    }
   }
 
   // Merge: OpenSea-discovered phases + on-chain public drop info
@@ -269,6 +285,7 @@ export async function runWizard(): Promise<void> {
   }
 
   // Pick: auto-select if exactly one live public phase, else let user choose
+  // Include private phases that have mintData+mintSignature (already fetched)
   const selectable = allDrops
     .map((d, i) => ({ drop: d, index: i, live: Date.now() >= d.startTime * 1000 && Date.now() < d.endTime * 1000 }))
     .filter((p) => p.drop.isPublicStage || (p.drop.mintData && p.drop.mintSignature))
@@ -331,7 +348,7 @@ export async function runWizard(): Promise<void> {
   const gasLimit = parseInt(process.env.GAS_LIMIT || "0", 10) || 250_000;
 
   // ── 8. Timing ─────────────────────────────────────────────────────────
-  const { targetStart, timingLabel } = await promptTiming(drop.startTime);
+  const { targetStart, timingLabel } = await promptTiming(startsAt);
 
   // ── 9. Balances + affordability ───────────────────────────────────────
   console.log(chalk.bold.white("\nWallets"));
@@ -400,22 +417,64 @@ export async function runWizard(): Promise<void> {
   // Hand stdin back so readline never interleaves with the blast logging.
   closePrompts();
 
-  await localPublicSnipe({
-    nftContract,
-    quantity,
-    walletKeys,
-    rpcUrls,
-    maxFeePerGas,
-    maxPriorityFee,
-    gasLimit,
-    targetStart,
-    plan: mintPlan,
-  });
+  // ── 11. Execute: route to public or private mint based on phase type ──
+  if (selectedDrop.isPublicStage) {
+    // Public phase — on-chain calldata, no OpenSea needed
+    await localPublicSnipe({
+      nftContract,
+      quantity,
+      walletKeys,
+      rpcUrls,
+      maxFeePerGas,
+      maxPriorityFee,
+      gasLimit,
+      targetStart,
+      plan: mintPlan,
+    });
+  } else {
+    // Private phase (allowlist/FCFS/OVR) — needs OpenSea signed payload
+    console.log(chalk.bold.white("\nFetching signed mint payload from OpenSea..."));
+    const apiKey = process.env.OPENSEA_API_KEY || undefined;
+    if (quantity <= 0) {
+      throw new Error("Quantity must be at least 1. Aborting.");
+    }
+    const payload = await fetchSignedPayload(nftContract, quantity, apiKey, { timeoutMs: 15000 });
+
+    if (!payload) {
+      throw new Error(
+        `Could not fetch signed mint payload for "${selectedDrop.name || "selected phase"}" from OpenSea.\n` +
+          `  This phase needs a signed payload (allowlist/FCFS/OVR mint).\n` +
+          `  Try: provide an OpenSea API key via OPENSEA_API_KEY in .env, or get a free key at\n` +
+          `  https://docs.opensea.io/reference/api-keys\n` +
+          `  Or switch to the public mint path if a public stage is available.`
+      );
+    }
+
+    console.log(chalk.green(`  ✓ Fetched signed payload from OpenSea`));
+    console.log(chalk.gray(`    SeaDrop:       ${payload.seaDropAddress}`));
+    console.log(chalk.gray(`    Fee recipient: ${payload.feeRecipient}`));
+    console.log(chalk.gray(`    Price:         ${formatEther(payload.value)} per wallet`));
+    console.log(chalk.gray(`    Calldata:      ${(payload.mintData.length - 2) / 2} bytes (per-wallet signed)`));
+
+    const mintPlan = buildFcfsMintPlan(payload, gasLimit, maxFeePerGas, maxPriorityFee, quantity);
+
+    await executeFcfsSnipe({
+      nftContract,
+      quantity,
+      walletKeys,
+      rpcUrls,
+      maxFeePerGas,
+      maxPriorityFeePerGas: maxPriorityFee,
+      gasLimit,
+      targetStart: targetStart || startsAt,
+      plan: mintPlan,
+    });
+  }
 }
 
 // ── Steps ───────────────────────────────────────────────────────────────
 
-async function promptKeys(): Promise<string[]> {
+async function promptKeys(log: RunLogger): Promise<string[]> {
   console.log(chalk.bold.white("Private keys"));
   console.log(chalk.gray("  Paste one key per line — typing is hidden. Blank line when done."));
   console.log(chalk.gray("  Each key is confirmed by its wallet address. Nothing is saved to disk."));
@@ -456,7 +515,7 @@ async function promptKeys(): Promise<string[]> {
 }
 
 async function promptQuantity(walletCount: number): Promise<number> {
-  console.log(chalk.bold.white("\nQuantity"));
+  console.log(chalk.bold.white("\\nQuantity"));
   const qty = await askNumber("NFTs per wallet", 1, { min: 1, max: 100 });
   if (walletCount > 1) {
     console.log(chalk.gray(`  → ${qty} × ${walletCount} wallets = ${qty * walletCount} total`));
@@ -465,6 +524,7 @@ async function promptQuantity(walletCount: number): Promise<number> {
 }
 
 async function promptTarget(
+  log: RunLogger,
   chainKey: string
 ): Promise<{ contract: string; label: string; chainKey: string }> {
   console.log(chalk.bold.white("\nNFT target"));
@@ -499,191 +559,83 @@ async function promptTarget(
     }
 
     if (parsed.kind === "address") {
-      const normalized = normalizeAddress(parsed.value);
-      if (!normalized) {
-        console.log(chalk.red(`  ✗ "${parsed.value}" is not a 20-byte address.`));
+      return { contract: parsed.value, label: parsed.value, chainKey: activeChain };
+    }
+
+    if (parsed.kind === "slug") {
+      const slug = parsed.value;
+      const chainForSlug = parsed.chainHint || activeChain;
+      const chainProfile = resolveChain(chainForSlug);
+      if (!chainProfile) {
+        console.log(chalk.red(`  ✗ Unknown chain "${parsed.chainHint || "?"}" for slug "${slug}".`));
         continue;
       }
-      if (normalized.checksumWarning) {
-        console.log(chalk.yellow("  ⚠ Mixed-case address whose EIP-55 checksum doesn't match — likely a typo."));
-        if (!(await askYesNo("Use it anyway?", false))) continue;
-      }
-      console.log(chalk.green(`  ✓ Contract ${normalized.address}`));
-      return { contract: normalized.address, label: short(normalized.address), chainKey: activeChain };
+      console.log(chalk.gray(`  ↳ Resolved slug "${slug}" on ${chainProfile.name}`));
+      return { contract: slug, label: slug, chainKey: chainForSlug };
     }
 
-    // Slug → address is a plain OpenSea REST lookup, which often answers without
-    // a key. Always try; a key only makes it reliable. The mint itself never
-    // touches OpenSea either way.
-    const apiKey = (process.env.OPENSEA_API_KEY || "").trim();
-
-    try {
-      console.log(chalk.gray(`  Resolving slug "${parsed.value}"${apiKey ? "" : " (no API key — may be refused)"}...`));
-      const info = await resolveSlug(parsed.value, apiKey || undefined, activeChain);
-      const resolved = normalizeAddress(info.contractAddress);
-      if (!resolved) {
-        console.log(chalk.red(`  ✗ Unusable address returned: ${info.contractAddress}`));
-        continue;
-      }
-      console.log(chalk.green(`  ✓ ${info.name} → ${resolved.address}`));
-      if (info.chain && resolveChain(info.chain) && info.chain !== activeChain) {
-        console.log(chalk.yellow(`  ⚠ Listed on "${info.chain}", not "${activeChain}".`));
-        if (await askYesNo(`Switch to ${resolveChain(info.chain)!.name}?`, true)) {
-          activeChain = resolveChain(info.chain)!.key;
-        }
-      }
-      return { contract: resolved.address, label: info.name || parsed.value, chainKey: activeChain };
-    } catch (err: any) {
-      console.log(chalk.red(`  ✗ ${err.message}`));
-      console.log(
-        chalk.gray("    Paste the contract address (0x…) instead — that always works, no key needed.")
-      );
-      console.log(
-        chalk.gray("    Find it on the collection page under Details, or click any item: the address is in that URL.")
-      );
-    }
+    console.log(chalk.red("  ✗ Could not parse that input — paste a link, slug, or address."));
   }
 }
 
-async function promptRpc(profile: ChainProfile): Promise<string[]> {
-  console.log(chalk.bold.white("\nRPC endpoints"));
-  console.log(chalk.gray("  A private RPC (Alchemy / QuickNode / Infura) is what wins a contested mint."));
-  if (profile.rpc.alchemyHost) {
-    console.log(chalk.gray(`  Paste a full URL, or just your Alchemy key → https://${profile.rpc.alchemyHost}/v2/<key>`));
-  }
-  console.log(chalk.gray("  Comma-separate several to blast to all of them."));
-
-  const fromEnv = privateRpcsFromEnv(profile.key);
-  if (fromEnv.length > 0) {
-    console.log(chalk.gray(`  .env has: ${fromEnv.map(maskRpc).join(", ")}`));
-    console.log(chalk.gray("  Auto-using .env values."));
-    return fromEnv;
+async function promptRpc(chainProfile: ChainProfile): Promise<string[]> {
+  const envUrls = privateRpcsFromEnv(chainProfile.key);
+  if (envUrls.length > 0) {
+    console.log(chalk.gray(`  Using ${envUrls.length} endpoint(s) from .env (RPC_URL_${chainProfile.key.toUpperCase()}):`));
+    for (const u of envUrls) console.log(chalk.gray(`    ${maskRpc(u)}`));
+    return envUrls;
   }
 
-  console.log(chalk.yellow(`  Nothing in .env for ${profile.name}.`));
-  console.log(chalk.gray("  Paste a URL or key, or leave blank for public nodes."));
-
-  for (;;) {
-    const raw = await askText(`RPC for ${profile.name} (blank = public nodes only)`);
-    if (!raw) return [];
-
-    const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
-    const urls: string[] = [];
-    let bad = false;
-    for (const part of parts) {
-      const url = toRpcUrl(part, profile.key);
-      if (!url) {
-        console.log(chalk.red(`  ✗ "${part}" is not a URL or a usable API key.`));
-        bad = true;
-        break;
-      }
-      urls.push(url);
-    }
-    if (bad || urls.length === 0) continue;
-
-    for (const u of urls) console.log(chalk.green(`  ✓ ${maskRpc(u)}`));
-    return urls;
-  }
+  // No .env RPCs — use the public endpoints from chains.ts, silently.
+  console.log(chalk.gray(`  No .env RPC configured for ${chainProfile.name} — using public endpoints.`));
+  return chainProfile.rpc.public;
 }
 
-async function promptTiming(
-  startTime: number
-): Promise<{ targetStart: Date | null; timingLabel: string }> {
-  const startsInFuture = startTime * 1000 > Date.now();
-  const at = new Date(startTime * 1000);
-
-  const choices: { label: string; value: "wait" | "now" | "custom"; hint?: string }[] = [];
-  if (startsInFuture) {
-    // Firing before the on-chain start reverts with NotActive, so it isn't
-    // offered at all once a future start time is known.
-    choices.push({
-      label: "Wait for the stage",
-      value: "wait",
-      hint: `${toIST(at)} IST · in ${formatRemaining(at.getTime() - Date.now())} · fires at T-0`,
-    });
-  } else {
-    choices.push({ label: "Fire now", value: "now", hint: "stage is already live" });
-  }
-  choices.push({ label: "Custom time", value: "custom", hint: "HH:MM, 24-hour IST, today" });
-
-  const pick = await askChoice("When should it fire?", choices, 0);
-
-  if (pick === "wait") return { targetStart: at, timingLabel: `wait for stage — ${toIST(at)} IST` };
-  if (pick === "now") return { targetStart: null, timingLabel: "fire immediately" };
-
-  for (;;) {
-    const raw = await askText("Time (HH:MM, 24-hour IST)");
-    try {
-      const custom = istTimeToDate(raw);
-      if (custom.getTime() < startTime * 1000) {
-        console.log(chalk.bold.red(`  ✗ That is before the stage opens (${toIST(at)} IST) — it will revert.`));
-        if (!(await askYesNo("Use it anyway?", false))) continue;
-      }
-      return { targetStart: custom, timingLabel: `custom — ${toIST(custom)} IST` };
-    } catch (err: any) {
-      console.log(chalk.red(`  ✗ ${err.message}`));
-    }
-  }
+function printBanner(): void {
+  console.log(
+    chalk.bold.white(`\n╔${"═".repeat(58)}╗
+║  NFT MINT SNIPER — SeaDrop public + FCFS/allowlist/OVR  ║
+╚${"═".repeat(58)}╝`),
+  );
+  console.log(chalk.gray("  Public mints: on-chain SeaDrop, no OpenSea account needed.\n"));
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-// Accept an address in any case — explorer copy-pastes arrive case-mangled and
-// hard-failing is worse. A mixed-case string failing EIP-55 is the typo signal.
-function normalizeAddress(raw: string): { address: string; checksumWarning: boolean } | null {
-  const value = raw.trim();
-  if (!/^0x[0-9a-fA-F]{40}$/.test(value)) return null;
-  const body = value.slice(2);
-  const mixedCase = /[a-f]/.test(body) && /[A-F]/.test(body);
-  return {
-    address: getAddress(value.toLowerCase()),
-    checksumWarning: mixedCase && !isAddress(value),
-  };
+function line(label: string, value: string): void {
+  console.log(chalk.gray(`  ${label.padEnd(10)} ${value}`));
 }
 
-async function currentBaseFeeGwei(provider: JsonRpcProvider): Promise<number | null> {
-  try {
-    const fee = await provider.getFeeData();
-    const wei = fee.gasPrice ?? fee.maxFeePerGas;
-    return wei === null || wei === undefined ? null : Number(wei) / 1e9;
-  } catch {
-    return null;
-  }
+function labelOf(url: string): string {
+  try { return new URL(url).hostname; } catch { return url; }
+}
+
+function short(addr: string): string {
+  return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+}
+
+function formatRemaining(ms: number): string {
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ${sec % 60}s`;
+  const hr = Math.floor(min / 60);
+  return `${hr}h ${min % 60}m`;
 }
 
 function gweiToWei(gwei: number): bigint {
   return BigInt(Math.round(gwei * 1e9));
 }
 
-function formatRemaining(ms: number): string {
-  const total = Math.max(0, Math.round(ms / 1000));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
+async function currentBaseFeeGwei(provider: JsonRpcProvider): Promise<number | null> {
+  const block = await provider.getBlock("latest");
+  if (!block) return null;
+  const baseFee = block.baseFeePerGas;
+  if (!baseFee) return null;
+  return Number(baseFee) / 1e9;
 }
 
-function short(addr: string): string {
-  return addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
-}
-
-function labelOf(url: string): string {
-  return parseRpcEndpoints([url])[0].label;
-}
-
-function line(label: string, value: string): void {
-  console.log(`  ${chalk.gray(label.padEnd(10))} ${chalk.white(value)}`);
-}
-
-function printBanner(): void {
-  console.log(
-    chalk.bold.cyan(`
-╔═══════════════════════════════════════╗
-║        NFT PUBLIC MINT SNIPER         ║
-║   On-chain calldata · no OpenSea      ║
-╚═══════════════════════════════════════╝`)
-  );
-  console.log(chalk.gray("  Public SeaDrop stages only. Ctrl+C to quit at any point.\n"));
+function formatEther(wei: bigint | string): string {
+  const n = typeof wei === "bigint" ? wei : BigInt(wei);
+  const eth = Number(formatEther(n));
+  if (eth >= 1) return eth.toFixed(4);
+  return eth.toExponential(3);
 }

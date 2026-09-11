@@ -10,6 +10,7 @@
 
 import chalk from "chalk";
 import { formatEther } from "ethers";
+import { fetchOnChainDrops, fetchSingleOnChainDrop } from "./seadrop-onchain";
 
 const OPENSEA_BASE = "https://api.opensea.io";
 
@@ -133,246 +134,488 @@ export async function fetchAllActiveDrops(
   // Use slug if provided (CA→slug resolved), otherwise try CA directly
   const lookupTarget = slug || nftContract;
 
+  let drops: DropPhase[] = [];
+  let chainId: number | null = null;
+  let lastReason: CollectionDropsInventory["notFoundReason"] | undefined;
+
+  // ── Step 1: REST v2 /api/v2/drops/{slug} ─────────────────────────────────
   try {
     const res = await fetch(
-      `${OPENSEA_BASE}/api/v2/collections/${lookupTarget}/drops?status=active&limit=50`,
+      `${OPENSEA_BASE}/api/v2/drops/${lookupTarget}`,
       { signal: controller.signal, headers },
     );
     clearTimeout(timer);
 
-    if (res.status === 401 || res.status === 403) {
-      // Key rejected — return empty inventory with a flag
-      return {
-        nftContract,
-        chainId: null,
-        drops: [],
-        fetchedAt: Date.now(),
-        apiKeyUsed: !!apiKey,
-        notFoundReason: "key_required",
-      };
-    }
+      if (res.status === 429) {
+        lastReason = "rate_limited";
+        // Don't abort the whole flow for rate limiting — fall through to on-chain
+      } else if (res.status === 401 || res.status === 403) {
+        // REST requires an API key. Without one we get 401. Fall through to GQL + on-chain.
+      } else if (res.status !== 200) {
+        // Other non-200 — fall through to GQL + on-chain
+      } else {
+        const json = (await res.json()) as any;
+        drops = catalogueDrops(json, nftContract);
 
-    if (res.status === 404) {
-      return {
-        nftContract,
-        chainId: null,
-        drops: [],
-        fetchedAt: Date.now(),
-        apiKeyUsed: !!apiKey,
-        notFoundReason: "not_found",
-      };
-    }
+        for (const d of drops) {
+          if (d.raw.chain_id != null) { chainId = Number(d.raw.chain_id); break; }
+          if (d.raw.chainId != null) { chainId = Number(d.raw.chainId); break; }
+        }
 
-    if (res.status === 429) {
-      // Rate limited — return what we have (nothing) but flag it
-      return {
-        nftContract,
-        chainId: null,
-        drops: [],
-        fetchedAt: Date.now(),
-        apiKeyUsed: !!apiKey,
-        notFoundReason: "rate_limited",
-      };
-    }
-
-    const json = (await res.json()) as any;
-    const drops = catalogueDrops(json, nftContract);
-
-    // Try to extract chainId from the first drop's metadata if available
-    let chainId: number | null = null;
-    for (const d of drops) {
-      if (d.raw.chain_id != null) {
-        chainId = Number(d.raw.chain_id);
-        break;
+        // REST with a raw CA returned nothing — stop, don't waste the GQL
+        // slot on the same lookup. Only fall through to GQL when we have a
+        // slug (different path) or REST errored/outage.
+        if (drops.length === 0 && !slug) {
+          return { nftContract, chainId: null, drops: [], fetchedAt: Date.now(), apiKeyUsed: !!apiKey, notFoundReason: "not_found" };
+        }
       }
-      if (d.raw.chainId != null) {
-        chainId = Number(d.raw.chainId);
-        break;
-      }
-    }
-
-    return {
-      nftContract,
-      chainId,
-      drops,
-      fetchedAt: Date.now(),
-      apiKeyUsed: !!apiKey,
-      notFoundReason: drops.length === 0 ? "no_phases" : undefined,
-    };
   } catch (err: any) {
     clearTimeout(timer);
     if (err && err.name === "AbortError") {
-      // Timeout — return empty with a flag
-      return {
-        nftContract,
-        chainId: null,
-        drops: [],
-        fetchedAt: Date.now(),
-        apiKeyUsed: !!apiKey,
-      };
+      return { nftContract, chainId: null, drops: [], fetchedAt: Date.now(), apiKeyUsed: !!apiKey };
     }
-    // Network error — return empty
-    return {
-      nftContract,
-      chainId: null,
-      drops: [],
-      fetchedAt: Date.now(),
-      apiKeyUsed: !!apiKey,
-      notFoundReason: "network_error",
-    };
+    // Network error in REST — fall through to on-chain
+  }
+
+  // ── Step 2: GraphQL fallback (if REST gave nothing) ───────────────────────
+  if (drops.length === 0) {
+    try {
+      const gqlDrops = await fetchGraphqlDrops(lookupTarget, apiKey || null, Math.min(timeoutMs, 8000));
+      if (gqlDrops.length > 0) {
+        drops = gqlDrops;
+        // Try to infer chainId from GQL response
+        for (const d of drops) {
+          if (d.raw?.chain?.identifier) {
+            if (d.raw.chain.identifier === "ethereum") chainId = 1;
+            else if (typeof d.raw.chain.networkId === "number") chainId = d.raw.chain.networkId;
+            break;
+          }
+        }
+      }
+    } catch {
+      // GQL failed — fall through to on-chain
+    }
+  }
+
+  // ── Step 3: On-chain SEADROP discovery (if still nothing) ─────────────────
+  if (drops.length === 0) {
+    try {
+      clearTimeout(timer);
+      const onChainDrops = await fetchOnChainDrops(nftContract, Math.min(timeoutMs, 15000));
+      if (onChainDrops.length > 0) {
+        drops = onChainDrops;
+        // On-chain drops are for ethereum by definition (SEADROP is on mainnet)
+        if (chainId === null) chainId = 1;
+        // If on-chain found a public drop, mark the reason as resolved
+        const hasPublic = onChainDrops.some(d => d.isPublicStage && d.mintPrice > 0n);
+        if (hasPublic) lastReason = undefined;
+      }
+    } catch {
+      // On-chain failed — return whatever we have (empty)
+    }
+  }
+
+  if (drops.length === 0 && lastReason === undefined) {
+    lastReason = "no_phases";
+  }
+
+  return {
+    nftContract,
+    chainId,
+    drops,
+    fetchedAt: Date.now(),
+    apiKeyUsed: !!apiKey,
+    notFoundReason: lastReason,
+  };
+}
+
+// ── GraphQL fallback ─────────────────────────────────────────────────────────
+// OpenSea v2 GraphQL: gql.opensea.io/graphql
+// Collection drops are exposed via collectionBySlug → stages connection.
+// We query both stages.list and the active/next stage shortcuts.
+//
+// NOTE: The GQL API is aggressively rate-limited (429) as of late 2026.
+// We use it as a secondary source after REST, with a short timeout.
+
+async function fetchGraphqlDrops(
+  lookupTarget: string,
+  apiKey?: string | null,
+  timeoutMs = 10000,
+): Promise<DropPhase[]> {
+  const gqlUrl = "https://gql.opensea.io/graphql";
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "user-agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    origin: "https://opensea.io",
+    referer: `https://opensea.io/collection/${lookupTarget}`,
+    "x-app-id": "os2-web",
+  };
+  if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let slug = lookupTarget;
+  // If the target is a CA, try on-chain discovery instead of slug resolution
+  // for the GQL query. GQL collectionBySlug needs a slug, but if we can't
+  // resolve one without an API key the CA is used directly as fallback.
+  if (lookupTarget.toLowerCase().startsWith("0x")) {
+    slug = lookupTarget; // use CA as slug — GQL may still return results
+  }
+
+  const query = `
+    query CollectionDrops($slug: String!) {
+      collectionBySlug(slug: $slug) {
+        slug
+        name
+        address
+        chain { identifier networkId }
+        stages(first: 50) {
+          edges {
+            node {
+              uuid
+              stageType
+              label
+              startTime
+              endTime
+              price
+              maxPerWallet
+              allowlistWalletCount
+              ... on CollectionDropStage {
+                mintData
+                mintSignature
+                gasLimit
+                maxFeePerGas
+                maxPriorityFeePerGas
+                eligible
+                eligibleCount
+                totalAllocated
+                allowlistedAddresses { address }
+                allowlistHash
+                feeRecipient
+              }
+            }
+          }
+        }
+        activeStage {
+          uuid
+          stageType
+          label
+          startTime
+          endTime
+          price
+          maxPerWallet
+          allowlistWalletCount
+          ... on CollectionDropStage {
+            mintData
+            mintSignature
+            gasLimit
+            maxFeePerGas
+            maxPriorityFeePerGas
+            eligible
+            eligibleCount
+            totalAllocated
+            allowlistedAddresses { address }
+            allowlistHash
+            feeRecipient
+          }
+        }
+        nextStage {
+          uuid
+          stageType
+          label
+          startTime
+          endTime
+          price
+          maxPerWallet
+          allowlistWalletCount
+        }
+      }
+    }
+  `;
+
+  const body = JSON.stringify({
+    query,
+    variables: { slug },
+    operationName: "CollectionDrops",
+  });
+
+  try {
+    const res = await fetch(gqlUrl, {
+      method: "POST",
+      headers,
+      body,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!res.ok) return [];
+
+    const json = (await res.json()) as any;
+    if (json.errors && json.errors.length > 0) return [];
+    if (!json.data?.collectionBySlug) return [];
+
+    const coll = json.data.collectionBySlug;
+    // Collect stages from three possible shapes: stages edges, activeStage, nextStage
+    const stageSources: any[] = [];
+
+    // 1. stages connection (all stages)
+    if (coll.stages?.edges) {
+      for (const edge of coll.stages.edges) {
+        if (edge?.node) stageSources.push(edge.node);
+      }
+    }
+    // 2. activeStage
+    if (coll.activeStage) {
+      stageSources.push(coll.activeStage);
+    }
+    // 3. nextStage
+    if (coll.nextStage) {
+      stageSources.push(coll.nextStage);
+    }
+
+    const drops: DropPhase[] = [];
+    for (const c of stageSources) {
+      if (!c || typeof c !== "object") continue;
+
+      // Fields: real v2 API uses snake_case; older/guessed shapes may use camelCase
+      const uuid = c.uuid || c.id || c.drop_id || c.hash || "";
+      const contract = (
+        c.contract_address || c.nftContract || c.contractAddress || c.address || ""
+      ).toLowerCase();
+
+      // Only include stages for our target contract (when we can identify it)
+      if (contract && contract !== lookupTarget.toLowerCase() && lookupTarget.toLowerCase() !== "") {
+        // If we can't match the contract, include anyway — the caller may have
+        // passed a slug that covers exactly one collection
+        if (contract !== "") continue;
+      }
+
+      const startTime = Number(c.start_time || c.startTime || c.start || 0);
+      const endTime = Number(c.end_time || c.endTime || c.end || 0);
+      const stageType = c.stage_type || c.stageType || c.type || c.kind || null;
+      const label = c.label || c.name || c.title || c.displayName || null;
+
+      const mintPrice = BigInt(String(c.price || c.mintPrice || c.mint_price || c.mintPriceWei || "0"));
+      const maxPerWallet = Number(
+        c.max_per_wallet || c.maxPerWallet || c.maxTotalMintableByWallet ||
+        c.max_total_mintable_by_wallet || c.max_total || 0
+      );
+      const maxTotal = Number(
+        c.maxTotalMintable || c.max_total_mintable || c.maxTotal || c.max_total ||
+        c.capacity || 0
+      );
+      const totalMinted = Number(
+        c.total_minted || c.totalMinted || c.minted || c.mintedCount || c.minted_count || 0
+      );
+      const feeBps = Number(c.fee_bps || c.feeBps || c.fee || 0);
+
+      const mintData = c.mintData || c.mint_data || c.calldata || c.data || null;
+      const mintSignature = c.mintSignature || c.mint_signature || c.signature || null;
+      const feeRecipient = c.fee_recipient || c.feeRecipient || c.fee_receipient || null;
+      const allowlistHash = c.allowlist_hash || c.allowlistHash || c.merkle_root || c.merkleRoot || c.root || null;
+      const gasLimit = Number(c.gas_limit || c.gasLimit || c.gas || 0) || null;
+      const maxFeePerGas = c.max_fee_per_gas || c.maxFeePerGas || c.maxFee || null;
+      const maxPriorityFeePerGas = c.max_priority_fee_per_gas || c.maxPriorityFeePerGas || c.maxPriorityFee || null;
+
+      const eligible = c.eligible != null ? Boolean(c.eligible) : null;
+      const eligibleCount = Number(
+        c.eligible_count || c.eligibleCount || c.eligibleWallets || c.eligible_wallets || c.eligibleCountTotal || 0
+      ) || null;
+      const totalAllocated = Number(
+        c.total_allocated || c.totalAllocated || c.allocated || c.slotsUsed || c.slots_used || 0
+      ) || null;
+
+      const allowlistedAddresses: string[] = [];
+      const rawAddrs = c.allowlisted_addresses || c.allowlistedAddresses || c.allowlist || c.allowList || [];
+      if (Array.isArray(rawAddrs)) {
+        for (const a of rawAddrs) {
+          if (typeof a === "string") allowlistedAddresses.push(a);
+          else if (a?.address) allowlistedAddresses.push(a.address);
+        }
+      }
+
+      const feeBpsVal = c.fee_bps != null ? Number(c.fee_bps) : (c.feeBps != null ? Number(c.feeBps) : 0);
+
+      drops.push({
+        dropId: uuid,
+        nftContract: contract || c.nftContract || c.contractAddress || c.address,
+        name: label,
+        type: stageType,
+        startTime,
+        endTime,
+        mintPrice,
+        maxTotalMintableByWallet: maxPerWallet,
+        maxTotalMintable: maxTotal,
+        totalMinted,
+        feeBps: feeBpsVal,
+        feeRecipient: feeRecipient || null,
+        mintData,
+        mintSignature,
+        gasLimit,
+        maxFeePerGas: maxFeePerGas ? BigInt(String(maxFeePerGas)) : null,
+        maxPriorityFeePerGas: maxPriorityFeePerGas ? BigInt(String(maxPriorityFeePerGas)) : null,
+        eligible,
+        eligibleCount,
+        totalAllocated,
+        allowlistedAddresses,
+        allowlistHash,
+        raw: c as Record<string, any>,
+        isPublicStage:
+          stageType === "public_sale" ||
+          stageType === "public",
+      });
+    }
+
+    return drops;
+  } catch {
+    return [];
   }
 }
 
-// ── Turn the raw OpenSea response into an array of DropPhase ────────────────
-
+// ── catalogueDrops helper ─────────────────────────────────────────────────
+// Parses raw OpenSea REST or GQL responses into DropPhase[].
+//
+// Real OpenSea v2 /api/v2/drops/{slug} returns:
+//   { drops: [{ contract_address, collection_slug, chain, stages: [...],
+//               active_stage, next_stage, ... }] }
+// Each stage: { uuid, stage_type, label, start_time, end_time, price,
+//               max_per_wallet, ...optional CollectionDropStage fields }
+//
+// Also handles GQL shapes (stages.edges[].node, activeStage, nextStage)
+// and guessed shapes for backward compat.
 function catalogueDrops(json: any, nftContract: string): DropPhase[] {
-  const candidates: any[] = [];
+  const stageObjects: any[] = [];
 
-  // OpenSea v2 response shapes — adapt as needed
-  if (Array.isArray(json)) {
-    candidates.push(...json);
-  } else if (json?.drops && Array.isArray(json.dumps)) {
-    candidates.push(...json.dumps);
-  } else if (json?.data && Array.isArray(json.data)) {
-    candidates.push(...json.data);
-  } else if (json?.drops && Array.isArray(json.dumps)) {
-    candidates.push(...json.dumps);
-  } else if (json?.items && Array.isArray(json.items)) {
-    candidates.push(...json.items);
-  } else if (json?.result) {
-    const r = json.result;
-    if (Array.isArray(r)) candidates.push(...r);
-    else if (r && typeof r === "object") candidates.push(r);
+  // Shape 1 (real v2 REST): { drops: [{ contract_address, stages: [...] }] }
+  if (json?.drops && Array.isArray(json.drops)) {
+    for (const drop of json.drops) {
+      const contract = (
+        drop.contract_address ||
+        drop.nftContract ||
+        drop.address ||
+        ""
+      ).toLowerCase();
+      if (contract && nftContract && contract !== nftContract.toLowerCase()) continue;
+
+      // Collect stages from this drop
+      if (drop.stages && Array.isArray(drop.stages)) {
+        for (const s of drop.stages) stageObjects.push(s);
+      }
+      // Also pull active_stage and next_stage if present
+      if (drop.active_stage && typeof drop.active_stage === "object") stageObjects.push(drop.active_stage);
+      if (drop.next_stage && typeof drop.next_stage === "object") stageObjects.push(drop.next_stage);
+    }
+  }
+
+  // Shape 2 (GQL collectionBySlug → stages edges): [{ uuid, stageType, ... }]
+  if (json?.stages?.edges && Array.isArray(json.stages.edges)) {
+    for (const edge of json.stages.edges) {
+      if (edge?.node) stageObjects.push(edge.node);
+    }
+  }
+  if (json?.activeStage && typeof json.activeStage === "object") stageObjects.push(json.activeStage);
+  if (json?.nextStage && typeof json.nextStage === "object") stageObjects.push(json.nextStage);
+
+  // Shape 3 (direct array — some endpoints return [DropPhase])
+  if (Array.isArray(json) && json.length > 0 && typeof json[0] === "object") {
+    stageObjects.push(...json);
   }
 
   const drops: DropPhase[] = [];
 
-  for (const c of candidates) {
+  for (const c of stageObjects) {
     if (!c || typeof c !== "object") continue;
 
-    // Match by contract address — OpenSea may nest it differently
+    // Fields: real v2 API uses snake_case; older/guessed shapes may use camelCase
+    const uuid = c.uuid || c.id || c.drop_id || c.hash || "";
     const contract = (
-      c.nftContract ||
-      c.contractAddress ||
-      c.address ||
-      c.collection?.address ||
-      c.collection?.contractAddress ||
-      ""
+      c.contract_address || c.nftContract || c.contractAddress || c.address || ""
     ).toLowerCase();
 
-    if (contract !== nftContract.toLowerCase()) continue;
+    // Only include stages for our target contract (when we can identify it)
+    if (contract && nftContract && contract !== nftContract.toLowerCase()) continue;
 
-    // Only active drops — include both "active" and "live" statuses.
-    // For a sniper, a future-dated phase that's been announced (status=active)
-    // is still targetable. We check the time window separately.
-    const status = (c.status || c.state || c.phaseStatus || "").toLowerCase();
-    if (status !== "active" && status !== "live" && status !== "scheduled") continue;
+    const startTime = Number(c.start_time || c.startTime || c.start || 0);
+    const endTime = Number(c.end_time || c.endTime || c.end || 0);
+    const stageType = c.stage_type || c.stageType || c.type || c.kind || null;
+    const label = c.label || c.name || c.title || c.displayName || null;
 
-    const drop: DropPhase = {
-      dropId: c.id || c.drop_id || c.hash || "",
-      nftContract: c.nftContract || c.contractAddress || c.address || nftContract,
-      name: c.name || c.title || c.displayName || null,
+    const mintPrice = BigInt(String(c.price || c.mintPrice || c.mint_price || c.mintPriceWei || "0"));
+    const maxPerWallet = Number(
+      c.max_per_wallet || c.maxPerWallet || c.maxTotalMintableByWallet ||
+      c.max_total_mintable_by_wallet || c.max_total || 0
+    );
+    const maxTotal = Number(
+      c.maxTotalMintable || c.max_total_mintable || c.maxTotal || c.max_total ||
+      c.capacity || 0
+    );
+    const totalMinted = Number(
+      c.total_minted || c.totalMinted || c.minted || c.mintedCount || c.minted_count || 0
+    );
+    const feeBps = Number(c.fee_bps || c.feeBps || c.fee || 0);
 
-      type: c.type || c.phaseType || c.phase_type || c.kind || null,
+    const mintData = c.mintData || c.mint_data || c.calldata || c.data || null;
+    const mintSignature = c.mintSignature || c.mint_signature || c.signature || null;
+    const feeRecipient = c.fee_recipient || c.feeRecipient || c.fee_receipient || null;
+    const allowlistHash = c.allowlist_hash || c.allowlistHash || c.merkle_root || c.merkleRoot || c.root || null;
+    const gasLimit = Number(c.gas_limit || c.gasLimit || c.gas || 0) || null;
+    const maxFeePerGas = c.max_fee_per_gas || c.maxFeePerGas || c.maxFee || null;
+    const maxPriorityFeePerGas = c.max_priority_fee_per_gas || c.maxPriorityFeePerGas || c.maxPriorityFee || null;
 
-      startTime: Number(c.startTime || c.start_time || c.start || 0),
-      endTime: Number(c.endTime || c.end_time || c.end || 0),
+    const eligible = c.eligible != null ? Boolean(c.eligible) : null;
+    const eligibleCount = Number(
+      c.eligible_count || c.eligibleCount || c.eligibleWallets || c.eligible_wallets || c.eligibleCountTotal || 0
+    ) || null;
+    const totalAllocated = Number(
+      c.total_allocated || c.totalAllocated || c.allocated || c.slotsUsed || c.slots_used || 0
+    ) || null;
 
-      mintPrice: BigInt(c.mintPrice || c.mint_price || c.price || c.mintPriceWei || "0"),
-      maxTotalMintableByWallet: Number(
-        c.maxTotalMintableByWallet ||
-          c.max_total_mintable_by_wallet ||
-          c.maxPerWallet ||
-          c.max_per_wallet ||
-          c.max_total || 0,
-      ),
-      maxTotalMintable: Number(
-        c.maxTotalMintable ||
-          c.max_total_mintable ||
-          c.maxTotal ||
-          c.max_total ||
-          c.capacity ||
-          0,
-      ),
-      totalMinted: Number(
-        c.totalMinted ||
-          c.total_minted ||
-          c.minted ||
-          c.mintedCount ||
-          c.minted_count ||
-          0,
-      ),
-
-      feeBps: Number(c.feeBps || c.fee_bps || c.fee || 0),
-      feeRecipient: c.feeRecipient || c.fee_recipient || c.fee_receipient || null,
-
-      mintData: c.mintData || c.mint_data || c.calldata || c.data || null,
-      mintSignature: c.mintSignature || c.mint_signature || c.signature || null,
-
-      gasLimit: c.gasLimit || c.gas_limit || c.gas || null,
-      maxFeePerGas: c.maxFeePerGas || c.max_fee_per_gas || c.maxFee || null,
-      maxPriorityFeePerGas:
-        c.maxPriorityFeePerGas ||
-        c.max_priority_fee_per_gas ||
-        c.maxPriorityFee ||
-        null,
-
-      // Eligibility signals
-      eligible: c.eligible != null ? Boolean(c.eligible) : null,
-      eligibleCount: Number(
-        c.eligibleCount ||
-          c.eligible_count ||
-          c.eligibleWallets ||
-          c.eligible_wallets ||
-          c.eligibleCountTotal ||
-          0,
-      ) || null,
-      totalAllocated: Number(
-        c.totalAllocated ||
-          c.total_allocated ||
-          c.allocated ||
-          c.slotsUsed ||
-          c.slots_used ||
-          0,
-      ) || null,
-      allowlistedAddresses:
-        (c.allowlistedAddresses || c.allowlisted_addresses || c.allowlist || []) as string[],
-      allowlistHash:
-        c.allowlistHash ||
-        c.allowlist_hash ||
-        c.merkleRoot ||
-        c.merkle_root ||
-        c.root ||
-        null,
-
-      raw: c as Record<string, any>,
-
-      // ── Public stage classification ─────────────────────────────────────
-      // Matches osnm-z's PUBLIC_SALE pattern: a phase is "public" when
-      // OpenSea labels it as such OR when it has no signed mint data
-      // (on-chain minting doesn't need a server signature).
-      // Public stages are targetable on-chain with no OpenSea key.
-      isPublicStage:
-        c.type === "public" ||
-        c.phaseType === "public" ||
-        c.phase_type === "public" ||
-        c.kind === "PUBLIC_SALE" ||
-        c.stage_type === "PUBLIC_SALE" ||
-        (c.mintData == null && c.mintSignature == null),
-    };
-
-    // Normalize: if maxTotalMintable is 0 and totalMinted > 0, try to infer
-    // capacity from mintPrice / total supply hints
-    if (drop.maxTotalMintable === 0 && drop.totalMinted > 0) {
-      // We don't know the total capacity — mark as unknown
-      drop.maxTotalMintable = -1; // sentinel: unknown
+    const allowlistedAddresses: string[] = [];
+    const rawAddrs = c.allowlisted_addresses || c.allowlistedAddresses || c.allowlist || c.allowList || [];
+    if (Array.isArray(rawAddrs)) {
+      for (const a of rawAddrs) {
+        if (typeof a === "string") allowlistedAddresses.push(a);
+        else if (a?.address) allowlistedAddresses.push(a.address);
+      }
     }
 
-    drops.push(drop);
+    const feeBpsVal = c.fee_bps != null ? Number(c.fee_bps) : (c.feeBps != null ? Number(c.feeBps) : 0);
+
+    drops.push({
+      dropId: uuid,
+      nftContract: contract || c.nftContract || c.contractAddress || c.address,
+      name: label,
+      type: stageType,
+      startTime,
+      endTime,
+      mintPrice,
+      maxTotalMintableByWallet: maxPerWallet,
+      maxTotalMintable: maxTotal,
+      totalMinted,
+      feeBps: feeBpsVal,
+      feeRecipient: feeRecipient || null,
+      mintData,
+      mintSignature,
+      gasLimit,
+      maxFeePerGas: maxFeePerGas ? BigInt(String(maxFeePerGas)) : null,
+      maxPriorityFeePerGas: maxPriorityFeePerGas ? BigInt(String(maxPriorityFeePerGas)) : null,
+      eligible,
+      eligibleCount,
+      totalAllocated,
+      allowlistedAddresses,
+      allowlistHash,
+      raw: c as Record<string, any>,
+      isPublicStage:
+        stageType === "public_sale" ||
+        stageType === "public" ||
+        (mintData == null && mintSignature == null),
+    });
   }
 
   return drops;
 }
+
 
 // ── Eligibility report for a single drop ────────────────────────────────────
 
@@ -380,13 +623,89 @@ export function assessDropEligibility(
   drop: DropPhase,
   ourWallet: string,
 ): EligibilityReport {
+  // OVR / allowlist phases — these need per-wallet signed data (mintSignature)
+  // fetched from OpenSea. Report them as targetable only if we have a signed
+  // payload, otherwise flag for manual check (need session + allowlist tree).
+  if (drop.type === "ovr" || drop.allowlistHash ||
+      drop.allowlistedAddresses.length > 0 ||
+      (drop.type && /ovr|allowlist|allow_list/i.test(drop.type))) {
+    if (drop.mintData && drop.mintSignature) {
+      // Pre-fetched signed payload — this wallet can target it
+      const remaining = computeAllocationRemaining(drop);
+      return {
+        drop,
+        ourWalletEligible: true, // signed payload means we're in the allowlist
+        allocationRemaining: remaining,
+        isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+          drop.totalMinted >= drop.maxTotalMintable,
+        recommendation: remaining !== null && remaining <= 0 ? "skip" : "target",
+        reason: "OVR/allowlist phase with signed mint data — wallet is allowlisted.",
+      };
+    }
+    // No signed data yet — needs pre-fetch. Mark as check-manually so the
+    // caller knows to run the pre-fetch step before this becomes targetable.
+    return {
+      drop,
+      ourWalletEligible: null,
+      allocationRemaining: computeAllocationRemaining(drop),
+      isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+        drop.totalMinted >= drop.maxTotalMintable,
+      recommendation: "check-manually",
+      reason: "OVR/allowlist phase detected but no signed mint data available. " +
+        "Run pre-fetch (fetchSignedPayload) to get the per-wallet signature.",
+    };
+  }
+
   // If OpenSea explicitly says we're not eligible, that's clear
   if (drop.eligible === false) {
-    // OpenSea says not eligible — but for a sniper, a future-dated phase
-    // with signed mint data is still targetable. Prep now; fire at T-0.
+    // OpenSea says not eligible. For OVR/allowlist phases specifically,
+    // a future-dated phase with signed mint data is still targetable.
     // Only skip if the phase is already past and has no signed data.
     const now = Date.now();
     const isPast = now >= drop.endTime * 1000;
+
+    if (drop.type === "ovr" || drop.allowlistHash ||
+        drop.allowlistedAddresses.length > 0 ||
+        (drop.type && /ovr|allowlist|allow_list/i.test(drop.type))) {
+      // OVR/allowlist: isPast + no signed data → skip; otherwise still targetable
+      if (isPast && (!drop.mintData || !drop.mintSignature)) {
+        return {
+          drop,
+          ourWalletEligible: false,
+          allocationRemaining: null,
+          isOverAllocated: null,
+          recommendation: "skip",
+          reason: "OVR/allowlist phase has ended and OpenSea reports ineligible.",
+        };
+      }
+      if (drop.mintData && drop.mintSignature) {
+        const remaining = computeAllocationRemaining(drop);
+        return {
+          drop,
+          ourWalletEligible: null,
+          allocationRemaining: remaining,
+          isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+            drop.totalMinted >= drop.maxTotalMintable,
+          recommendation: remaining !== null && remaining <= 0 ? "skip" : "target",
+          reason: "OpenSea reports ineligible, but OVR/allowlist phase has signed data — " +
+            "targetable with pre-signed payload.",
+        };
+      }
+      return {
+        drop,
+        ourWalletEligible: null,
+        allocationRemaining: computeAllocationRemaining(drop),
+        isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+          drop.totalMinted >= drop.maxTotalMintable,
+        recommendation: "check-manually",
+        reason: "OVR/allowlist phase, OpenSea reports ineligible, no signed data yet. " +
+          "Run pre-fetch (fetchSignedPayload) to get the per-wallet signature.",
+      };
+    }
+
+    // Non-OVR: OpenSea says not eligible — but for a sniper, a future-dated phase
+    // with signed mint data is still targetable. Prep now; fire at T-0.
+    // Only skip if the phase is already past and has no signed data.
     if (isPast && (!drop.mintData || !drop.mintSignature)) {
       return {
         drop,
@@ -557,6 +876,8 @@ export function printDropsInventory(
     if (typeBadge.toLowerCase().includes("ovr")) typeBadge = "OVR";
     if (typeBadge.toLowerCase().includes("public")) typeBadge = "public";
     if (typeBadge.toLowerCase().includes("reserved")) typeBadge = "reserved";
+    if (typeBadge.toLowerCase().includes("token-gated") || typeBadge.toLowerCase().includes("tokengated"))
+      typeBadge = "token-gated";
 
     // Price line
     const priceEth = formatEther(drop.mintPrice);

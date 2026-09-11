@@ -51,10 +51,53 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
   // ── Warm sockets and pre-fetch everything the signature depends on ──
   await warmConnections(rpcUrls);
 
-  const [nonces, network] = await Promise.all([
-    Promise.all(wallets.map((w) => provider.getTransactionCount(w.address, "pending"))),
-    provider.getNetwork(),
-  ]);
+  // ── Nonce strategy: read from EVERY endpoint, use highest agreed nonce ──
+  // Reading from rpcUrls[0] only and blasting to all is the bug the nonce-cross-check
+  // exists to fix: if another endpoint has a higher pending nonce, every signed tx
+  // lands as stale-nonce or is rejected. We resolve the highest nonce that a
+  // majority of endpoints agree on. Endpoints that disagree are still used for
+  // blasting (redundancy), but the signed nonce is the safe one.
+  const nonceChecks = await Promise.all(
+    wallets.map(async (w) => {
+      const perEndpoint: { url: string; nonce: number | null }[] = [];
+      await Promise.all(
+        rpcUrls.map(async (url) => {
+          try {
+            const res = await fetch(url, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ jsonrpc: "2.0", method: "eth_getTransactionCount", params: [w.address, "pending"], id: 1 }),
+              signal: AbortSignal.timeout(4000),
+            });
+            const json = (await res.json()) as any;
+            perEndpoint.push({ url, nonce: json.result != null ? parseInt(json.result, 16) : null });
+          } catch {
+            perEndpoint.push({ url, nonce: null });
+          }
+        })
+      );
+      const readable = perEndpoint.filter((p) => p.nonce != null);
+      const nonces = readable.map((p) => p.nonce!);
+      const highest = nonces.length > 0 ? Math.max(...nonces) : 0;
+      const agreed = nonces.length > 0 && new Set(nonces).size === 1;
+      return { address: w.address, nonce: highest, agreed, mismatched: readable.filter((p) => p.nonce !== highest).map((p) => p.url) };
+    })
+  );
+
+  // If endpoints disagree, warn but proceed with highest nonce — the blast will
+  // tell us which endpoints accepted. We do NOT refuse to fire, because refusing
+  // loses the mint; the blast + receipt poll is the real signal.
+  const mismatchedWallets = nonceChecks.filter((c) => !c.agreed);
+  if (mismatchedWallets.length > 0) {
+    console.log(chalk.yellow(`\n  ⚠ Nonce mismatch on ${mismatchedWallets.length} wallet(s) — using highest agreed nonce per wallet.`));
+    for (const c of mismatchedWallets) {
+      console.log(chalk.gray(`    [${c.address.slice(0, 6)}…${c.address.slice(-4)}] nonce ${c.nonce} | mismatched endpoints: ${c.mismatched.join(", ")}`));
+    }
+    console.log(chalk.gray(`  If your txs are rejected as "nonce too low", a wallet was active on another endpoint.` + "\n"));
+  }
+
+  const nonces = nonceChecks.map((c) => c.nonce);
+  const network = await provider.getNetwork();
   const chainId = network.chainId;
   console.log(chalk.gray(`  Nonces: [${nonces.join(", ")}] | chainId: ${chainId}`));
 
@@ -134,20 +177,40 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
 
   // ── Receipts (only for txs an endpoint actually accepted) ──
   console.log(chalk.gray("\n  Waiting for receipts..."));
-  await Promise.all(
+
+  // We know which wallet fired which txHash. The blast results are matched by
+  // index to `fired`, and `accepted` carries the `idx` so we can find the
+  // endpoint that accepted each tx. Poll that endpoint first; fall back to
+  // rpcUrls[0] if the poll fails or times out.
+  const receiptPolls = await Promise.all(
     accepted.map(async ({ idx, txHash }) => {
-      const receipt = await waitForReceipt(txHash, rpcUrls[0], 60_000);
-      if (!receipt) {
-        console.log(chalk.yellow(`  [W${idx}] TIMEOUT — check: ${explorerTx(chainId, txHash)}`));
-        return;
+      const firing = fired[idx];
+      let url = rpcUrls[0];
+      if (firing) {
+        const blastResults = await firing.responsePromise;
+        const accepting = blastResults.find((r: any) => r.txHash != null);
+        if (accepting) {
+          const ep = endpoints.find((e) => e.label === accepting.label);
+          if (ep) url = ep.url;
+        }
       }
-      const color = receipt.status === "SUCCESS" ? chalk.bold.green : chalk.bold.red;
-      console.log(
-        color(`  [W${idx}] Block: ${receipt.block} | Pos: ${receipt.position} | ${receipt.status} | Gas: ${receipt.gasUsed}`)
-      );
-      console.log(chalk.gray(`  [W${idx}] Track: ${explorerTx(chainId, txHash)}`));
+      return waitForReceipt(txHash, url, 60_000);
     })
   );
+
+  for (let i = 0; i < accepted.length; i++) {
+    const receipt = receiptPolls[i];
+    const { idx } = accepted[i];
+    if (!receipt) {
+      console.log(chalk.yellow(`  [W${idx}] TIMEOUT — check: ${explorerTx(chainId, accepted[i].txHash)}`));
+      continue;
+    }
+    const color = receipt.status === "SUCCESS" ? chalk.bold.green : chalk.bold.red;
+    console.log(
+      color(`  [W${idx}] Block: ${receipt.block} | Pos: ${receipt.position} | ${receipt.status} | Gas: ${receipt.gasUsed}`)
+    );
+    console.log(chalk.gray(`  [W${idx}] Track: ${explorerTx(chainId, accepted[i].txHash!)}`));
+  }
 
   console.log(chalk.bold.white("\n===== LOCAL PUBLIC MINT COMPLETE ====="));
 }

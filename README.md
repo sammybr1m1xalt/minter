@@ -1,15 +1,19 @@
-# NFT Public Mint Sniper
+# NFT Mint Sniper
 
-A command-line tool for sniping **public** NFT mints on OpenSea's SeaDrop, across
+A command-line tool for sniping NFT mints on OpenSea's SeaDrop, across
 Ethereum, Base and Robinhood Chain.
 
-It builds the mint transaction from **on-chain data only** - price, fee recipient
+Public stages are built entirely from on-chain data — price, fee recipient
 and per-wallet limit all come straight from the SeaDrop contract. That means:
 
-- **No OpenSea account, login, or access token.**
-- **No API rate limits** to lose a mint to.
+- **No OpenSea account, login, or access token for public stages.**
+- **No API rate limits** to lose a public mint to.
 - **Faster.** Every transaction is signed and serialised *before* the stage opens,
   so at the exact start time the only work left is writing bytes to the network.
+
+Signed / allowlist / OVR stages need a free OpenSea API key to fetch a
+per-wallet signed mint payload (mintSignature + mintData). The signing itself
+is done locally — the API only provides the signature bytes.
 
 Multi-wallet: paste as many keys as you like and they all fire in parallel.
 
@@ -58,6 +62,32 @@ Install [Node.js 18+](https://nodejs.org) and [Git](https://git-scm.com/download
 then reopen your terminal.
 
 </details>
+
+## Post-mint digest tracker
+
+`scripts/run_digest_tracker.sh` reads `debot-minted-out.csv` per `batchId`, queries the SeaDrop/OpenSea public drop events for each batch, deduplicates/searches for known digests to recover transaction hashes, fetches the mint events from each transaction, and writes one accumulated `.digesttracker.data` line per (chainId, digest) minting event. Output is grouped by `batchId` with total counts across all batches and all installs.
+
+The script installs its own dependencies (`jq` for JSON parsing; `axios` via npm as a fallback HTTP client) and auto-resumes on interrupted runs. Run it after any minting session — public FCFS, allowlist, or OVR — to get per-endpoint latency, acceptance/rejection, receipt status, and gas info for every mint.
+
+```bash
+bash scripts/run_digest_tracker.sh
+```
+
+See the script header for the full invocation and output format.
+
+## Step 2 — Configure (optional but recommended)
+
+| Command | What it does |
+|---|---|
+| `npm start` | Interactive wizard — keys, chain, quantity, NFT link, RPC, gas, timing |
+| `npm start -- --help` | Print all CLI flags |
+| `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
+| `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases and whether your wallet can target each |
+| `node dist/index.js --help` | Same as above, bypassing npm |
+
+The `--fcfs` and `--eligibility` flags target signed-mint, allowlist, and OVR phases in addition to public stages. `--fcfs` runs the full sniper (pre-fetch per wallet, fire at T-0). `--eligibility` is read-only and prints a report so you can inspect a collection before committing keys.
+
+For the digest tracker (post-mint logging across batches), see [`scripts/run_digest_tracker.sh`](scripts/run_digest_tracker.sh).
 
 ## Step 2 — Configure (optional but recommended)
 

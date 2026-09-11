@@ -2,7 +2,11 @@ import chalk from "chalk";
 import ora from "ora";
 
 export async function waitForMintTime(mintTime: Date, earlyFireMs: number = 0): Promise<void> {
-  // Fire early by earlyFireMs — tx sits in mempool and lands the moment contract allows
+  // Fire early by earlyFireMs — tx sits in mempool and lands the moment contract allows.
+  // WARNING: earlyFireMs only helps if your RPC is on the same chain the contract
+  // cares about. If rpcUrls[0] resolves to the wrong chain (e.g. Base RPC while
+  // the contract is on Ethereum), the tx will be rejected or silently misdirected.
+  // Run rpcHealthCheck() before relying on earlyFireMs.
   const fireTime = new Date(mintTime.getTime() - earlyFireMs);
   const now = new Date();
   const diff = fireTime.getTime() - now.getTime();
