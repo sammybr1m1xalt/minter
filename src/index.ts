@@ -12,6 +12,19 @@ import { closePrompts } from "./prompt";
 import { parseWhen, isValidWhen } from "./schedule";
 import { parsePriceSpec, extractMaxPriceSpec } from "./price-protection";
 import { parseTarget, resolveTarget } from "./target-resolver";
+import { destroyProviderCache } from "./chains";
+
+// ── Provider cleanup ────────────────────────────────────────────────────────
+// ethers keeps a polling timer alive on every JsonRpcProvider. A provider that
+// is not destroyed keeps the Node event loop busy, so a run that finished its
+// work still never exits — the process hangs after printing its final line.
+//
+// Individual call sites destroy their own short-lived providers, but a single
+// missed `finally` on an early return is enough to hang the process. This hook
+// is the backstop: it runs on every normal exit path, including process.exit().
+process.on("exit", () => {
+  destroyProviderCache();
+});
 
 const HELP = `\nNFT Mint Sniper\n\n  Mints public SeaDrop stages AND FCFS/allowlist/OVR stages, plus any\n  contract with a discoverable mint function (ERC721/ERC1155, Manifold,\n  Zora, Scatter, or a bespoke mint).\n  Public mints need no OpenSea account; FCFS stages fetch a signed\n  payload from OpenSea (free API key, auto-managed).\n\nUsage\n  npm start                          run the interactive wizard\n  npm start -- --fcfs <target>       run the FCFS/allowlist/OVR branch directly\n  npm start -- --eligibility <ca>   poll eligibility + gas for a contract (no mint)\n  npm start -- --help                show this message\n\nTarget\n  An OpenSea / Scatter / Zora / Manifold link, a collection slug, or a contract\n  address. Chain aliases work: "0xabc… on base", "slug matic", "slug arb".\n\nOptions\n  --at <time>           ISO 8601, unix seconds/ms, "in 5m", "30s", or "HH:MM"\n  --max-price <price>   max total price in ETH, "free", "0.05/unit", "0.05total",\n                        or "any" (no cap)\n  --wallets <spec>      all | N | 1,3,4  (default: single primary wallet)\n  --chain <key>         ethereum | base | polygon | arbitrum | optimism | ...\n  --quantity <n>        NFTs per wallet (default 1)\n\nExamples\n  npm start -- --fcfs de-bots\n  npm start -- --fcfs de-bots --at "in 5m" --max-price 0.01\n  npm start -- --eligibility 0x8d80efb61341e4b8459fbb52b213d5c25a1af179\n  npm start -- --fcfs 0xabc… on base --quantity 3 --wallets all\n\nEverything not passed as a flag is asked interactively: keys, chain, quantity,\nNFT link, RPC, gas and timing. Optional defaults can be set in .env.\n`;
 

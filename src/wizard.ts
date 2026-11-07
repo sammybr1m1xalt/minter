@@ -63,6 +63,7 @@ import { parseTarget, resolveTarget, chainSlug, ResolvedTarget } from "./target-
 import { parseWhen } from "./schedule";
 import { parsePriceSpec } from "./price-protection";
 import { findUniversalMint, explainFailure, UniversalMintPlan } from "./universal-mint";
+import { getMintMechanisms } from "./seadrop-public";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
 import { blastToAll } from "./rpc-blast";
 import {
@@ -349,6 +350,33 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
 
     console.log(chalk.yellow("  ✗ No mintable mechanism found on this contract."));
     console.log(chalk.gray(explainFailure(universal)));
+
+    // Explain WHY, when the contract is a SeaDrop drop with non-public
+    // mechanisms. Ported from mint.js, which read getMintMechanisms() to warn
+    // that a public fallback does not cover the wallet's spot. Without this the
+    // user is left guessing whether the failure is a closed sale, a missing
+    // allowlist spot, or a token gate.
+    try {
+      const mech = await getMintMechanisms(rpcUrls[0], nftInput);
+      if (mech.signers.length > 0 || mech.tokenGated.length > 0) {
+        const kinds: string[] = [];
+        if (mech.signers.length > 0) kinds.push("signed (needs an OpenSea signature)");
+        if (mech.tokenGated.length > 0) kinds.push("token-gated (needs a held NFT)");
+        console.log(
+          chalk.yellow(
+            `\n  This drop uses ${kinds.join(" and ")} — a public mint will not cover your wallet.`
+          )
+        );
+        console.log(
+          chalk.gray(
+            `  You need to be on its allowlist, or hold its token, before it opens.`
+          )
+        );
+      }
+    } catch {
+      // Best-effort diagnostic — never block the refusal on it.
+    }
+
     console.log(
       chalk.gray(
         "\n  This may not be a mintable contract, the sale may be closed, or it may\n" +

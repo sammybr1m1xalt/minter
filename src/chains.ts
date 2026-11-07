@@ -10,6 +10,8 @@
 // so the existing OpenSea-based mint flow works on it unchanged — only the RPC
 // (in .env) and the explorer links (resolved here) differ from Base.
 
+import { JsonRpcProvider } from "ethers";
+
 export interface ChainProfile {
   key: string;          // OpenSea id + --chain value + CHAIN env value
   chainId: number;      // EVM network chain id
@@ -111,6 +113,77 @@ export function chainKeyFromId(chainId: number): string | null {
   const c = resolveChain(chainId);
   return c?.key ?? null;
 }
+
+// ── Provider cache ──────────────────────────────────────────────────────────
+// Ported from nft-minter-bot/src/chains.js getProvider().
+//
+// The TS port constructed a fresh JsonRpcProvider at every call site — 12 of
+// them across 7 files — and destroyed only some. Every provider carries a
+// polling timer, so each leaked one keeps the Node event loop busy and the
+// process never exits. The original cached one provider per chain and reused it.
+//
+// A cached provider is also faster: the first request pays the connection
+// setup, and every later call reuses the keep-alive socket.
+
+const providerCache = new Map<string, JsonRpcProvider>();
+
+// Per-chain request timeout so a stalled RPC never hangs a mint or a poll.
+const RPC_TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS) || 15000;
+
+/**
+ * Get a cached provider for a chain, creating it on first use.
+ *
+ * The caller does NOT own the returned provider — it is shared and must not be
+ * destroyed. Use `shortLivedProvider` for a one-off read that must not leak.
+ */
+export function getProvider(idOrKey: string | number | bigint): JsonRpcProvider {
+  const profile = resolveChain(idOrKey);
+  if (!profile) {
+    throw new Error(`unknown chain: ${String(idOrKey)}`);
+  }
+  const cached = providerCache.get(profile.key);
+  if (cached) return cached;
+
+  const url = profile.rpc.public[0];
+  const provider = new JsonRpcProvider(url, profile.chainId, {
+    staticNetwork: true,
+    pollingInterval: 4000,
+  });
+  providerCache.set(profile.key, provider);
+  return provider;
+}
+
+/**
+ * Create a provider for a specific RPC URL, with a bounded request timeout.
+ *
+ * Use this for one-off reads (simulation, eth_getCode, a gas estimate) where a
+ * cached per-chain provider is not wanted. The caller owns the result and MUST
+ * call destroy() when finished — see the note on provider lifetime in
+ * simulate.ts.
+ */
+export function shortLivedProvider(
+  rpcUrl: string,
+  chainId?: number
+): JsonRpcProvider {
+  return new JsonRpcProvider(rpcUrl, chainId, {
+    staticNetwork: true,
+    pollingInterval: 1000,
+  });
+}
+
+/** Destroy every cached provider. Call before process exit. */
+export function destroyProviderCache(): void {
+  for (const p of providerCache.values()) {
+    try {
+      p.destroy();
+    } catch {
+      // Already destroyed.
+    }
+  }
+  providerCache.clear();
+}
+
+export { RPC_TIMEOUT_MS };
 
 // ── OpenSea chain key mapping ────────────────────────────────────────────────
 // Maps our internal chain keys to OpenSea's chain identifiers.

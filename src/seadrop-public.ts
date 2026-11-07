@@ -23,6 +23,12 @@ const PUBLIC_ABI = [
   "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",
   "function getPublicDrop(address nftContract) view returns (tuple(uint80 mintPrice, uint48 startTime, uint48 endTime, uint16 maxTotalMintableByWallet, uint16 feeBps, bool restrictFeeRecipients))",
   "function getAllowedFeeRecipients(address nftContract) view returns (address[])",
+  // Mint mechanisms — ported from nft-minter-bot/src/seadrop.js
+  // getMintMechanisms(). These tell us whether a drop is signed or token-gated
+  // rather than public, so a wallet that is not on the allowlist gets an
+  // explanation instead of an on-chain revert.
+  "function getSigners(address nftContract) view returns (address[])",
+  "function getTokenGatedAllowedTokens(address nftContract) view returns (address[])",
 ];
 
 const IFACE = new Interface(PUBLIC_ABI);
@@ -51,10 +57,9 @@ export async function fetchPublicDrop(
   rpcUrl: string,
   nftContract: string
 ): Promise<PublicDrop | null> {
-  const provider = new JsonRpcProvider(rpcUrl);
-  const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
-
+  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
   try {
+    const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
     const raw = await seadrop.getPublicDrop(nftContract);
     const drop: PublicDrop = {
       mintPrice: BigInt(raw.mintPrice),
@@ -71,6 +76,14 @@ export async function fetchPublicDrop(
     return drop;
   } catch {
     return null;
+  } finally {
+    // ethers keeps a polling timer alive on every provider. Without an explicit
+    // destroy the process never exits.
+    try {
+      provider.destroy();
+    } catch {
+      // Already destroyed.
+    }
   }
 }
 
@@ -81,25 +94,82 @@ export async function resolveFeeRecipient(
   nftContract: string,
   restricted: boolean
 ): Promise<{ address: string; source: string } | null> {
-  const provider = new JsonRpcProvider(rpcUrl);
-  const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
-
-  let allowed: string[] = [];
+  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
   try {
-    allowed = await seadrop.getAllowedFeeRecipients(nftContract);
-  } catch {
-    allowed = [];
-  }
+    const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
+    let allowed: string[] = [];
+    try {
+      allowed = await seadrop.getAllowedFeeRecipients(nftContract);
+    } catch {
+      allowed = [];
+    }
 
-  if (allowed.length > 0) {
-    return { address: allowed[0], source: "allowed fee recipient on-chain" };
+    if (allowed.length > 0) {
+      return { address: allowed[0], source: "allowed fee recipient on-chain" };
+    }
+    if (restricted) {
+      // Nothing allowed and the drop enforces the list — a public mint cannot be
+      // constructed at all, locally or otherwise.
+      return null;
+    }
+    return { address: OPENSEA_FEE_RECIPIENT, source: "OpenSea default (drop does not restrict)" };
+  } finally {
+    // ethers keeps a polling timer alive on every provider. Without an explicit
+    // destroy the process never exits.
+    try {
+      provider.destroy();
+    } catch {
+      // Already destroyed.
+    }
   }
-  if (restricted) {
-    // Nothing allowed and the drop enforces the list — a public mint cannot be
-    // constructed at all, locally or otherwise.
-    return null;
+}
+
+export interface MintMechanisms {
+  signers: string[];
+  tokenGated: string[];
+}
+
+/**
+ * Read which non-public mint mechanisms a drop uses.
+ *
+ * Ported from nft-minter-bot/src/seadrop.js getMintMechanisms(). The original
+ * used this to explain WHY a public mint would fail: when a drop has signers or
+ * token-gated tokens, a wallet that is not on the allowlist cannot mint publicly
+ * at all, and the failure is better reported as a reason than discovered as an
+ * on-chain revert.
+ *
+ * Both reads are best-effort: older SeaDrop variants do not expose these
+ * getters, and a missing getter is not an error — it means "no such mechanism".
+ */
+export async function getMintMechanisms(
+  rpcUrl: string,
+  nftContract: string
+): Promise<MintMechanisms> {
+  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+  try {
+    const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
+    let signers: string[] = [];
+    let tokenGated: string[] = [];
+    try {
+      signers = Array.from(await seadrop.getSigners(nftContract) as string[]);
+    } catch {
+      /* not supported on this SeaDrop variant */
+    }
+    try {
+      tokenGated = Array.from(
+        await seadrop.getTokenGatedAllowedTokens(nftContract) as string[]
+      );
+    } catch {
+      /* not supported on this SeaDrop variant */
+    }
+    return { signers, tokenGated };
+  } finally {
+    try {
+      provider.destroy();
+    } catch {
+      // Already destroyed.
+    }
   }
-  return { address: OPENSEA_FEE_RECIPIENT, source: "OpenSea default (drop does not restrict)" };
 }
 
 // minterIfNotPayer = address(0) means "credit the caller", so the calldata is

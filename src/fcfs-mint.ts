@@ -42,6 +42,7 @@ import { SEADROP_ADDRESS } from "./seadrop-public";
 import { ConfirmedTx } from "./rpc-health";
 import { buildOpenseaMint, OpenseaMintTx } from "./opensea-gql";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
+import { autoGasBounded } from "./auto-gas";
 import { assertPriceProtection } from "./price-protection";
 
 // ── OpenSea v2 shapes (read from the live response, not hardcoded magic) ──
@@ -1076,6 +1077,40 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         maxFeePerGas,
         maxPriorityFeePerGas,
       };
+
+      // ── Gas estimation (ported from mint.js autoGas) ────────────────────
+      // The static 250k default is a guess, and a wrong guess fails silently:
+      // too low and the tx reverts on-chain with out-of-gas after broadcast;
+      // too high and the fee cap (maxFeePerGas × gasLimit) can exceed what the
+      // wallet can cover when the base fee moves, so the tx never mines.
+      // Estimate per transaction, with a 20% buffer, as the original does.
+      //
+      // A failed estimate is almost always a revert — refuse rather than send.
+      const gasProvider = new JsonRpcProvider(rpcUrls[0], undefined, {
+        staticNetwork: true,
+        pollingInterval: 1000,
+      });
+      let estimated: Awaited<ReturnType<typeof autoGasBounded>>;
+      try {
+        estimated = await autoGasBounded(
+          gasProvider,
+          { to: txRequest.to, from: addr, data: txRequest.data, value: txRequest.value },
+          8_000
+        );
+      } finally {
+        try {
+          gasProvider.destroy();
+        } catch {
+          // Already destroyed.
+        }
+      }
+      if (estimated) {
+        txRequest.gasLimit = Number(estimated.gasLimit);
+        if (estimated.maxFeePerGas) txRequest.maxFeePerGas = estimated.maxFeePerGas;
+        if (estimated.maxPriorityFeePerGas) {
+          txRequest.maxPriorityFeePerGas = estimated.maxPriorityFeePerGas;
+        }
+      }
 
       // ── Price protection (ported from price.js) ─────────────────────────
       // Assert before signing. A signed payload carries the price OpenSea quoted

@@ -125,15 +125,21 @@ function rpcUrlsForChain(chainKey?: string): string[] {
 
 async function getProvider(chainKey?: string): Promise<JsonRpcProvider | null> {
   for (const url of rpcUrlsForChain(chainKey)) {
+    const p = new JsonRpcProvider(url, undefined, { staticNetwork: true });
     try {
-      const p = new JsonRpcProvider(url);
       await Promise.race([
         p.getBlockNumber(),
         new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 4000)),
       ]);
       return p;
     } catch {
-      // next
+      // This endpoint failed its probe — destroy it before trying the next, or
+      // every failed attempt leaks a polling timer.
+      try {
+        p.destroy();
+      } catch {
+        // Already destroyed.
+      }
     }
   }
   return null;

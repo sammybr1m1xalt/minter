@@ -166,19 +166,34 @@ export async function waitForReceipt(
           actualGasPrice: effectiveGasPrice,
         };
       }
-      // Receipt not found — check if the tx itself exists (pending/dropped)
-      const txRes = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          method: "eth_getTransactionByHash",
-          params: [txHash],
-          id: 1,
-        }),
-      });
-      const txJson = (await txRes.json()) as any;
-      const tx = txJson.result;
+      // Receipt not found — check if the tx itself exists (pending/dropped).
+      // This fetch MUST be bounded too. The loop's `timeoutMs` is checked
+      // between iterations; a fetch that hangs inside an iteration bypasses it
+      // entirely, so an RPC that accepts the connection and then stalls would
+      // hang the receipt poll forever.
+      const txController = new AbortController();
+      const txTimer = setTimeout(() => txController.abort(), 3000);
+      let txJson: any;
+      try {
+        const txRes = await fetch(rpcUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "eth_getTransactionByHash",
+            params: [txHash],
+            id: 1,
+          }),
+          signal: txController.signal,
+        });
+        txJson = (await txRes.json()) as any;
+      } catch {
+        // Treat a failed lookup as "not found yet" and keep polling.
+        txJson = null;
+      } finally {
+        clearTimeout(txTimer);
+      }
+      const tx = txJson?.result;
       if (tx && tx.blockNumber === null) {
         // Still pending — keep polling
         await new Promise((r) => setTimeout(r, 1000));

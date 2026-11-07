@@ -15,6 +15,7 @@ import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
 import { LocalMintPlan } from "./seadrop-public";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
+import { autoGasBounded } from "./auto-gas";
 import { assertPriceProtection } from "./price-protection";
 
 export interface LocalSnipeOpts {
@@ -42,7 +43,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
     maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan, maxPriceWei,
   } = opts;
 
-  const provider = new JsonRpcProvider(rpcUrls[0]);
+  const provider = new JsonRpcProvider(rpcUrls[0], undefined, { staticNetwork: true });
   const endpoints = parseRpcEndpoints(rpcUrls);
   const wallets = walletKeys.map((k) => new Wallet(k, provider));
 
@@ -214,15 +215,60 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
   const signStart = performance.now();
   const prepared: { idx: number; address: string; blast: PreparedBlast }[] = [];
 
+  // ── Gas estimation (ported from mint.js autoGas) ────────────────────────
+  // The static 250k default fails silently in both directions: too low and the
+  // tx reverts on-chain with out-of-gas after broadcast; too high and the fee
+  // cap (maxFeePerGas × gasLimit) can exceed what the wallet can cover when the
+  // base fee moves, so the tx never mines. Estimate once — the calldata is
+  // identical for every wallet, so one estimate covers the batch.
+  let estimatedGasLimit = gasLimit || 250_000;
+  let estimatedMaxFee = maxFeePerGas;
+  let estimatedPriority = maxPriorityFee;
+  const gasProvider = new JsonRpcProvider(rpcUrls[0], undefined, {
+    staticNetwork: true,
+    pollingInterval: 1000,
+  });
+  try {
+    const est = await autoGasBounded(
+      gasProvider,
+      { to: plan.to, from: wallets[0].address, data: plan.data, value: plan.value },
+      8_000
+    );
+    if (est) {
+      estimatedGasLimit = Number(est.gasLimit);
+      if (est.maxFeePerGas) estimatedMaxFee = est.maxFeePerGas;
+      if (est.maxPriorityFeePerGas) estimatedPriority = est.maxPriorityFeePerGas;
+      console.log(
+        chalk.gray(
+          `  ✓ Gas estimated: ${estimatedGasLimit} (was the ${gasLimit || 250_000} default)`
+        )
+      );
+    } else {
+      console.log(
+        chalk.yellow(`  ⚠ Gas estimation inconclusive — using the ${estimatedGasLimit} default.`)
+      );
+    }
+  } catch (e: any) {
+    console.log(
+      chalk.yellow(`  ⚠ Gas estimation failed (${e?.message ?? e}) — using the ${estimatedGasLimit} default.`)
+    );
+  } finally {
+    try {
+      gasProvider.destroy();
+    } catch {
+      // Already destroyed.
+    }
+  }
+
   for (let i = 0; i < wallets.length; i++) {
     const rawTx = await wallets[i].signTransaction({
       to: plan.to,
       data: plan.data,
       value: plan.value,
       nonce: nonces[i],
-      maxFeePerGas,
-      maxPriorityFeePerGas: maxPriorityFee,
-      gasLimit: gasLimit || 250_000,
+      maxFeePerGas: estimatedMaxFee,
+      maxPriorityFeePerGas: estimatedPriority,
+      gasLimit: estimatedGasLimit,
       type: 2,
       chainId,
     });
