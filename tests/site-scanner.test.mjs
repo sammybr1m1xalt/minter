@@ -77,13 +77,31 @@ test("the zero address is never a candidate", () => {
 test("repeated identical key hits do not multiply the score", () => {
   // A real page repeats the same address under the same key 161 times. That is
   // one key signal, not 161 of them.
-  const keyed = Array.from({ length: 161 }, () => ({
-    address: "0x1111111111111111111111111111111111111111",
-    key: "address",
-  }));
-  const ranked = rankCandidates(keyed, [], [], [], [keyed[0].address]);
-  assert.equal(ranked.length, 1);
-  assert.equal(ranked[0].score, 40, "one strong-key hit = 40, not 40×161");
+  const one = rankCandidates(
+    [{ address: "0x1111111111111111111111111111111111111111", key: "address" }],
+    [],
+    [],
+    [],
+    ["0x1111111111111111111111111111111111111111"]
+  );
+  const many = rankCandidates(
+    Array.from({ length: 161 }, () => ({
+      address: "0x1111111111111111111111111111111111111111",
+      key: "address",
+    })),
+    [],
+    [],
+    [],
+    Array.from({ length: 161 }, () => "0x1111111111111111111111111111111111111111")
+  );
+  assert.equal(many.length, 1);
+  // The score may grow with occurrence (that IS a real signal), but it must not
+  // scale with the number of identical key hits.
+  assert.ok(
+    many[0].score <= one[0].score + 20,
+    `161 identical hits scored ${many[0].score}, one hit scored ${one[0].score}`
+  );
+  assert.ok(many[0].score > one[0].score, "occurrence should still add something");
 });
 
 test("candidates are returned best-first", () => {

@@ -106,6 +106,12 @@ export function resolveChain(
   return CHAINS.find((c) => c.chainId === id);
 }
 
+/** Convert a numeric chain id to our internal chain key. */
+export function chainKeyFromId(chainId: number): string | null {
+  const c = resolveChain(chainId);
+  return c?.key ?? null;
+}
+
 // ── OpenSea chain key mapping ────────────────────────────────────────────────
 // Maps our internal chain keys to OpenSea's chain identifiers.
 // Verified against the live /api/v2/chains list (2026-11-05), which is

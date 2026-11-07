@@ -34,6 +34,9 @@ import {
 } from "./prompt";
 import { parseNftLink } from "./nft-link";
 import { resolveContractToSlug } from "./slug-resolver";
+import { parseTarget, resolveTarget } from "./target-resolver";
+import { parseWhen } from "./schedule";
+import { loadEnvKeys, selectFromLoaded } from "./wizard";
 import {
   promptGasGwei,
   promptTiming,
@@ -51,7 +54,7 @@ export async function runFcfsBranch(
   nftContract: string,
   quantity: number,
   rpcUrls: string[],
-  target: { label: string },
+  target: { label: string; at?: string | null; whenOpen?: boolean; maxPrice?: string | null },
 ): Promise<void> {
   log.info("FCFS branch: started");
   log.field("nftContract", nftContract);
@@ -570,8 +573,21 @@ export async function runEligibilityCheck(_log: RunLogger, nftContract: string):
 // Resolves chain + RPC from env, prompts for wallet keys, then calls the
 // 7-arg runFcfsBranch executor defined above.
 
-export async function runFcfsBranchCli(log: RunLogger, targetArg: string): Promise<void> {
-  const chainKey = (process.env.CHAIN || "base").toLowerCase();
+export interface FcfsCliOptions {
+  at?: string | null;
+  whenOpen?: boolean;
+  maxPrice?: string | null;
+  wallets?: string | null;
+  chain?: string | null;
+  quantity?: number | null;
+}
+
+export async function runFcfsBranchCli(
+  log: RunLogger,
+  targetArg: string,
+  opts: FcfsCliOptions = {}
+): Promise<void> {
+  const chainKey = (opts.chain || process.env.CHAIN || "base").toLowerCase();
   const chainProfile = resolveChain(chainKey);
   if (!chainProfile) throw new Error(`Unknown chain "${chainKey}"`);
 
@@ -586,36 +602,66 @@ export async function runFcfsBranchCli(log: RunLogger, targetArg: string): Promi
   const rpcUrls = plan.urls;
   if (rpcUrls.length === 0) throw new Error(`No usable RPC endpoints for ${chainProfile.name}`);
 
-  const parsed = parseNftLink(targetArg);
-  const nftContract = parsed.value;
-  const targetLabel = parsed.value;
-  const targetChainKey = parsed.chainHint && resolveChain(parsed.chainHint) ? parsed.chainHint : chainKey;
-  const quantity = 1;
-
-  console.log(chalk.bold.white("\\nPrivate keys"));
-  console.log(chalk.gray("  Paste one key per line — typing is hidden. Blank line when done."));
-  log.info("FCFS CLI: prompting for wallet keys");
-  const keys: string[] = [];
-  const seen = new Set<string>();
-  for (;;) {
-    const raw = await askHidden(chalk.gray(`  › key ${keys.length + 1}: `));
-    if (!raw) {
-      if (keys.length === 0) { console.log(chalk.red("  ✗ Need at least one key.")); continue; }
-      break;
-    }
-    const normalized = raw.startsWith("0x") ? raw : `0x${raw}`;
-    let wallet: Wallet;
-    try { wallet = new Wallet(normalized); } catch { console.log(chalk.red("  ✗ Not a valid private key — try again.")); continue; }
-    if (seen.has(wallet.address.toLowerCase())) { console.log(chalk.yellow(`  ⚠ Duplicate of ${wallet.address.slice(0,6)}…${wallet.address.slice(-4)} — skipped.`)); continue; }
-    seen.add(wallet.address.toLowerCase());
-    keys.push(normalized);
-    console.log(chalk.green(`  ✓ [W${keys.length - 1}] ${wallet.address}`));
+  // Parse the target with the unified resolver so Scatter/Zora/direct addresses
+  // work here too, not just OpenSea links.
+  const parsed = parseTarget(targetArg);
+  const resolvedTarget = await resolveTarget(parsed, process.env.OPENSEA_API_KEY || "", chainKey);
+  if (!resolvedTarget) {
+    throw new Error(
+      parsed.platform === "manifold"
+        ? `Manifold claim "${parsed.claimId}" cannot be resolved automatically — paste the 0x… claim contract instead.`
+        : `Could not resolve "${targetArg}".`
+    );
   }
+  const nftContract = resolvedTarget.contract;
+  const targetLabel = resolvedTarget.slug ?? resolvedTarget.contract;
+  const targetChainKey = resolvedTarget.chainKey;
+  const quantity = opts.quantity ?? 1;
+
+  // ── Wallets ──────────────────────────────────────────────────────────────
+  // A --wallets spec with keys in the environment means the run is headless.
+  // Load them rather than prompting, which would hang forever.
+  const envKeys = loadEnvKeys();
+  let keys: string[] = [];
+  if (envKeys.length > 0 && (opts.wallets || !process.stdin.isTTY)) {
+    const selected = opts.wallets ? selectFromLoaded(envKeys, opts.wallets) : envKeys;
+    keys = selected.map((w) => w.privateKey);
+    console.log(chalk.bold.white("\nPrivate keys"));
+    console.log(chalk.gray(`  ${keys.length} wallet(s) from environment${opts.wallets ? ` (${opts.wallets})` : ""}.`));
+    for (const w of selected) console.log(chalk.green(`  ✓ ${w.address}`));
+  } else {
+    console.log(chalk.bold.white("\nPrivate keys"));
+    console.log(chalk.gray("  Paste one key per line — typing is hidden. Blank line when done."));
+    log.info("FCFS CLI: prompting for wallet keys");
+    const seen = new Set<string>();
+    for (;;) {
+      const raw = await askHidden(chalk.gray(`  › key ${keys.length + 1}: `));
+      if (!raw) {
+        if (keys.length === 0) { console.log(chalk.red("  ✗ Need at least one key.")); continue; }
+        break;
+      }
+      const normalized = raw.startsWith("0x") ? raw : `0x${raw}`;
+      let wallet: Wallet;
+      try { wallet = new Wallet(normalized); } catch { console.log(chalk.red("  ✗ Not a valid private key — try again.")); continue; }
+      if (seen.has(wallet.address.toLowerCase())) { console.log(chalk.yellow(`  ⚠ Duplicate of ${wallet.address.slice(0,6)}…${wallet.address.slice(-4)} — skipped.`)); continue; }
+      seen.add(wallet.address.toLowerCase());
+      keys.push(normalized);
+      console.log(chalk.green(`  ✓ [W${keys.length - 1}] ${wallet.address}`));
+    }
+  }
+  if (keys.length === 0) throw new Error("No wallet keys provided.");
   console.log(chalk.gray(`  ${keys.length} wallet(s) loaded.\n`));
   log.field("wallet_count", keys.length);
   log.field("rpc_urls", rpcUrls.length);
   log.field("rpc_source", envRpcs.length > 0 ? "env" : "public");
+  if (opts.at) log.field("scheduled_at", String(parseWhen(opts.at)));
+  if (opts.maxPrice) log.field("max_price", opts.maxPrice);
   log.info("FCFS CLI: keys loaded, calling runFcfsBranch");
 
-  await runFcfsBranch(log, keys, chainProfile, targetChainKey, nftContract, quantity, rpcUrls, { label: targetLabel });
+  await runFcfsBranch(log, keys, chainProfile, targetChainKey, nftContract, quantity, rpcUrls, {
+    label: targetLabel,
+    at: opts.at,
+    whenOpen: opts.whenOpen,
+    maxPrice: opts.maxPrice,
+  });
 }

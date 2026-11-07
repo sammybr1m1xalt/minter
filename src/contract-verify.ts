@@ -80,6 +80,48 @@ function providerFor(chainId: number): JsonRpcProvider {
   return new JsonRpcProvider(urls[0]);
 }
 
+/**
+ * Run a read against the chain's RPCs, trying each in turn.
+ *
+ * Public RPCs rate-limit bursts and occasionally drop a request entirely. A
+ * single failed call would otherwise surface as "not a contract" — a false
+ * negative that silently discards a real candidate. Trying every configured
+ * endpoint costs nothing when the first works and turns a transient failure
+ * into a successful read.
+ */
+async function withProviderFailover<T>(
+  chainId: number,
+  fn: (provider: JsonRpcProvider) => Promise<T>
+): Promise<T> {
+  const profile = resolveChain(chainId);
+  const urls = profile?.rpc?.public ?? [];
+  if (urls.length === 0) {
+    throw new Error(`No public RPC configured for chainId ${chainId}`);
+  }
+
+  let lastErr: unknown;
+  for (const url of urls) {
+    const provider = new JsonRpcProvider(url, undefined, {
+      staticNetwork: true,
+      pollingInterval: 2000,
+    });
+    try {
+      return await fn(provider);
+    } catch (err) {
+      lastErr = err;
+    } finally {
+      // ethers keeps a polling timer alive on every provider. Without an
+      // explicit destroy the process never exits.
+      try {
+        provider.destroy();
+      } catch {
+        // Already destroyed.
+      }
+    }
+  }
+  throw lastErr;
+}
+
 // ── Step 1: is it a contract? ───────────────────────────────────────────────
 
 /**
@@ -96,8 +138,7 @@ export async function getCode(
   address: string,
   chainId: number
 ): Promise<string> {
-  const provider = providerFor(chainId);
-  return provider.getCode(address);
+  return withProviderFailover(chainId, (provider) => provider.getCode(address));
 }
 
 /** True when the bytecode is an EIP-7702 delegation designator. */
@@ -217,8 +258,30 @@ export async function verifyContract(
   address: string,
   chainId: number
 ): Promise<VerificationResult> {
-  const provider = providerFor(chainId);
+  try {
+    return await withProviderFailover(chainId, (provider) =>
+      verifyContractInner(address, chainId, provider)
+    );
+  } catch (err: any) {
+    // Every RPC failed. Report it as an RPC error rather than "not a contract" —
+    // a network failure is not evidence about the address.
+    return {
+      address,
+      chainId,
+      isContract: false,
+      standard: "unknown",
+      erc165Supported: false,
+      platform: "none",
+      reason: `RPC error: ${err?.shortMessage ?? err?.message ?? "all endpoints failed"}`,
+    };
+  }
+}
 
+async function verifyContractInner(
+  address: string,
+  chainId: number,
+  provider: JsonRpcProvider
+): Promise<VerificationResult> {
   // 1. Contract?
   let code: string;
   try {

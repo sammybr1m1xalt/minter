@@ -14,6 +14,8 @@ import { warmConnections } from "./connection-warmer";
 import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
 import { LocalMintPlan } from "./seadrop-public";
+import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
+import { assertPriceProtection } from "./price-protection";
 
 export interface LocalSnipeOpts {
   nftContract: string;
@@ -25,12 +27,19 @@ export interface LocalSnipeOpts {
   gasLimit: number;
   targetStart: Date | null;
   plan: LocalMintPlan;
+  /**
+   * Maximum total price (wei) the user will accept. When set, the observed
+   * price is asserted against it before signing. Ported from price.js —
+   * without it a drop that raised its price between planning and firing would
+   * be minted at the new price with no warning.
+   */
+  maxPriceWei?: bigint | null;
 }
 
 export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
   const {
     nftContract, quantity, walletKeys, rpcUrls,
-    maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan,
+    maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan, maxPriceWei,
   } = opts;
 
   const provider = new JsonRpcProvider(rpcUrls[0]);
@@ -117,6 +126,89 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
   const network = await provider.getNetwork();
   const chainId = network.chainId;
   console.log(chalk.gray(`  Nonces: [${nonces.join(", ")}] | chainId: ${chainId}`));
+
+  // ── Price protection ────────────────────────────────────────────────────
+  // Ported from price.js assertPriceProtection. The plan's value was read from
+  // the chain a moment ago; if the drop's price moved, refuse rather than pay
+  // more than the user agreed to. Simulation alone does not catch this — a
+  // higher price with the same msg.value would still revert, but a drop that
+  // switched price AND the caller re-read it would silently mint at the new
+  // rate. The assertion is the guard.
+  if (maxPriceWei != null) {
+    assertPriceProtection({
+      actualPriceWei: plan.value,
+      maxPriceWei,
+      context: `public mint × ${quantity}`,
+    });
+    console.log(
+      chalk.gray(`  ✓ Price protection: ${formatEther(plan.value)} ≤ ${formatEther(maxPriceWei)} ETH`)
+    );
+  }
+
+  // ── Simulation gate ────────────────────────────────────────────────────
+  // Ported from mint.js, which simulates before every broadcast. The public
+  // path signs everything ahead of T-0, so the simulation must happen BEFORE
+  // signing — otherwise we sign bytes we already know will revert.
+  //
+  // Simulating every wallet is wasteful: the calldata is identical for all of
+  // them (minterIfNotPayer = 0x0), so one wallet's verdict applies to all. We
+  // simulate the first wallet and, if it reverts, refuse the whole batch.
+  const simProvider = new JsonRpcProvider(rpcUrls[0]);
+  const firstWallet = wallets[0];
+  let sim: SimulateResult;
+  try {
+    sim = await simulateTx(simProvider, {
+      to: plan.to,
+      from: firstWallet.address,
+      data: plan.data,
+      value: plan.value,
+    });
+  } finally {
+    // ethers keeps a polling timer alive on every provider. Without an explicit
+    // destroy the process never exits — the work is done but the event loop
+    // stays busy forever.
+    try {
+      simProvider.destroy();
+    } catch {
+      // Already destroyed.
+    }
+  }
+
+  // An INDETERMINATE result (timeout, network error) is not evidence the tx
+  // reverts — it means we could not tell. Fail OPEN: blocking a good mint
+  // because a public RPC had a bad moment is worse than sending a tx that
+  // might revert. A definitive revert still blocks.
+  if (!sim.ok && sim.reverted) {
+    const classified = classifyRevert(sim.reason);
+    const label = classified ? `[${classified.label}] ` : "";
+    console.log(
+      chalk.bold.red(
+        `\n  ✗ Simulation refused to sign: ${label}${sim.reason ?? "unknown revert"}`
+      )
+    );
+    console.log(
+      chalk.gray(
+        `    The transaction would revert on-chain. Nothing was signed or broadcast.`
+      )
+    );
+    if (classified?.retryable) {
+      console.log(
+        chalk.yellow(
+          `    This looks timing-related — the sale may not be open yet. Re-run when it is.`
+        )
+      );
+    }
+    return;
+  }
+  if (!sim.ok && sim.indeterminate) {
+    console.log(
+      chalk.yellow(
+        `\n  ⚠ Simulation inconclusive (${sim.reason}) — proceeding; the tx may still revert.`
+      )
+    );
+  } else if (sim.ok) {
+    console.log(chalk.green(`  ✓ Simulation passed — the mint transaction will succeed.`));
+  }
 
   // ── Sign everything now, well before the stage opens ──
   const signStart = performance.now();

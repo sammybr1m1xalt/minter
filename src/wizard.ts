@@ -16,6 +16,7 @@
 import chalk from "chalk";
 import dotenv from "dotenv";
 import path from "path";
+import fs from "fs";
 
 // Load .env so process.env has RPC_URL_*, OPENSEA_API_KEY, etc.
 // Must happen before any imported module reads process.env.
@@ -58,6 +59,12 @@ import {
 } from "./wizard-helpers";
 import { getValidApiKey } from "./opensea-key";
 import { getSessionCookies } from "./opensea-session";
+import { parseTarget, resolveTarget, chainSlug, ResolvedTarget } from "./target-resolver";
+import { parseWhen } from "./schedule";
+import { parsePriceSpec } from "./price-protection";
+import { findUniversalMint, explainFailure, UniversalMintPlan } from "./universal-mint";
+import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
+import { blastToAll } from "./rpc-blast";
 import {
   getDropEligibility,
   fetchRestEligibility,
@@ -106,18 +113,37 @@ interface PhaseEligibility {
 
 // ── Main wizard entry point ──────────────────────────────────────────────────
 
-export async function runWizard(log: RunLogger): Promise<void> {
+export interface WizardOptions {
+  /** Schedule the mint for a specific time instead of asking. */
+  at?: string | null;
+  /** Poll the on-chain open time and mint the instant it opens. */
+  whenOpen?: boolean;
+  /** Max total price in ETH, "free", or "any". */
+  maxPrice?: string | null;
+  /** Wallet selection: all | N | 1,3,4. */
+  wallets?: string | null;
+  /** Chain key override. */
+  chain?: string | null;
+  /** Quantity per wallet. */
+  quantity?: number | null;
+  /** Pre-filled mint target, skipping the prompt. */
+  target?: string | null;
+}
+
+export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promise<void> {
   log.info("Wizard: started");
   log.field("startup_mode", "interactive");
   log.field("chain_env", process.env.CHAIN || "<unset>");
   log.field("api_key_set", !!(process.env.OPENSEA_API_KEY));
   log.field("rpc_env", process.env[`RPC_URL_${(process.env.CHAIN || "base").toUpperCase()}`] || "<unset>");
+  if (opts.at) log.field("scheduled_at", String(parseWhen(opts.at)));
+  if (opts.maxPrice) log.field("max_price", opts.maxPrice);
 
   printBanner();
 
   // ── 1. Private keys ───────────────────────────────────────────────────
   log.info("Wizard: prompting for keys");
-  const walletKeys = await promptKeys(log);
+  const walletKeys = await promptKeys(log, opts.wallets);
   log.field("wallet_count", walletKeys.length);
   if (walletKeys.length === 0) {
     throw new Error("No wallet keys provided.");
@@ -125,30 +151,38 @@ export async function runWizard(log: RunLogger): Promise<void> {
   const wallets = walletKeys.map((k) => new Wallet(k));
 
   // ── 2. Chain ──────────────────────────────────────────────────────────
-  let chainKey = await askChoice<string>(
-    "Which chain?",
-    CHAINS.map((c) => ({ label: c.name, value: c.key, hint: `chain id ${c.chainId}` })),
-    Math.max(
-      0,
-      CHAINS.findIndex((c) => c.key === (process.env.CHAIN || "base").toLowerCase())
-    )
-  );
+  let chainKey = opts.chain
+    ? chainSlug(opts.chain)
+    : await askChoice<string>(
+        "Which chain?",
+        CHAINS.map((c) => ({ label: c.name, value: c.key, hint: `chain id ${c.chainId}` })),
+        Math.max(
+          0,
+          CHAINS.findIndex((c) => c.key === (process.env.CHAIN || "base").toLowerCase())
+        )
+      );
+  if (!resolveChain(chainKey)) {
+    throw new Error(`Unknown chain "${chainKey}". Use ethereum, base, polygon, arbitrum, optimism, zora-network, or robinhood.`);
+  }
   log.field("chain", chainKey);
   const chainProfile = resolveChain(chainKey)!;
 
   // ── 3. Quantity ───────────────────────────────────────────────────────
-  const quantity = await promptQuantity(walletKeys.length);
+  const quantity = opts.quantity ?? (await promptQuantity(walletKeys.length));
   log.field("quantity", quantity);
   if (quantity <= 0) {
     throw new Error("Quantity must be at least 1. Aborting.");
   }
 
   // ── 4. NFT target ──────────────────────────────────────────────────────
-  const target = await promptTarget(log, chainKey);
+  const target = opts.target
+    ? await promptTarget(log, chainKey, opts.target)
+    : await promptTarget(log, chainKey);
   const nftInput = target.contract;
   chainKey = target.chainKey;
   log.field("nft_input", nftInput);
   log.field("label", target.label);
+  log.field("platform", target.resolved?.platform ?? "unknown");
 
   // ── 5. RPC endpoints ──────────────────────────────────────────────────
   const manualRpcs = await promptRpc(chainProfile);
@@ -268,6 +302,63 @@ export async function runWizard(log: RunLogger): Promise<void> {
   const inventory = await discoverAllPhases(nftInput, slug, apiKey, chainKey, 12000);
   log.field("phases_found", inventory.drops.length);
 
+  // ── 8a. Gas (needed by both the phase path and the universal fallback) ──
+  console.log(chalk.bold.white("\nGas"));
+  const gas = await promptGasGwei(chainProfile, rpcUrls);
+
+  // ── 8b. Universal fallback ─────────────────────────────────────────────
+  // OpenSea only knows about drops it hosts. A plain ERC721 with its own
+  // mint(), a Manifold claim, a Zora collect, or any contract using a bespoke
+  // mint function is invisible to the drops endpoint — and previously that
+  // meant "no phases found" and a dead end.
+  //
+  // Try the universal adapter before giving up. It probes SeaDrop, the generic
+  // signature registry, and the contract's own ABI, and only accepts a plan
+  // that SIMULATES — so a closed sale or a missing proof is reported as a
+  // reason, not silently minted.
+  if (inventory.drops.length === 0) {
+    console.log(chalk.bold.white("\nUniversal mint probe"));
+    console.log(
+      chalk.gray("  OpenSea reports no phases — probing the contract directly...")
+    );
+
+    const universal = await findUniversalMint(nftInput, provider, wallets[0].address, BigInt(quantity), {
+      rpcUrl: rpcUrls[0],
+    });
+
+    if (universal.plan) {
+      console.log(chalk.green(`  ✓ ${universal.plan.description}`));
+      console.log(chalk.gray(`    via ${universal.plan.adapter}`));
+
+      // A universal plan is a single-wallet, single-contract mint. Confirm and
+      // execute it directly — there is no phase matrix to pick from.
+      const didConfirm = await askYesNo(
+        `Mint ${quantity} × ${universal.plan.description}?`,
+        true
+      );
+      if (!didConfirm) {
+        console.log(chalk.yellow("\n  Aborted — nothing was sent.\n"));
+        closePrompts();
+        return;
+      }
+
+      await executeUniversalMint(universal.plan, walletKeys, rpcUrls, chainProfile, gas, quantity);
+      closePrompts();
+      return;
+    }
+
+    console.log(chalk.yellow("  ✗ No mintable mechanism found on this contract."));
+    console.log(chalk.gray(explainFailure(universal)));
+    console.log(
+      chalk.gray(
+        "\n  This may not be a mintable contract, the sale may be closed, or it may\n" +
+          "  need an allowlist proof / signature this tool cannot obtain."
+      )
+    );
+    closePrompts();
+    return;
+  }
+
   if (inventory.drops.length === 0) {
     throw new Error(
       `No mint phases found for ${nftInput}.\n` +
@@ -305,14 +396,35 @@ export async function runWizard(log: RunLogger): Promise<void> {
   log.field("selected_phase", selectedDrop.name || selectedDrop.dropId);
   log.field("mint_mode", phaseEligibility.mode);
 
-  // ── 12. Gas ──────────────────────────────────────────────────────────────
-  console.log(chalk.bold.white("\nGas"));
-  const gas = await promptGasGwei(chainProfile, rpcUrls);
-
-  // ── 13. Timing ──────────────────────────────────────────────────────────
-  const { targetStart, timingLabel } = await promptTiming(
-    new Date(selectedDrop.startTime * 1000)
-  );
+  // ── 12. Timing ──────────────────────────────────────────────────────────
+  // --at / --when-open skip the prompt; otherwise ask.
+  let targetStart: Date = new Date(selectedDrop.startTime * 1000);
+  let timingLabel: string;
+  if (opts.at) {
+    const unix = parseWhen(opts.at);
+    targetStart = new Date(unix * 1000);
+    timingLabel = `--at ${opts.at}`;
+    console.log(chalk.gray(`  Scheduled for ${targetStart.toISOString()} (${timingLabel})`));
+  } else if (opts.whenOpen) {
+    timingLabel = "when-open (poll on-chain)";
+    console.log(chalk.gray("  Will poll the on-chain open time."));
+  } else {
+    const prompted = await promptTiming(new Date(selectedDrop.startTime * 1000));
+    targetStart = prompted.targetStart ?? targetStart;
+    timingLabel = prompted.timingLabel;
+  }
+  // ── 12b. Price protection ───────────────────────────────────────────────
+  // Ported from price.js. --max-price sets the cap; otherwise the user is
+  // asked. Without it a drop that raised its price between planning and firing
+  // would be minted at the new price with no warning.
+  let maxPriceWei: bigint | null = null;
+  if (opts.maxPrice) {
+    const priceSpec = parsePriceSpec(opts.maxPrice, quantity);
+    if (priceSpec) {
+      maxPriceWei = priceSpec.isUnlimited ? null : priceSpec.maxPriceWei;
+      console.log(chalk.gray(`  Price protection: ${priceSpec.display}`));
+    }
+  }
 
   // ── 14. Balances + affordability ─────────────────────────────────────────
   console.log(chalk.bold.white("\nWallets"));
@@ -387,6 +499,7 @@ export async function runWizard(log: RunLogger): Promise<void> {
       gasLimit: gas.defaultGasLimit,
       targetStart: targetStart || new Date(selectedDrop.startTime * 1000),
       plan: localPlan,
+      maxPriceWei,
     });
   } else {
     // Signed/allowlist phase — needs OpenSea signed payload
@@ -441,7 +554,89 @@ export async function runWizard(log: RunLogger): Promise<void> {
       sessions: sessionResults.map((sr) => sr.session),
       slug: slug || undefined,
       chainKey,
+      maxPriceWei,
     });
+  }
+}
+
+// ── Universal mint execution ────────────────────────────────────────────────
+//
+// Broadcasts a plan produced by findUniversalMint. Unlike the phase paths this
+// has no signed payload and no per-wallet variation — the calldata is identical
+// for every wallet, so it is encoded once and blasted to every endpoint.
+
+async function executeUniversalMint(
+  plan: UniversalMintPlan,
+  walletKeys: string[],
+  rpcUrls: string[],
+  chainProfile: ChainProfile,
+  gas: { defaultGasLimit: number; maxFeePerGasWei: bigint; maxPriorityFeePerGasWei: bigint },
+  quantity: number
+): Promise<void> {
+  console.log(chalk.bold.white("\nBroadcasting"));
+  console.log(chalk.gray(`  ${walletKeys.length} wallet(s) × ${rpcUrls.length} endpoint(s)`));
+
+  const results: { wallet: string; ok: boolean; hash?: string; error?: string }[] = [];
+
+  for (const key of walletKeys) {
+    const wallet = new Wallet(key);
+    const txRequest = {
+      to: plan.to,
+      data: plan.data,
+      value: plan.value,
+      gasLimit: gas.defaultGasLimit,
+      maxFeePerGas: gas.maxFeePerGasWei,
+      maxPriorityFeePerGas: gas.maxPriorityFeePerGasWei,
+    };
+
+    // Re-simulate immediately before signing. The plan was simulated during
+    // discovery, but a live sale can close between then and now — and a revert
+    // costs gas to discover on-chain.
+    const simProvider = new JsonRpcProvider(rpcUrls[0]);
+    let sim: SimulateResult;
+    try {
+      sim = await simulateTx(simProvider, {
+        to: plan.to,
+        from: wallet.address,
+        data: plan.data,
+        value: plan.value,
+      });
+    } finally {
+      // ethers keeps a polling timer alive on every provider. Without an
+      // explicit destroy the process never exits — the work is done but the
+      // event loop stays busy forever.
+      try {
+        simProvider.destroy();
+      } catch {
+        // Already destroyed.
+      }
+    }
+    if (!sim.ok && sim.reverted) {
+      const classified = classifyRevert(sim.reason);
+      results.push({
+        wallet: wallet.address,
+        ok: false,
+        error: `${classified ? `[${classified.label}] ` : ""}${sim.reason ?? "reverted"}`,
+      });
+      continue;
+    }
+
+    try {
+      const signed = await wallet.signTransaction(txRequest);
+      const endpoints = parseRpcEndpoints(rpcUrls);
+      const { txHash } = blastToAll(signed, endpoints);
+      results.push({ wallet: wallet.address, ok: true, hash: txHash });
+      console.log(chalk.green(`  ✓ ${short(wallet.address)} — ${short(txHash)}`));
+    } catch (err: any) {
+      results.push({ wallet: wallet.address, ok: false, error: err.message });
+      console.log(chalk.red(`  ✗ ${short(wallet.address)} — ${err.message}`));
+    }
+  }
+
+  const okCount = results.filter((r) => r.ok).length;
+  console.log(chalk.bold(`\n  ${okCount}/${results.length} wallet(s) broadcast`));
+  if (okCount === 0) {
+    throw new Error("Every wallet failed to broadcast — nothing was sent.");
   }
 }
 
@@ -960,8 +1155,28 @@ async function promptWalletAndPhase(
 
 // ── Steps ───────────────────────────────────────────────────────────────────
 
-async function promptKeys(log: RunLogger): Promise<string[]> {
+async function promptKeys(log: RunLogger, spec?: string | null): Promise<string[]> {
   console.log(chalk.bold.white("Private keys"));
+
+  // A --wallets spec with a PRIVATE_KEY in the environment means the user has
+  // already supplied keys non-interactively. Load them rather than prompting,
+  // which is what makes a headless run possible.
+  const envKeys = loadEnvKeys();
+  if (envKeys.length > 0 && spec) {
+    const selected = selectFromLoaded(envKeys, spec);
+    console.log(chalk.gray(`  ${selected.length} wallet(s) from environment (${spec}).`));
+    for (const w of selected) {
+      console.log(chalk.green(`  ✓ ${w.address}`));
+    }
+    return selected.map((w) => w.privateKey);
+  }
+  if (envKeys.length > 0 && process.env.PRIVATE_KEY && !process.stdin.isTTY) {
+    // Non-interactive stdin with a key present: use it rather than hanging on a
+    // prompt that can never be answered.
+    console.log(chalk.gray(`  ${envKeys.length} wallet(s) from environment.`));
+    return envKeys.map((w) => w.privateKey);
+  }
+
   console.log(chalk.gray("  Paste one key per line — typing is hidden. Blank line when done."));
   console.log(chalk.gray("  Each key is confirmed by its wallet address. Nothing is saved to disk."));
 
@@ -1001,6 +1216,68 @@ async function promptKeys(log: RunLogger): Promise<string[]> {
   return keys;
 }
 
+// ── Environment wallet loading (ported from wallets.js) ─────────────────────
+// The TS port prompted for keys interactively and had no way to load them from
+// the environment, so a headless run was impossible. Priority order matches the
+// JS original: PRIVATE_KEY, then PRIVATE_KEYS, then WALLETS_FILE.
+
+export interface LoadedWallet {
+  address: string;
+  privateKey: string;
+}
+
+export function loadEnvKeys(): LoadedWallet[] {
+  const list: LoadedWallet[] = [];
+  const seen = new Set<string>();
+  const add = (pk: string | undefined) => {
+    if (!pk || typeof pk !== "string") return;
+    let w: Wallet;
+    try {
+      w = new Wallet(pk.trim());
+    } catch {
+      return;
+    }
+    if (seen.has(w.address.toLowerCase())) return;
+    seen.add(w.address.toLowerCase());
+    list.push({ address: w.address, privateKey: pk.trim() });
+  };
+
+  add(process.env.PRIVATE_KEY);
+  (process.env.PRIVATE_KEYS || "").split(",").forEach(add);
+
+  const file = process.env.WALLETS_FILE || "wallets.json";
+  try {
+    if (fs.existsSync(file)) {
+      const j = JSON.parse(fs.readFileSync(file, "utf8"));
+      const arr = Array.isArray(j) ? j : j.wallets || [];
+      for (const e of arr) add(typeof e === "string" ? e : e.pk || e.privateKey);
+    }
+  } catch {
+    // A malformed wallets file is not fatal — fall back to the env keys.
+  }
+
+  return list;
+}
+
+/**
+ * Select a subset by spec: all | * | N | 1,3,4 (1-based).
+ * Ported from wallets.js selectWallets().
+ */
+export function selectFromLoaded(all: LoadedWallet[], spec: string): LoadedWallet[] {
+  if (!all.length) return [];
+  const s = String(spec).trim().toLowerCase();
+  if (s === "all" || s === "*") return all;
+  if (/^\d+$/.test(s)) return all.slice(0, Math.max(1, Math.min(Number(s), all.length)));
+  if (/^[0-9,\s]+$/.test(s)) {
+    const idx = s
+      .split(",")
+      .map((x) => Number(x.trim()) - 1)
+      .filter((i) => Number.isInteger(i) && i >= 0 && i < all.length);
+    if (idx.length) return idx.map((i) => all[i]);
+  }
+  return [all[0]];
+}
+
 async function promptQuantity(walletCount: number): Promise<number> {
   console.log(chalk.bold.white("\nQuantity"));
   const qty = await askNumber("NFTs per wallet", 1, { min: 1, max: 100 });
@@ -1013,14 +1290,23 @@ async function promptQuantity(walletCount: number): Promise<number> {
 async function promptTarget(
   log: RunLogger,
   chainKey: string,
-): Promise<{ contract: string; label: string; chainKey: string }> {
+  prefill?: string | null,
+): Promise<{ contract: string; label: string; chainKey: string; resolved: ResolvedTarget | null }> {
   console.log(chalk.bold.white("\nNFT target"));
-  console.log(chalk.gray("  Paste the OpenSea link (collection or item), a slug, or the contract address."));
+  console.log(
+    chalk.gray(
+      "  Paste an OpenSea, Scatter, Zora or Manifold link, a collection slug, or a contract address."
+    )
+  );
+  console.log(chalk.gray("  Chain aliases work too: \"0xabc… on base\", \"slug matic\", \"--chain arb\"."));
 
   let activeChain = chainKey;
 
   for (;;) {
-    const raw = await askText("NFT link");
+    const raw = prefill ?? (await askText("NFT link"));
+    // A pre-filled target is tried once; if it fails, fall through to the
+    // prompt so the user can correct it rather than the run just dying.
+    prefill = null;
     if (!raw) {
       console.log(chalk.red("  ✗ Paste a link, slug, or address."));
       continue;
@@ -1028,40 +1314,71 @@ async function promptTarget(
 
     let parsed;
     try {
-      parsed = parseNftLink(raw);
+      parsed = parseTarget(raw);
     } catch (err: any) {
       console.log(chalk.red(`  ✗ ${err.message}`));
       continue;
     }
 
-    if (parsed.chainHint && parsed.chainHint !== activeChain && resolveChain(parsed.chainHint)) {
-      const hinted = resolveChain(parsed.chainHint)!;
+    // A chain named in the input overrides the one chosen at the top — the user
+    // typed it, so it is the more specific instruction.
+    const namedChain = parsed.chain ? chainSlug(parsed.chain) : undefined;
+    if (namedChain && resolveChain(namedChain)) {
+      if (namedChain !== activeChain) {
+        console.log(chalk.gray(`  ↳ Chain set to ${resolveChain(namedChain)!.name} (from input)`));
+        activeChain = namedChain;
+      }
+    } else if (parsed.chain) {
+      console.log(chalk.yellow(`  ⚠ Unknown chain "${parsed.chain}" — using ${resolveChain(activeChain)!.name}.`));
+    }
+
+    // Manifold cannot be resolved to a contract from a claim slug. Say so
+    // immediately rather than letting the user wait through a failed lookup.
+    if (parsed.platform === "manifold") {
       console.log(
-        chalk.yellow(`  ⚠ This link points at ${hinted.name}, but you selected ${resolveChain(activeChain)!.name}.`)
+        chalk.red(
+          `  ✗ Manifold claim "${parsed.claimId}" cannot be resolved automatically — Manifold claims need the claim contract address.`
+        )
       );
-      if (await askYesNo(`Switch to ${hinted.name}?`, true)) {
-        activeChain = hinted.key;
-        console.log(chalk.green(`  ✓ Chain switched to ${hinted.name}`));
-      }
+      console.log(chalk.gray("    Paste the 0x… contract address instead."));
+      continue;
     }
 
-    if (parsed.kind === "address") {
-      return { contract: parsed.value, label: parsed.value, chainKey: activeChain };
+    // Resolve to a concrete contract. This is where a bare slug gets disambiguated
+    // between OpenSea and Scatter.
+    let resolved: ResolvedTarget | null = null;
+    try {
+      resolved = await resolveTarget(parsed, process.env.OPENSEA_API_KEY || "", activeChain);
+    } catch (err: any) {
+      console.log(chalk.yellow(`  ⚠ Resolution issue: ${err.message}`));
     }
 
-    if (parsed.kind === "slug") {
-      const slug = parsed.value;
-      const chainForSlug = parsed.chainHint || activeChain;
-      const chainProfile = resolveChain(chainForSlug);
-      if (!chainProfile) {
-        console.log(chalk.red(`  ✗ Unknown chain "${parsed.chainHint || '?'}' for slug "${slug}".`));
-        continue;
-      }
-      console.log(chalk.gray(`  ↳ Resolved slug "${slug}" on ${chainProfile.name}`));
-      return { contract: slug, label: slug, chainKey: chainForSlug };
+    if (!resolved) {
+      console.log(
+        chalk.red(
+          `  ✗ Could not resolve "${raw}" — the collection may not exist, or it needs an OpenSea API key.`
+        )
+      );
+      continue;
     }
 
-    console.log(chalk.red("  ✗ Could not parse that input — paste a link, slug, or address."));
+    const label =
+      resolved.platform === "scatter"
+        ? `${resolved.scatter?.name ?? resolved.slug} (Scatter)`
+        : resolved.platform === "opensea" && resolved.slug
+          ? `${resolved.slug} (OpenSea)`
+          : resolved.contract;
+
+    console.log(
+      chalk.green(
+        `  ✓ ${resolved.platform.toUpperCase()} — ${label} on ${resolveChain(resolved.chainKey)?.name ?? resolved.chainKey}`
+      )
+    );
+    if (resolved.resolvedViaFallback) {
+      console.log(chalk.gray("    (resolved via fallback — verify the contract before minting)"));
+    }
+
+    return { contract: resolved.contract, label, chainKey: resolved.chainKey, resolved };
   }
 }
 

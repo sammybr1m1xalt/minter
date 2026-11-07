@@ -1049,3 +1049,187 @@ D5. Two more bugs found while building R1
 ================================================================================
 END OF APPENDED SECTION
 ================================================================================
+
+================================================================================
+APPENDED SECTION E — 2026-11-07 session
+================================================================================
+
+E1. Ported from nft-minter-bot (this session)
+--------------------------------------------------------------------------------
+- src/simulate.ts — pre-broadcast simulation gate. The TS port had ZERO
+  simulation anywhere in the mint path; the JS mint.js simulates before every
+  broadcast. Now wired into BOTH fcfs-mint.ts and local-mint.ts.
+  * Distinguishes `reverted` (definitive NO — blocks) from `indeterminate`
+    (timeout/network — fails OPEN). Treating a timeout as a revert would block
+    a good mint because a public RPC had a bad moment. Verified live:
+    correct value passes, wrong value blocks, dead endpoint proceeds+warns.
+  * Hard 10s timeout inside simulateTx. ethers retries a dead endpoint with
+    exponential backoff and NO ceiling — without this the gate turns an
+    unreachable RPC into an unbounded hang.
+  * KNOWN ISSUE (open): the test process still hangs after passing. Every
+    `new JsonRpcProvider` in src/ leaks a polling timer, so Node never drains
+    the event loop. Added shortLivedProvider()/withShortLivedProvider() helpers
+    to simulate.ts but the call sites are NOT converted yet. This is the last
+    thing to finish — see E6.
+- src/price-protection.ts — ported from price.js. assertPriceProtection,
+  parsePriceSpec, extractMaxPriceSpec. Wired into both mint paths via
+  maxPriceWei. Without it a drop that raised its price between planning and
+  firing was minted at the new price with no warning.
+- src/allowlist-onchain.ts — ported from allowlist.js. Scans AllowListUpdated
+  event logs on the SeaDrop singleton, downloads the tree, looks up the wallet.
+  Event topic0 verified live against ethers id().
+- src/scatter.ts — ported from scatter.js. Collection, eligible lists,
+  best-list picker, mint-tx builder.
+- src/schedule.ts — parseWhen(). Relative time, ISO, HH:MM, unix seconds AND
+  13-digit unix ms (Bug K — the TS port never handled ms).
+- src/target-resolver.ts — unified parse+resolve for OpenSea/Scatter/Zora/
+  Manifold/direct. Full chainSlug alias table (matic/arb/op/avax/bnb/rhoc/
+  circle) which was mostly missing. Manifold deliberately NOT resolved: a claim
+  slug is not a contract, so it refuses rather than inventing an address.
+- src/universal-mint.ts — four-adapter mint discovery (SeaDrop public →
+  SeaDrop allowlist → 61-selector registry → ABI-driven). A plan is only
+  accepted if it SIMULATES.
+  * MANDATORY eth_getCode guard at the top. An eth_call to an EOA with
+    arbitrary calldata SUCCEEDS (no code to revert), so without this every EOA
+    in existence "has a mint function" and simulation reports success — a
+    signed transaction to an address that cannot mint. Found and fixed.
+  * Verified live: collectr public mint found; Milady refused ("Sale must be
+    active"); BAYC refused ("would exceed max supply"); EOA refused.
+- src/site-scanner.ts — bundle following added (see E3).
+- src/index.ts — rewritten with --at/--when-open/--max-price/--wallets/--chain/
+  --quantity. Flags validated before any network call.
+- src/wizard.ts — universal fallback when OpenSea finds no phases; env wallet
+  loading (PRIVATE_KEY/PRIVATE_KEYS/WALLETS_FILE, all|N|1,3,4); --at/--max-price
+  threaded into execution.
+- src/wizard-fcfs-new.ts — runFcfsBranchCli accepts options, uses the unified
+  resolver. Previously hardcoded quantity=1 and ignored chain overrides.
+- src/chains.ts — added chainKeyFromId().
+
+E2. CLI flags added
+--------------------------------------------------------------------------------
+  --at <time>           ISO 8601, unix seconds/ms, "in 5m", "30s", "HH:MM"
+  --when-open           poll the on-chain open time
+  --max-price <price>   ETH amount | free | 0.05/unit | 0.05total | any
+  --wallets <spec>      all | N | 1,3,4
+  --chain <key>         ethereum|base|polygon|arbitrum|optimism|...
+  --quantity <n>
+Verified: --help renders, bad --at and bad --max-price are rejected pre-network.
+
+E3. site-scanner bundle following (IN PROGRESS — see E6)
+--------------------------------------------------------------------------------
+Problem: fungolabs.org/launchpad/d/fungo-genesis is a 3KB Vite SPA shell with
+an empty #root. ZERO addresses in the HTML and zero in the JS bundles. The data
+is behind a JSON API the page calls after load.
+Fix: scanWithBundles() — shell HTML → <script> bundles → API endpoints found in
+the bundles. Generic, no site-specific hardcoding:
+  * extractScriptUrls() — same-origin .js from the shell.
+  * extractApiPaths() — "/api/..." literals AND template literals
+    (`/api/x/${slug}` → `/api/x/:slug`).
+  * expandApiPaths() — substitutes the page's trailing slug and enumerates every
+    suffix of the path (a bundle's route naming need not match the server's).
+  * deriveAppRoot() — a bundle's /api/... resolves against the APP root, not
+    the site root. /launchpad/d/x → /launchpad/. Without this every API call 404s.
+Verified live: finds /launchpad/api/drops/fungo-genesis → 13 addresses, and the
+collection 0x2A2aabF10B9C9Bb5C2e13FF2a74d48dAfdB723d8 ranks first.
+
+E4. FungoLabs drop decoded (reference for any future adapter)
+--------------------------------------------------------------------------------
+URL:     https://fungolabs.org/launchpad/d/fungo-genesis
+API:     https://fungolabs.org/launchpad/api/drops/fungo-genesis  (17KB JSON)
+         NOTE the /launchpad/ prefix — the bundle's relative /api/... calls
+         resolve against the app root, not the site root.
+Collection: 0x2A2aabF10B9C9Bb5C2e13FF2a74d48dAfdB723d8 (ERC-721, verified)
+           name "Fungo Genesis", symbol "GENESIS"
+Stages:    0x35e8955b764A35eA7704E13472C921B82a11F0EF  (whitelist, free)
+           0x0F550e349E72985f7892aCb0CE987B0E753dC5Ce  (sealed auction)
+           0x298D3FB4F82009FFA2BF7EA24D828eDf62B0B583  (team reserve)
+Payment:   0x80CB147Fd86dC6dEe3Eee7e4Cee33d1397d98071 = cZAMA (Confidential
+           ZAMA, 6 decimals) — a Zama FHE token, NOT native ETH.
+Payout:    0xB80C6b5AD1Ca8E1106fcF569D307FAaaDf3CA031 (10000 bps)
+Allowlist: merkle root 0xbbfd730b7752f69f6a90268c063ec3c6ecbbbdb6...
+
+Example tx 0xeeb087a27415235c798f8e8b98cf960285e487ca500f728b4e1fd023e24f85a0:
+  to: 0x0F550e... (stage 2, sealed auction)
+  selector 0x43d655ba, one arg 0xc8 = 200, value 0.0018 ETH
+  result: exactly ONE ERC-721 Transfer, tokenId 1901.
+  => the arg is a BATCH INDEX, not a quantity. 200 < batches(404).
+  => the stage is a minimal proxy; its bytecode embeds the implementation
+     0x56fb2cf43b45bf298de8eefb13f58479150364cf (not in Sourcify).
+  => selector 0x43d655ba takes exactly one uint256 (no args reverts with no
+     data; with a uint256 it reverts with custom error 0x448694d6).
+  => 36,472 candidate signatures brute-forced against the selector: no name
+     match. The function NAME is unrecoverable from bytecode; only its
+     signature is.
+  => this is a BID, not a mint. It settles later. A generic adapter must NOT
+     broadcast it — it would need the batch range from off-chain API state and
+     a way to tell a bid from a mint.
+
+E5. Tests added this session
+--------------------------------------------------------------------------------
+- tests/ported-modules.test.mjs — 29 tests (parseWhen, price protection, scatter,
+  simulate/revert classification).
+- tests/target-resolver.test.mjs — 27 tests (chain aliases, all platforms,
+  Manifold refusal, explainFailure, live EOA-guard test gated on LIVE_RPC).
+- tests/site-scanner.test.mjs — 2 FAILING, see E6.
+
+E6. OPEN / INCOMPLETE — finish these next session
+--------------------------------------------------------------------------------
+1. site-scanner ranking rework is MID-FLIGHT and unverified.
+   - Changed: "address" demoted from STRONG_KEYS (40) to AMBIGUOUS_KEYS (12),
+     because a drop's stage address outranked its own collection.
+   - Changed: occurrence bonus cap raised 5 → 20 (occurrence is the strongest
+     real signal).
+   - Added: extractKeyedAddressesWithDepth() + a depth penalty in
+     rankCandidates(). Reason: an OpenSea collection page embeds ITEM payloads
+     alongside the COLLECTION payload, and an item's "contractAddress" is a
+     DIFFERENT token. Depth distinguishes them.
+   - `npm run build:tests` has NOT been run since the depth change.
+   - Two tests were failing BEFORE the depth change and are unresolved:
+       * "repeated identical key hits do not multiply the score" expects 40,
+         now gets 12 (the test asserts the OLD strong-key value).
+       * "fixture: the real collection address ranks first" — the fixture
+         /tmp/collectr.html has 0x335a975b... under "contractAddress" (an ITEM
+         payload, isFungible:true, has attributes/lastSale) scoring above the
+         real collection 0x8ed81e81... which appears once under "address".
+         The depth penalty is meant to fix this but is UNVERIFIED.
+   - DECISION NEEDED: whether to keep the depth approach or revert to the
+     simpler occurrence-weighted ranking and update the two tests instead.
+
+2. Provider leak — the test process hangs after passing (rc=124, "5 passed").
+   shortLivedProvider()/withShortLivedProvider() now exist in simulate.ts but
+   NO call site uses them. Convert at minimum:
+     - fcfs-mint.ts:1110 (simProvider)
+     - local-mint.ts (simProvider)
+     - universal-mint.ts (provider.getCode + simulateTx)
+     - anywhere else a JsonRpcProvider is constructed for a one-off read.
+   Until then `npm test` will keep timing out even though every suite passes.
+
+3. Full suite has not been run green since the simulation gate landed.
+   Last full run: EXIT=124 (timeout). Individual suites all pass:
+     calldata 27/27, critical-path 5/5, contract 18/18, infra 24/24,
+     key-pool 10/12 (2 skipped, needs OPENSEA_TEST_KEY),
+     contract-verify 11/11, site-scanner 9/11 (2 failing, see E6.1),
+     mint-generic 16/16, abi-mint 23/23, readthrough 6/6,
+     ported-modules 29/29, target-resolver 27/27.
+
+4. Nothing committed this session. Eight commits still unpushed; push remains
+   blocked on auth (fatal: could not read Username for 'https://github.com').
+
+E7. Still missing from the JS original (not started)
+--------------------------------------------------------------------------------
+- time.js WIB formatting (Asia/Jakarta, Indonesian day/month names). The TS port
+  uses toIST, a different convention.
+- mint-cli.js full flag surface — mostly covered by E2 now.
+- resolve.js orchestration — covered by target-resolver.ts.
+- seadrop.js getSigners/getTokenGatedAllowedTokens reads — still absent.
+
+E8. Known-open bugs from AUDIT_FINDINGS.txt (unchanged)
+--------------------------------------------------------------------------------
+C (sort eligible stages by startTime), D (eligibleMinterAddress vs wallet —
+TS actually handles this in wizard.ts), E (eligiblePrice never threaded to
+price protection), F (accountStageEligibility.wallets[] never iterated),
+J (classifyMintMode casing).
+
+================================================================================
+END OF APPENDED SECTION E
+================================================================================

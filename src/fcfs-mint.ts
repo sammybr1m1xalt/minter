@@ -41,6 +41,8 @@ export { isPayloadBoundToWallet } from "./seadrop-calldata";
 import { SEADROP_ADDRESS } from "./seadrop-public";
 import { ConfirmedTx } from "./rpc-health";
 import { buildOpenseaMint, OpenseaMintTx } from "./opensea-gql";
+import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
+import { assertPriceProtection } from "./price-protection";
 
 // ── OpenSea v2 shapes (read from the live response, not hardcoded magic) ──
 
@@ -971,6 +973,8 @@ export interface ExecuteSnipeOpts {
   /** Per-wallet pre-fetched payloads (indexed by walletKeys). When present,
    *  these are used directly and NO API call happens in the critical path. */
   payloads?: (FcfsSignedPayload | null)[];
+  /** Maximum total price (wei) the user will accept. Asserted before signing. */
+  maxPriceWei?: bigint | null;
 }
 
 export interface SnipeResult {
@@ -980,6 +984,8 @@ export interface SnipeResult {
   txHash?: string;
   receipt?: ConfirmedTx;
   error?: string;
+  /** True when the failure is timing-related and a later attempt could work. */
+  retryable?: boolean;
 }
 
 export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeResult[]> {
@@ -1070,6 +1076,87 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         maxFeePerGas,
         maxPriorityFeePerGas,
       };
+
+      // ── Price protection (ported from price.js) ─────────────────────────
+      // Assert before signing. A signed payload carries the price OpenSea quoted
+      // when it was fetched; if the drop's price moved since, refuse.
+      if (opts.maxPriceWei != null) {
+        try {
+          assertPriceProtection({
+            actualPriceWei: payload.value,
+            maxPriceWei: opts.maxPriceWei,
+            context: `signed mint × ${quantity}`,
+          });
+        } catch (e: any) {
+          results.push({
+            walletIndex: i,
+            walletAddress: addr,
+            success: false,
+            error: e?.message || String(e),
+            retryable: false,
+          });
+          continue;
+        }
+      }
+
+      // ── Simulation gate ────────────────────────────────────────────────
+      // Ported from mint.js, which simulates before every broadcast. Without
+      // this a guaranteed revert (closed sale, wrong stage, a payload bound to
+      // another wallet) still costs gas to discover, and the failure surfaces
+      // as a reverted receipt instead of a refusal to send.
+      //
+      // Simulation happens AFTER the wait and BEFORE signing, so a doomed tx
+      // costs nothing. It is not a substitute for the blast — it is a filter.
+      //
+      // The provider is built with staticNetwork and a hard timeout: a dead
+      // endpoint must fail FAST, not retry for minutes. Without this the gate
+      // turns an unreachable RPC into an unbounded hang.
+      const simProvider = new JsonRpcProvider(rpcUrls[0], undefined, {
+        staticNetwork: true,
+        pollingInterval: 1000,
+      });
+      let sim: SimulateResult;
+      try {
+        sim = await simulateTx(simProvider, {
+          to: txRequest.to,
+          from: addr,
+          data: txRequest.data,
+          value: txRequest.value,
+        });
+      } finally {
+        // ethers keeps a polling timer alive on every provider. Without an
+        // explicit destroy the process never exits — the work is done but the
+        // event loop stays busy forever.
+        try {
+          simProvider.destroy();
+        } catch {
+          // Already destroyed.
+        }
+      }
+
+      // An INDETERMINATE result (timeout, network error) is not evidence the tx
+      // reverts — it means we could not tell. Fail OPEN in that case: blocking a
+      // good mint because a public RPC had a bad moment is worse than sending a
+      // tx that might revert. A definitive revert still blocks.
+      if (!sim.ok && sim.reverted) {
+        const classified = classifyRevert(sim.reason);
+        const label = classified ? `[${classified.label}] ` : "";
+        results.push({
+          walletIndex: i,
+          walletAddress: addr,
+          success: false,
+          error: `Simulation refused to broadcast: ${label}${sim.reason ?? "unknown revert"}`,
+          retryable: classified?.retryable ?? false,
+        });
+        continue;
+      }
+      if (!sim.ok && sim.indeterminate) {
+        console.log(
+          chalk.yellow(
+            `    ⚠ Simulation inconclusive (${sim.reason}) — proceeding; the tx may still revert.`
+          )
+        );
+      }
 
       const signed = await w.signTransaction(txRequest);
       const prepared = prepareBlast(signed);
