@@ -2,9 +2,6 @@ node_modules/
 dist/
 *.log
 
-# Test build output
-tests/.compiled/
-
 # Secrets — never commit
 .env
 .env.*

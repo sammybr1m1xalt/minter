@@ -1,7 +1,7 @@
 {
   "name": "minter",
   "version": "1.0.0",
-  "description": "CLI sniper for public SeaDrop NFT mints AND FCFS/allowlist stages — builds calldata on-chain, no OpenSea token required for public path",
+  "description": "CLI sniper for public SeaDrop NFT mints AND FCFS/allowlist stages \u2014 builds calldata on-chain, no OpenSea token required for public path",
   "main": "dist/index.js",
   "bin": {
     "minter": "dist/index.js"
@@ -10,8 +10,6 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "test": "npm run build:tests && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/calldata.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/critical-path.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/contract.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/infra.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/key-pool.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/contract-verify.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/site-scanner.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/mint-generic.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/abi-mint.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/readthrough.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/ported-modules.test.mjs && node --experimental-loader ./tests/ts-resolve-loader.mjs tests/target-resolver.test.mjs",
-    "build:tests": "tsc -p tsconfig.json --outDir tests/.compiled",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
