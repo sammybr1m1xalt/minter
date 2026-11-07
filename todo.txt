@@ -1172,48 +1172,25 @@ E5. Tests added this session
   Manifold refusal, explainFailure, live EOA-guard test gated on LIVE_RPC).
 - tests/site-scanner.test.mjs — 2 FAILING, see E6.
 
-E6. OPEN / INCOMPLETE — finish these next session
+E6. RESOLVED 2026-11-07 (commit 4f68fc7)
 --------------------------------------------------------------------------------
-1. site-scanner ranking rework is MID-FLIGHT and unverified.
-   - Changed: "address" demoted from STRONG_KEYS (40) to AMBIGUOUS_KEYS (12),
-     because a drop's stage address outranked its own collection.
-   - Changed: occurrence bonus cap raised 5 → 20 (occurrence is the strongest
-     real signal).
-   - Added: extractKeyedAddressesWithDepth() + a depth penalty in
-     rankCandidates(). Reason: an OpenSea collection page embeds ITEM payloads
-     alongside the COLLECTION payload, and an item's "contractAddress" is a
-     DIFFERENT token. Depth distinguishes them.
-   - `npm run build:tests` has NOT been run since the depth change.
-   - Two tests were failing BEFORE the depth change and are unresolved:
-       * "repeated identical key hits do not multiply the score" expects 40,
-         now gets 12 (the test asserts the OLD strong-key value).
-       * "fixture: the real collection address ranks first" — the fixture
-         /tmp/collectr.html has 0x335a975b... under "contractAddress" (an ITEM
-         payload, isFungible:true, has attributes/lastSale) scoring above the
-         real collection 0x8ed81e81... which appears once under "address".
-         The depth penalty is meant to fix this but is UNVERIFIED.
-   - DECISION NEEDED: whether to keep the depth approach or revert to the
-     simpler occurrence-weighted ranking and update the two tests instead.
+1. site-scanner ranking — DONE. The depth approach worked: the OpenSea fixture
+   test now passes because the item payload (deeper nesting) no longer outranks
+   the collection. The one remaining failure was a stale assertion expecting
+   the old strong-key score of 40; rewrote it to assert the actual property
+   (score must not scale with identical key hits) instead of a magic number.
+   site-scanner: 9/9 pass.
 
-2. Provider leak — the test process hangs after passing (rc=124, "5 passed").
-   shortLivedProvider()/withShortLivedProvider() now exist in simulate.ts but
-   NO call site uses them. Convert at minimum:
-     - fcfs-mint.ts:1110 (simProvider)
-     - local-mint.ts (simProvider)
-     - universal-mint.ts (provider.getCode + simulateTx)
-     - anywhere else a JsonRpcProvider is constructed for a one-off read.
-   Until then `npm test` will keep timing out even though every suite passes.
+2. Provider leak — DONE. Every short-lived JsonRpcProvider is now destroyed in
+   a finally block: fcfs-mint.ts, local-mint.ts, wizard.ts, contract-verify.ts.
+   contract-verify.ts also gained withProviderFailover(), which tries every
+   configured RPC and reports an exhausted set as an RPC error rather than
+   "not a contract". This also fixed a flaky live test that was failing because
+   a single public RPC dropped one request.
+   npm test: 560s timeout -> 43s, rc=0.
 
-3. Full suite has not been run green since the simulation gate landed.
-   Last full run: EXIT=124 (timeout). Individual suites all pass:
-     calldata 27/27, critical-path 5/5, contract 18/18, infra 24/24,
-     key-pool 10/12 (2 skipped, needs OPENSEA_TEST_KEY),
-     contract-verify 11/11, site-scanner 9/11 (2 failing, see E6.1),
-     mint-generic 16/16, abi-mint 23/23, readthrough 6/6,
-     ported-modules 29/29, target-resolver 27/27.
-
-4. Nothing committed this session. Eight commits still unpushed; push remains
-   blocked on auth (fatal: could not read Username for 'https://github.com').
+3. Full suite — GREEN. 159 tests, 154 pass, 0 fail, 5 skipped (need
+   OPENSEA_TEST_KEY).
 
 E7. Still missing from the JS original (not started)
 --------------------------------------------------------------------------------
