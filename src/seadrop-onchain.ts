@@ -97,18 +97,34 @@ const RPC_URLS_PUBLIC = [
   "https://cloudflare-eth.com",
 ];
 
-// ── RPC fallback — try several public endpoints ────────────────────────────
-// Use .env RPC first if configured (private, faster), then fall back to public
-const RPC_URLS = (() => {
-  const envRpc = process.env.RPC_URL_ETHEREUM;
-  if (envRpc && envRpc.trim()) {
-    return [envRpc.trim(), ...RPC_URLS_PUBLIC];
-  }
-  return RPC_URLS_PUBLIC;
-})();
+// Per-chain public RPCs. The SeaDrop singleton is deployed on every network,
+// so the probe must go to the chain the collection lives on — an Ethereum RPC
+// returns empty data for a Base drop, which silently looks like "no phases".
+const RPC_URLS_BY_CHAIN: Record<string, string[]> = {
+  ethereum: RPC_URLS_PUBLIC,
+  base: [
+    "https://mainnet.base.org",
+    "https://base-rpc.publicnode.com",
+  ],
+  robinhood: [
+    "https://rpc.mainnet.chain.robinhood.com",
+  ],
+};
 
-async function getProvider(): Promise<JsonRpcProvider | null> {
-  for (const url of RPC_URLS) {
+// Use .env RPC first if configured (private, faster), then fall back to public
+function rpcUrlsForChain(chainKey?: string): string[] {
+  const key = (chainKey || "ethereum").trim().toLowerCase();
+  const envVar = `RPC_URL_${key.toUpperCase()}`;
+  const envRpc = process.env[envVar];
+  const publics = RPC_URLS_BY_CHAIN[key] ?? RPC_URLS_PUBLIC;
+  if (envRpc && envRpc.trim()) {
+    return [envRpc.trim(), ...publics];
+  }
+  return publics;
+}
+
+async function getProvider(chainKey?: string): Promise<JsonRpcProvider | null> {
+  for (const url of rpcUrlsForChain(chainKey)) {
     try {
       const p = new JsonRpcProvider(url);
       await Promise.race([
@@ -199,7 +215,7 @@ async function fetchPublicDrop(
     maxTotalMintable: 0, // public drops don't have a total cap on-chain
     totalMinted: 0,       // can't get from SeaDrop — check the NFT contract
     feeBps: Number(d.feeBps),
-    feeRecipient: "0x0000a26b00c1F0DF003000390027140000fAa719", // default SEA DEX fee addr
+    feeRecipient: feeRecipient, // default SEA DEX fee addr
     mintData: null,
     mintSignature: null,
     gasLimit: null,
@@ -212,6 +228,7 @@ async function fetchPublicDrop(
     allowlistHash: null,
     raw: { source: "onchain_public" },
     isPublicStage: true,
+    eligiblePrice: null,
   };
 }
 
@@ -281,6 +298,7 @@ async function fetchAllowlistPhase(
     allowlistHash: merkleRoot ? `0x${merkleRoot.slice(2, 10)}...` : null,
     raw: { source: "onchain_allowlist", merkleRoot, feeRecipientsCount: feeRecipients.length },
     isPublicStage: false, // allowlist needs signed mint or merkle proof
+    eligiblePrice: null,
   };
 }
 
@@ -341,7 +359,8 @@ async function fetchTokenGatedPhase(
       allowlistHash: null,
       raw: { source: "onchain_tokengated", gateToken: nftContract },
       isPublicStage: false,
-    };
+      eligiblePrice: null,
+      };
   } catch {
     return null;
   }
@@ -352,11 +371,12 @@ async function fetchTokenGatedPhase(
 export async function fetchOnChainDrops(
   nftContract: string,
   timeoutMs = 10000,
+  chainKey?: string,
 ): Promise<DropPhase[]> {
-  const provider = await getProvider();
+  const provider = await getProvider(chainKey);
   if (!provider) return [];
 
-  const deadline = Date.now() + timeoutMs;
+  const _deadline = Date.now() + timeoutMs;
 
   try {
     // Run all probes in parallel, collect whatever returns data
@@ -393,9 +413,10 @@ export async function fetchOnChainDrops(
 
 export async function fetchSingleOnChainDrop(
   nftContract: string,
-  timeoutMs = 10000,
+  _timeoutMs = 10000,
+  chainKey?: string,
 ): Promise<DropPhase | null> {
-  const provider = await getProvider();
+  const provider = await getProvider(chainKey);
   if (!provider) return null;
 
   try {

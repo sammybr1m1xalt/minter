@@ -2,7 +2,6 @@
 // for a handshake. Warms only the RPC endpoints — OpenSea is handled separately
 // by the FCFS path because it may need an API key in the request.
 import chalk from "chalk";
-import { probeEndpoints, EndpointHealth } from "./rpc-health";
 
 // Minimal liveness check: eth_chainId + eth_blockNumber on each RPC.
 // This is cheaper than the full probeEndpoints() (no chainId verification,

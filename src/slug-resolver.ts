@@ -6,9 +6,39 @@
 const REST_URL = "https://api.opensea.io/api/v2/collections";
 const GQL_URL = "https://gql.opensea.io/graphql";
 
+// ── HTML scrape fallback (mirrors upstream resolve.js) ────────────────────────
+// When REST + GraphQL both fail, scrape the public collection page.
+// OpenSea embeds a "contracts":[{...}] JSON block in the page HTML.
+
+async function htmlScrapeCollection(slug: string, timeoutMs = 10000): Promise<{ address: string; chain: string } | null> {
+  let html: string;
+  try {
+    const res = await fetch(`https://opensea.io/collection/${slug}`, {
+      headers: {
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        accept: "text/html,application/xhtml+xml",
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    html = await res.text();
+  } catch {
+    return null;
+  }
+
+  // The page embeds several JSON payloads. The "contracts" block only carries
+  // chain info ({chain:{identifier}}), while the contract address lives in the
+  // collection payload as "address":"0x…". Anchor on that field instead.
+  const addrM = html.match(/"address":"(0x[a-fA-F0-9]{40})"/);
+  const contractsBlock = html.match(/"contracts":\[[^\]]{0,500}\]/);
+  const chainM = contractsBlock ? contractsBlock[0].match(/"identifier":"([\w-]+)"/) : null;
+  if (!addrM || /^0x0+$/.test(addrM[1])) return null; // zero-address = placeholder
+  return { address: addrM[1], chain: chainM ? chainM[1] : "ethereum" };
+}
+
 // ── REST v2 (primary) ────────────────────────────────────────────────────────
 
-export interface RestCollection {
+interface RestCollection {
   slug: string;
   address: string;
   chain: { identifier: string; networkId: number };
@@ -131,7 +161,7 @@ async function gqlSearchByAddress(address: string): Promise<{ slug: string }[]> 
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-export interface CollectionInfo {
+interface CollectionInfo {
   name: string;
   contractAddress: string;
   chain: string;
@@ -148,7 +178,7 @@ export async function resolveSlug(
   apiKey = "",
   preferredChain?: string
 ): Promise<CollectionInfo> {
-  const wanted = preferredChain?.trim().toLowerCase();
+  const _wanted = preferredChain?.trim().toLowerCase();
 
   // 1. REST v2 — primary. Works unauthenticated for most collections.
   const rest = await restCollectionBySlug(slug, apiKey);
@@ -182,6 +212,16 @@ export async function resolveSlug(
         chain: rest2.chain.identifier ?? "",
       };
     }
+  }
+
+  // 4. HTML scrape — final fallback (mirrors upstream resolve.js)
+  const scraped = await htmlScrapeCollection(slug);
+  if (scraped?.address) {
+    return {
+      name: slug,
+      contractAddress: scraped.address,
+      chain: preferredChain ?? scraped.chain,
+    };
   }
 
   throw new Error(`Could not resolve slug "${slug}" — OpenSea doesn't know about it, or it needs an API key we don't have.`);

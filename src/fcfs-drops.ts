@@ -10,9 +10,70 @@
 
 import chalk from "chalk";
 import { formatEther } from "ethers";
-import { fetchOnChainDrops, fetchSingleOnChainDrop } from "./seadrop-onchain";
+import { fetchOnChainDrops } from "./seadrop-onchain";
+import { parsePriceToWei } from "./opensea-gql";
+import { resolveChain } from "./chains";
 
 const OPENSEA_BASE = "https://api.opensea.io";
+
+/**
+ * Normalize an OpenSea timestamp to UNIX seconds.
+ *
+ * GQL returns ISO-8601 strings ("2026-11-01T00:00:00.000Z"); REST returns
+ * UNIX seconds as a number or numeric string. Number() on an ISO string is
+ * NaN, which previously fell back to 0 and made every stage look like it
+ * started at the epoch.
+ */
+function toUnixSeconds(value: unknown): number {
+  if (value == null || value === "") return 0;
+  if (typeof value === "number") return Number.isFinite(value) ? Math.floor(value) : 0;
+  const s = String(value).trim();
+  if (!s) return 0;
+  if (/^\d+$/.test(s)) return Number(s);            // UNIX seconds
+  const parsed = Date.parse(s);                     // ISO-8601
+  return Number.isNaN(parsed) ? 0 : Math.floor(parsed / 1000);
+}
+
+// ── Stage type classification ────────────────────────────────────────────────
+// OpenSea returns the same concept in different casings per surface: GraphQL
+// emits SCREAMING_SNAKE_CASE ("PUBLIC_SALE"), REST emits snake_case
+// ("public_sale"). Comparing a raw value against one casing makes the other
+// surface's branch dead — a public stage classified non-public silently
+// disables the fast local mint path. Normalize once, here.
+
+/** Canonical stage-type tokens we reason about. */
+export type StageTypeToken =
+  | "public"
+  | "allowlist"
+  | "ovr"
+  | "token_gated"
+  | "fcfs"
+  | "reserved"
+  | "unknown";
+
+/** Normalize any OpenSea stageType casing to a canonical lowercase token. */
+export function normalizeStageType(raw: string | null | undefined): StageTypeToken {
+  if (!raw || typeof raw !== "string") return "unknown";
+  const s = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (s === "public" || s === "public_sale" || s === "publicsale" || s === "open") return "public";
+  if (s === "allowlist" || s === "allow_list" || s === "allowlisted" || s === "gtd" || s === "guaranteed") return "allowlist";
+  if (s === "ovr" || s === "ovr_allowlist" || s === "override") return "ovr";
+  if (s === "token_gated" || s === "tokengated" || s === "token_gate" || s === "gated") return "token_gated";
+  if (s === "fcfs" || s === "first_come_first_serve") return "fcfs";
+  if (s === "reserved") return "reserved";
+  return "unknown";
+}
+
+/** True when the stage is open to all — mintable on-chain with no signature. */
+export function classifyStageType(raw: string | null | undefined): boolean {
+  return normalizeStageType(raw) === "public";
+}
+
+/** True when the stage needs a per-wallet server signature. */
+export function isSignedStageType(raw: string | null | undefined): boolean {
+  const t = normalizeStageType(raw);
+  return t === "allowlist" || t === "ovr";
+}
 
 // ── Shapes ──────────────────────────────────────────────────────────────────
 
@@ -56,6 +117,7 @@ export interface DropPhase {
   eligible: boolean | null;       // is the current wallet eligible?
   eligibleCount: number | null;   // how many wallets are eligible (if reported)
   totalAllocated: number | null;  // total slots allocated (if reported)
+  eligiblePrice: bigint | null;   // per-wallet eligible price in wei (from GQL)
   allowlistedAddresses: string[]; // explicit allowlist (rarely exposed in full)
   allowlistHash: string | null;   // merkle root or similar, if exposed
 
@@ -121,9 +183,10 @@ export interface GasRecommendation {
 
 export async function fetchAllActiveDrops(
   nftContract: string,
-  apiKey: string | undefined,
+  apiKey: string | null | undefined,
   timeoutMs = 15000,
   slug?: string,
+  chainKey?: string,
 ): Promise<CollectionDropsInventory> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -138,21 +201,48 @@ export async function fetchAllActiveDrops(
   let chainId: number | null = null;
   let lastReason: CollectionDropsInventory["notFoundReason"] | undefined;
 
-  // ── Step 1: REST v2 /api/v2/drops/{slug} ─────────────────────────────────
+  // ── Step 1: GraphQL collectionBySlug (primary) ────────────────────────────
+  // Per user requirement: "graphql and gpq should fucking be the default!"
+  // GQL returns richer data (stage configs, eligibility, etc.) and works
+  // without an API key. REST is the fallback when GQL rate-limits or fails.
   try {
-    const res = await fetch(
-      `${OPENSEA_BASE}/api/v2/drops/${lookupTarget}`,
-      { signal: controller.signal, headers },
-    );
-    clearTimeout(timer);
+    const gqlDrops = await fetchGraphqlDrops(lookupTarget, apiKey || null, Math.min(timeoutMs, 8000));
+    if (gqlDrops.length > 0) {
+      drops = gqlDrops;
+      // The chain lives on dropBySlug.collection, one level above the stages.
+      // The previous code looked for d.raw.chain on each stage, which no
+      // longer exists, so chainId was always null.
+      const rawDrop = (gqlDrops as any)[0]?.raw;
+      const chain = rawDrop?.collection?.chain ?? rawDrop?.chain;
+      if (chain?.identifier === "ethereum") chainId = 1;
+      else if (typeof chain?.networkId === "number") chainId = chain.networkId;
+    } else {
+      lastReason = "not_found";
+    }
+  } catch (err: any) {
+    if (err && err.name === "AbortError") {
+      lastReason = "rate_limited";
+    }
+  }
+
+  // ── Step 2: REST fallback (if GQL gave nothing) ───────────────────────────
+  // REST /api/v2/drops/{slug} works without an API key for most collections.
+  // Only reached if GQL returned empty (rate-limited, not found, or errored).
+  if (drops.length === 0) {
+    try {
+      const res = await fetch(
+        `${OPENSEA_BASE}/api/v2/drops/${lookupTarget}`,
+        { signal: controller.signal, headers },
+      );
+      clearTimeout(timer);
 
       if (res.status === 429) {
         lastReason = "rate_limited";
         // Don't abort the whole flow for rate limiting — fall through to on-chain
       } else if (res.status === 401 || res.status === 403) {
-        // REST requires an API key. Without one we get 401. Fall through to GQL + on-chain.
+        // REST requires an API key. Without one we get 401. Fall through to on-chain.
       } else if (res.status !== 200) {
-        // Other non-200 — fall through to GQL + on-chain
+        // Other non-200 — fall through to on-chain
       } else {
         const json = (await res.json()) as any;
         drops = catalogueDrops(json, nftContract);
@@ -161,51 +251,35 @@ export async function fetchAllActiveDrops(
           if (d.raw.chain_id != null) { chainId = Number(d.raw.chain_id); break; }
           if (d.raw.chainId != null) { chainId = Number(d.raw.chainId); break; }
         }
-
-        // REST with a raw CA returned nothing — stop, don't waste the GQL
-        // slot on the same lookup. Only fall through to GQL when we have a
-        // slug (different path) or REST errored/outage.
-        if (drops.length === 0 && !slug) {
-          return { nftContract, chainId: null, drops: [], fetchedAt: Date.now(), apiKeyUsed: !!apiKey, notFoundReason: "not_found" };
-        }
       }
-  } catch (err: any) {
-    clearTimeout(timer);
-    if (err && err.name === "AbortError") {
-      return { nftContract, chainId: null, drops: [], fetchedAt: Date.now(), apiKeyUsed: !!apiKey };
+    } catch (err: any) {
+      clearTimeout(timer);
+      if (err && err.name === "AbortError") {
+        return { nftContract, chainId: null, drops: [], fetchedAt: Date.now(), apiKeyUsed: !!apiKey };
+      }
+      // Network error in REST — fall through to on-chain
     }
-    // Network error in REST — fall through to on-chain
   }
 
-  // ── Step 2: GraphQL fallback (if REST gave nothing) ───────────────────────
-  if (drops.length === 0) {
-    try {
-      const gqlDrops = await fetchGraphqlDrops(lookupTarget, apiKey || null, Math.min(timeoutMs, 8000));
-      if (gqlDrops.length > 0) {
-        drops = gqlDrops;
-        // Try to infer chainId from GQL response
-        for (const d of drops) {
-          if (d.raw?.chain?.identifier) {
-            if (d.raw.chain.identifier === "ethereum") chainId = 1;
-            else if (typeof d.raw.chain.networkId === "number") chainId = d.raw.chain.networkId;
-            break;
-          }
-        }
-      }
-    } catch {
-      // GQL failed — fall through to on-chain
-    }
+  // ── Step 2b: Early return if REST gave nothing and we don't have a slug ─────
+  // REST with a raw CA returned nothing — stop, don't waste the on-chain slot.
+  if (drops.length === 0 && !slug) {
+    return { nftContract, chainId: null, drops: [], fetchedAt: Date.now(), apiKeyUsed: !!apiKey, notFoundReason: lastReason ?? "not_found" };
   }
 
   // ── Step 3: On-chain SEADROP discovery (if still nothing) ─────────────────
   if (drops.length === 0) {
     try {
       clearTimeout(timer);
-      const onChainDrops = await fetchOnChainDrops(nftContract, Math.min(timeoutMs, 15000));
+      const onChainDrops = await fetchOnChainDrops(nftContract, Math.min(timeoutMs, 15000), chainKey);
       if (onChainDrops.length > 0) {
         drops = onChainDrops;
-        // On-chain drops are for ethereum by definition (SEADROP is on mainnet)
-        if (chainId === null) chainId = 1;
+        // The SeaDrop singleton is deployed on every network, so the chain is
+        // whatever we probed — not necessarily Ethereum.
+        if (chainId === null) {
+          const profile = chainKey ? resolveChain(chainKey) : undefined;
+          chainId = profile?.chainId ?? 1;
+        }
         // If on-chain found a public drop, mark the reason as resolved
         const hasPublic = onChainDrops.some(d => d.isPublicStage && d.mintPrice > 0n);
         if (hasPublic) lastReason = undefined;
@@ -229,13 +303,14 @@ export async function fetchAllActiveDrops(
   };
 }
 
-// ── GraphQL fallback ─────────────────────────────────────────────────────────
+// ── GraphQL drops query (PRIMARY) ──────────────────────────────────────────────
 // OpenSea v2 GraphQL: gql.opensea.io/graphql
 // Collection drops are exposed via collectionBySlug → stages connection.
 // We query both stages.list and the active/next stage shortcuts.
 //
 // NOTE: The GQL API is aggressively rate-limited (429) as of late 2026.
-// We use it as a secondary source after REST, with a short timeout.
+// We use it as the PRIMARY source (per user requirement: GraphQL first),
+// with a short timeout and REST as fallback when GQL fails.
 
 async function fetchGraphqlDrops(
   lookupTarget: string,
@@ -253,9 +328,6 @@ async function fetchGraphqlDrops(
   };
   if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
   let slug = lookupTarget;
   // If the target is a CA, try on-chain discovery instead of slug resolution
   // for the GQL query. GQL collectionBySlug needs a slug, but if we can't
@@ -264,72 +336,28 @@ async function fetchGraphqlDrops(
     slug = lookupTarget; // use CA as slug — GQL may still return results
   }
 
+  // Live-verified against the OpenSea schema (collectr, 2026-11-05).
+  // The previous query used collectionBySlug, whose CollectionResult type
+  // exposes none of the requested fields — the server rejected every one with
+  // "Cannot query field", and CollectionDropStage does not exist. dropBySlug is
+  // the working root. See GQL_QUERY_TEXTS.CollectionDropsQuery in
+  // opensea-gql.ts for the field-by-field verification.
   const query = `
     query CollectionDrops($slug: String!) {
-      collectionBySlug(slug: $slug) {
-        slug
-        name
-        address
-        chain { identifier networkId }
-        stages(first: 50) {
-          edges {
-            node {
-              uuid
-              stageType
-              label
-              startTime
-              endTime
-              price
-              maxPerWallet
-              allowlistWalletCount
-              ... on CollectionDropStage {
-                mintData
-                mintSignature
-                gasLimit
-                maxFeePerGas
-                maxPriorityFeePerGas
-                eligible
-                eligibleCount
-                totalAllocated
-                allowlistedAddresses { address }
-                allowlistHash
-                feeRecipient
-              }
-            }
-          }
-        }
-        activeStage {
+      dropBySlug(slug: $slug) {
+        __typename
+        collection { slug name address chain { identifier networkId } }
+        stages {
+          __typename
           uuid
           stageType
+          stageIndex
           label
           startTime
           endTime
-          price
-          maxPerWallet
-          allowlistWalletCount
-          ... on CollectionDropStage {
-            mintData
-            mintSignature
-            gasLimit
-            maxFeePerGas
-            maxPriorityFeePerGas
-            eligible
-            eligibleCount
-            totalAllocated
-            allowlistedAddresses { address }
-            allowlistHash
-            feeRecipient
-          }
-        }
-        nextStage {
-          uuid
-          stageType
-          label
-          startTime
-          endTime
-          price
-          maxPerWallet
-          allowlistWalletCount
+          maxTotalMintableByWallet
+          allowlistMemberCount
+          price { token { unit symbol contractAddress chain { identifier } } }
         }
       }
     }
@@ -353,50 +381,51 @@ async function fetchGraphqlDrops(
 
     const json = (await res.json()) as any;
     if (json.errors && json.errors.length > 0) return [];
-    if (!json.data?.collectionBySlug) return [];
+    const drop = json.data?.dropBySlug;
+    if (!drop) return [];
 
-    const coll = json.data.collectionBySlug;
-    // Collect stages from three possible shapes: stages edges, activeStage, nextStage
-    const stageSources: any[] = [];
-
-    // 1. stages connection (all stages)
-    if (coll.stages?.edges) {
-      for (const edge of coll.stages.edges) {
-        if (edge?.node) stageSources.push(edge.node);
-      }
-    }
-    // 2. activeStage
-    if (coll.activeStage) {
-      stageSources.push(coll.activeStage);
-    }
-    // 3. nextStage
-    if (coll.nextStage) {
-      stageSources.push(coll.nextStage);
-    }
+    // The collection lives one level up from the stages on dropBySlug.
+    const coll = drop.collection ?? {};
+    const stageSources: any[] = Array.isArray(drop.stages) ? drop.stages : [];
 
     const drops: DropPhase[] = [];
     for (const c of stageSources) {
       if (!c || typeof c !== "object") continue;
 
-      // Fields: real v2 API uses snake_case; older/guessed shapes may use camelCase
+      // Fields: GQL uses camelCase; REST uses snake_case. Accept both.
       const uuid = c.uuid || c.id || c.drop_id || c.hash || "";
       const contract = (
-        c.contract_address || c.nftContract || c.contractAddress || c.address || ""
+        coll.address || c.contract_address || c.nftContract || c.contractAddress || c.address || ""
       ).toLowerCase();
 
-      // Only include stages for our target contract (when we can identify it)
-      if (contract && contract !== lookupTarget.toLowerCase() && lookupTarget.toLowerCase() !== "") {
-        // If we can't match the contract, include anyway — the caller may have
-        // passed a slug that covers exactly one collection
-        if (contract !== "") continue;
+      // Only include stages for our target contract (when we can identify it).
+      // `lookupTarget` may be a slug OR a contract address, so compare against
+      // both. The previous code compared the contract address to the raw
+      // lookupTarget, which never matched when a slug was passed — every stage
+      // was dropped and the inventory came back empty.
+      const target = lookupTarget.toLowerCase();
+      if (target.startsWith("0x")) {
+        // Address lookup: the stage's collection must be that exact contract.
+        if (contract !== target) continue;
       }
+      // Slug lookup: dropBySlug is already scoped to the collection, so every
+      // stage it returns belongs to the requested drop.
 
-      const startTime = Number(c.start_time || c.startTime || c.start || 0);
-      const endTime = Number(c.end_time || c.endTime || c.end || 0);
+      // GQL returns ISO-8601 strings ("2026-11-01T00:00:00.000Z"); REST returns
+      // UNIX seconds. Number() on an ISO string yields NaN, which fell back to
+      // 0 — making every stage look like it started at the epoch.
+      const startTime = toUnixSeconds(c.start_time ?? c.startTime ?? c.start);
+      const endTime = toUnixSeconds(c.end_time ?? c.endTime ?? c.end);
       const stageType = c.stage_type || c.stageType || c.type || c.kind || null;
       const label = c.label || c.name || c.title || c.displayName || null;
 
-      const mintPrice = BigInt(String(c.price || c.mintPrice || c.mint_price || c.mintPriceWei || "0"));
+      // GQL returns price.token.unit as an ETH float (0.0056); REST returns a
+      // wei decimal string ("5600000000000000"). parsePriceToWei handles both
+      // and never throws — the previous BigInt(String(...)) threw on floats and
+      // silently emptied the whole inventory.
+      const mintPrice = parsePriceToWei(
+        c.price?.token?.unit ?? c.price ?? c.mintPrice ?? c.mint_price ?? c.mintPriceWei ?? 0
+      );
       const maxPerWallet = Number(
         c.max_per_wallet || c.maxPerWallet || c.maxTotalMintableByWallet ||
         c.max_total_mintable_by_wallet || c.max_total || 0
@@ -408,7 +437,7 @@ async function fetchGraphqlDrops(
       const totalMinted = Number(
         c.total_minted || c.totalMinted || c.minted || c.mintedCount || c.minted_count || 0
       );
-      const feeBps = Number(c.fee_bps || c.feeBps || c.fee || 0);
+      const _feeBps = Number(c.fee_bps || c.feeBps || c.fee || 0);
 
       const mintData = c.mintData || c.mint_data || c.calldata || c.data || null;
       const mintSignature = c.mintSignature || c.mint_signature || c.signature || null;
@@ -458,12 +487,13 @@ async function fetchGraphqlDrops(
         eligible,
         eligibleCount,
         totalAllocated,
+        eligiblePrice: c.eligiblePrice != null ? BigInt(String(c.eligiblePrice)) : null,
         allowlistedAddresses,
         allowlistHash,
-        raw: c as Record<string, any>,
-        isPublicStage:
-          stageType === "public_sale" ||
-          stageType === "public",
+        // `raw` carries the stage plus the drop-level collection/chain, so
+        // callers can recover the chain without a second request.
+        raw: { ...c, collection: coll, chain: coll?.chain } as Record<string, any>,
+        isPublicStage: classifyStageType(stageType),
       });
     }
 
@@ -536,12 +566,15 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
     // Only include stages for our target contract (when we can identify it)
     if (contract && nftContract && contract !== nftContract.toLowerCase()) continue;
 
-    const startTime = Number(c.start_time || c.startTime || c.start || 0);
-    const endTime = Number(c.end_time || c.endTime || c.end || 0);
+    const startTime = toUnixSeconds(c.start_time ?? c.startTime ?? c.start);
+    const endTime = toUnixSeconds(c.end_time ?? c.endTime ?? c.end);
     const stageType = c.stage_type || c.stageType || c.type || c.kind || null;
     const label = c.label || c.name || c.title || c.displayName || null;
 
-    const mintPrice = BigInt(String(c.price || c.mintPrice || c.mint_price || c.mintPriceWei || "0"));
+    // GQL price is an ETH float; REST price is a wei decimal string.
+    const mintPrice = parsePriceToWei(
+      c.price?.token?.unit ?? c.price ?? c.mintPrice ?? c.mint_price ?? c.mintPriceWei ?? 0
+    );
     const maxPerWallet = Number(
       c.max_per_wallet || c.maxPerWallet || c.maxTotalMintableByWallet ||
       c.max_total_mintable_by_wallet || c.max_total || 0
@@ -553,7 +586,7 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
     const totalMinted = Number(
       c.total_minted || c.totalMinted || c.minted || c.mintedCount || c.minted_count || 0
     );
-    const feeBps = Number(c.fee_bps || c.feeBps || c.fee || 0);
+    const _feeBps = Number(c.fee_bps || c.feeBps || c.fee || 0);
 
     const mintData = c.mintData || c.mint_data || c.calldata || c.data || null;
     const mintSignature = c.mintSignature || c.mint_signature || c.signature || null;
@@ -603,13 +636,14 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
       eligible,
       eligibleCount,
       totalAllocated,
+      eligiblePrice: c.eligiblePrice != null ? BigInt(String(c.eligiblePrice)) : null,
       allowlistedAddresses,
       allowlistHash,
       raw: c as Record<string, any>,
-      isPublicStage:
-        stageType === "public_sale" ||
-        stageType === "public" ||
-        (mintData == null && mintSignature == null),
+      // A stage is public only when OpenSea says so via stageType. Do NOT infer
+      // it from absent mintData/mintSignature — a signed stage before its
+      // payload is published has null signed fields but is not public.
+      isPublicStage: classifyStageType(stageType),
     });
   }
 
@@ -621,7 +655,7 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
 
 export function assessDropEligibility(
   drop: DropPhase,
-  ourWallet: string,
+  _ourWallet: string,
 ): EligibilityReport {
   // OVR / allowlist phases — these need per-wallet signed data (mintSignature)
   // fetched from OpenSea. Report them as targetable only if we have a signed
@@ -629,7 +663,7 @@ export function assessDropEligibility(
   if (drop.type === "ovr" || drop.allowlistHash ||
       drop.allowlistedAddresses.length > 0 ||
       (drop.type && /ovr|allowlist|allow_list/i.test(drop.type))) {
-    if (drop.mintData && drop.mintSignature) {
+    if (drop.mintData) {
       // Pre-fetched signed payload — this wallet can target it
       const remaining = computeAllocationRemaining(drop);
       return {
@@ -668,7 +702,7 @@ export function assessDropEligibility(
         drop.allowlistedAddresses.length > 0 ||
         (drop.type && /ovr|allowlist|allow_list/i.test(drop.type))) {
       // OVR/allowlist: isPast + no signed data → skip; otherwise still targetable
-      if (isPast && (!drop.mintData || !drop.mintSignature)) {
+      if (isPast && (!drop.mintData)) {
         return {
           drop,
           ourWalletEligible: false,
@@ -678,7 +712,7 @@ export function assessDropEligibility(
           reason: "OVR/allowlist phase has ended and OpenSea reports ineligible.",
         };
       }
-      if (drop.mintData && drop.mintSignature) {
+      if (drop.mintData) {
         const remaining = computeAllocationRemaining(drop);
         return {
           drop,
@@ -706,7 +740,7 @@ export function assessDropEligibility(
     // Non-OVR: OpenSea says not eligible — but for a sniper, a future-dated phase
     // with signed mint data is still targetable. Prep now; fire at T-0.
     // Only skip if the phase is already past and has no signed data.
-    if (isPast && (!drop.mintData || !drop.mintSignature)) {
+    if (isPast && (!drop.mintData)) {
       return {
         drop,
         ourWalletEligible: false,
@@ -717,7 +751,7 @@ export function assessDropEligibility(
       };
     }
     // Phase may be in the future — still targetable if it has signed data
-    if (drop.mintData && drop.mintSignature) {
+    if (drop.mintData) {
       const remaining = computeAllocationRemaining(drop);
       return {
         drop,
@@ -761,7 +795,7 @@ export function assessDropEligibility(
   // If we have mintData + mintSignature, we can at least attempt it.
   // The signature is wallet-specific, so we won't know if it works until
   // we try to get one per wallet. But the phase is targetable.
-  if (drop.mintData && drop.mintSignature) {
+  if (drop.mintData) {
     const remaining = computeAllocationRemaining(drop);
     return {
       drop,
@@ -776,7 +810,7 @@ export function assessDropEligibility(
   }
 
   // Phase exists but no signed data available — can't snipe, but report it
-  if (!drop.mintData || !drop.mintSignature) {
+  if (!drop.mintData) {
     return {
       drop,
       ourWalletEligible: null,
@@ -811,11 +845,35 @@ function computeAllocationRemaining(drop: DropPhase): number | null {
 
 // ── Full inventory eligibility report ────────────────────────────────────────
 
+/**
+ * Sort phases by start time (soonest first), keeping the original index so
+ * callers can map a report back to `inventory.drops[i]`.
+ *
+ * OpenSea returns stages in an unspecified order. Every downstream consumer —
+ * the wizard's phase picker, the eligibility report, the pre-fetch loop —
+ * assumes index alignment with `inventory.drops`, so the sort must happen once
+ * here, at the boundary, rather than in each consumer.
+ */
+export function orderDropsByStartTime(drops: DropPhase[]): DropPhase[] {
+  return drops
+    .map((d, i) => ({ d, i }))
+    .sort((a, b) => {
+      // Soonest-starting first; unknown start times (0) sort last.
+      const at = a.d.startTime || Number.MAX_SAFE_INTEGER;
+      const bt = b.d.startTime || Number.MAX_SAFE_INTEGER;
+      if (at !== bt) return at - bt;
+      return a.i - b.i; // stable tiebreak on original order
+    })
+    .map((x) => x.d);
+}
+
 export function reportInventoryEligibility(
   inventory: CollectionDropsInventory,
   ourWallet: string,
 ): EligibilityReport[] {
-  return inventory.drops.map((d) => assessDropEligibility(d, ourWallet));
+  // Sort first so the report reads soonest-stage-first, matching what the
+  // wizard displays and what the sniper will target.
+  return orderDropsByStartTime(inventory.drops).map((d) => assessDropEligibility(d, ourWallet));
 }
 
 // ── Print a human-readable inventory report ──────────────────────────────────
@@ -853,7 +911,6 @@ export function printDropsInventory(
     const now = Date.now();
     const isLive = now >= drop.startTime * 1000 && now < drop.endTime * 1000;
     const isActive = now < drop.endTime * 1000;
-    const isPast = now >= drop.endTime * 1000;
 
     let statusLabel: string;
     let statusColor: typeof chalk.green | typeof chalk.yellow | typeof chalk.red;
@@ -881,7 +938,6 @@ export function printDropsInventory(
 
     // Price line
     const priceEth = formatEther(drop.mintPrice);
-    const totalNeeded = formatEther(drop.mintPrice * BigInt(drop.maxTotalMintableByWallet || 1));
 
     // Per-wallet limit
     const perWallet = drop.maxTotalMintableByWallet > 0
@@ -943,7 +999,7 @@ export function printDropsInventory(
     }
 
     // Show mint data availability
-    if (drop.mintData && drop.mintSignature) {
+    if (drop.mintData) {
       console.log(chalk.green(`    ✓ Signed mint data available — targetable`));
     } else if (drop.mintData || drop.mintSignature) {
       console.log(chalk.yellow(`    ⚠ Partial signed data (${!!drop.mintData ? "calldata" : ""}${!!drop.mintData && !!drop.mintSignature ? " + " : ""}${!!drop.mintSignature ? "signature" : ""}) — may need session`));
@@ -1102,10 +1158,6 @@ export function printGasState(
     console.log(chalk.gray(`    Will use manually configured gas settings instead.\n`));
     return;
   }
-
-  const baseGwei = Number(gas.baseFeePerGas) / 1e9;
-  const maxGwei = Number(gas.suggestedMaxFeePerGas) / 1e9;
-  const priGwei = Number(gas.suggestedMaxPriorityFeePerGas) / 1e9;
 
   const urgencyBadge: Record<string, any> = {
     low: chalk.green("low"),

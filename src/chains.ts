@@ -78,7 +78,7 @@ export const CHAINS: ChainProfile[] = [
     chainId: 5042,
     name: "Arc",
     explorer: "https://arcscan.app", // TODO: confirm mainnet explorer base URL
-    nativeSymbol: "ETH",            // TODO: confirm native symbol
+    nativeSymbol: "USDC",            // TODO: confirm native symbol
     rpc: {
       alchemyHost: undefined,       // TODO: Alchemy host when available
       public: [],                   // TODO: public RPC list when available
@@ -86,6 +86,10 @@ export const CHAINS: ChainProfile[] = [
   },
 ];
 
+
+// Fallback explorer for chains not in CHAINS. Basescan is used because it is
+// the most common non-Ethereum explorer in this set; unknown chains still get
+// a working (if possibly wrong) link rather than a broken one.
 const DEFAULT_EXPLORER = "https://basescan.org";
 
 // Resolve a chain by its numeric chainId (from the live network) or by its
@@ -102,8 +106,31 @@ export function resolveChain(
   return CHAINS.find((c) => c.chainId === id);
 }
 
+// ── OpenSea chain key mapping ────────────────────────────────────────────────
+// Maps our internal chain keys to OpenSea's chain identifiers.
+// Verified against the live /api/v2/chains list (2026-11-05), which is
+// authoritative over the docs' ChainIdentifier enum (the docs list 26 and are
+// missing arc, which the live API returns).
+// Unknown keys pass through unchanged.
+const OS_CHAIN: Record<string, string> = {
+  ethereum: "ethereum",
+  base: "base",
+  polygon: "polygon",   // live API uses "polygon"; the old "matic" is stale
+  arbitrum: "arbitrum",
+  optimism: "optimism",
+  "zora-network": "zora",
+  avalanche: "avalanche",
+  robinhood: "robinhood",
+  arc: "arc",
+};
+
+/** Convert our internal chain key to OpenSea's GraphQL chain identifier. */
+export function osChain(chainKey: string): string {
+  return OS_CHAIN[chainKey] || chainKey;
+}
+
 // Build a block-explorer tx URL for whatever chain we're on. Accepts either the
-// numeric chainId (preferred — it's authoritative) or the chain key. Falls back
+// numeric chainId (preferred — it's authoritative) or the string key. Falls back
 // to Basescan for unknown chains so links are never broken silently.
 export function explorerTx(
   idOrKey: string | number | bigint | null | undefined,

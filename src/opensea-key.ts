@@ -7,6 +7,23 @@
 //
 // Keys are cached to disk. New keys are minted on demand (subject to
 // OpenSea's rate limit: max 2 keys/day for free tier).
+//
+// ⚠ DOCUMENTED LIMITATION (verified against docs.opensea.io/reference/api-keys,
+//   2026-11-06): "All API keys under the same account share a single rate limit
+//   bucket. Creating multiple API keys will not increase your overall rate
+//   limit." and "Minting extra keys is not a way to get more throughput."
+//
+// So the pool does NOT buy extra quota. What it does buy:
+//   - failover when one key is throttled or dead (the bucket is shared, but a
+//     dead/expired key is still unusable while a live one works)
+//   - continuity across the 7-day key expiry
+// It does NOT raise the ceiling. For more throughput the only documented path
+// is upgrading to a full key at opensea.io/settings/developer.
+//
+// Free-tier documented rates: 600/h read, 30/h write, 5/m fulfillment.
+// Live probe returned X-RateLimit-Limit: 120 — the docs also warn that "some
+// endpoint groups are metered more tightly than the headline read rate", so
+// always read the headers rather than assuming a number.
 
 import chalk from "chalk";
 import * as fs from "fs";
@@ -21,6 +38,9 @@ const KEY_CACHE_DIR = process.env.OPENSEA_SESSION_DIR
     })();
 
 const KEY_POOL_FILE = path.join(KEY_CACHE_DIR, "opensea_key_pool.json");
+// Records that today's free-key creation attempt already failed, so we don't
+// burn a request re-POSTing on every run. Keyed by local-midnight timestamp.
+const QUOTA_FILE = path.join(KEY_CACHE_DIR, "opensea_quota.json");
 const OPENSEA_BASE = "https://api.opensea.io";
 const FREE_KEY_ENDPOINT = `${OPENSEA_BASE}/api/v2/auth/keys`;
 
@@ -32,7 +52,7 @@ export interface KeyPoolEntry {
   expires_at: string;
   minted_at: string;
   times_used: number;
-  last_probe: "alive" | "throttled" | "dead" | "timeout" | "unknown" | "alive_but_exhausted";
+  last_probe: "alive" | "throttled" | "dead" | "timeout" | "unknown" | "alive_but_exhausted" | "server_error";
   last_probe_at: string;
   probe_latency_ms: number;
   score: number;
@@ -57,6 +77,22 @@ function todayMidnightMs(): number {
   return d.getTime();
 }
 
+/**
+ * ⚠ The daily key-creation quota does NOT reset at midnight.
+ *
+ * OPENSEA_API_LAYOUT.txt claims "Quota state (QUOTA_FILE) resets at UTC
+ * midnight (not 24h from 429)". That is wrong. Verified live 2026-11-06:
+ * X-RateLimit-Reset was 1794036334 = 07:25:34 UTC, i.e. a ROLLING window that
+ * had already expired a minute before the probe. The window slides; it is not
+ * anchored to any midnight.
+ *
+ * Consequence: the local-midnight marker below is an approximation. It is still
+ * useful (it stops us re-POSTing every run within a day) but it can block a
+ * legitimate mint if the rolling window has already recovered while the local
+ * day has not. Callers that need certainty should re-probe rather than trust
+ * this marker.
+ */
+
 /** How many keys in the pool were created today (local midnight). */
 function keysCreatedToday(pool: KeyPoolEntry[]): number {
   const todayStart = todayMidnightMs();
@@ -66,17 +102,85 @@ function keysCreatedToday(pool: KeyPoolEntry[]): number {
   }).length;
 }
 
-/** Strip stale keys: expired (expires_at past) or older than 3 days. */
-function pruneStaleKeys(pool: KeyPoolEntry[]): KeyPoolEntry[] {
+// ── Daily quota marker ──────────────────────────────────────────────────────
+// OpenSea allows 2 free key creations per day per IP. Once an attempt fails
+// with 429, retrying on every run wastes a request and produces the same 429.
+// Persist the failure so the code can skip the POST until the next local day.
+
+interface QuotaState {
+  rate_limited_today: boolean;
+  last_429_at: number;
+  /** Retry-After from the last 429, in seconds. Authoritative when present. */
+  retry_after_seconds: number;
+  cached_keys_created_today: number;
+}
+
+function readQuota(): QuotaState {
+  try {
+    return JSON.parse(fs.readFileSync(QUOTA_FILE, "utf-8")) as QuotaState;
+  } catch {
+    return {
+      rate_limited_today: false,
+      last_429_at: 0,
+      retry_after_seconds: 0,
+      cached_keys_created_today: 0,
+    };
+  }
+}
+
+function writeQuota(state: QuotaState): void {
+  try {
+    fs.writeFileSync(QUOTA_FILE, JSON.stringify(state, null, 2), "utf-8");
+  } catch {}
+}
+
+/**
+ * True when the creation quota is still exhausted.
+ *
+ * Prefers Retry-After from the last 429 — that is the server's own statement of
+ * when the window opens. Falls back to local midnight only when no Retry-After
+ * was recorded. Verified live: a 429 returned Retry-After: 41550 (~11.5 hours),
+ * which is neither 1 hour nor 24 hours, so no fixed period is correct.
+ */
+function quotaExhaustedToday(): boolean {
+  const q = readQuota();
+  if (!q.rate_limited_today) return false;
+  if (q.retry_after_seconds > 0 && q.last_429_at > 0) {
+    return Date.now() < q.last_429_at + q.retry_after_seconds * 1000;
+  }
+  // No Retry-After recorded — approximate with the local day boundary.
+  return q.last_429_at >= todayMidnightMs();
+}
+
+function markQuotaExhausted(retryAfterSeconds = 0): void {
+  writeQuota({
+    rate_limited_today: true,
+    last_429_at: Date.now(),
+    retry_after_seconds: retryAfterSeconds,
+    cached_keys_created_today: keysCreatedToday(loadKeyPool()),
+  });
+}
+
+/** Strip stale keys: expired (expires_at past) or older than 7 days. */
+export function pruneStaleKeys(pool: KeyPoolEntry[]): KeyPoolEntry[] {
   const now = Date.now();
   return pool.filter((e) => {
-    // Expired key
+    // Expired key — but see the warning below before trusting this.
     if (e.expires_at) {
       const exp = new Date(e.expires_at).getTime();
-      if (!isNaN(exp) && exp < now) return false;
+      if (!isNaN(exp) && exp < now) {
+        // OpenSea's expires_at is NOT enforced. Verified 2026-11-06: a key with
+        // expires_at 2026-10-17 (21 days past) still returns HTTP 200 on
+        // /api/v2/collections. Pruning on this field alone would discard keys
+        // that work. Only drop the key if it has also been probed dead — the
+        // probe is the authoritative signal, the timestamp is not.
+        if (e.last_probe === "dead") return false;
+      }
     }
-    // Older than 3 days
-    if (daysOld(e) > 3) return false;
+    // Older than 7 days. Same caveat: age alone is not proof of death. Keep
+    // the key if it was recently probed alive; the next probe will retire it
+    // if it has actually stopped working.
+    if (daysOld(e) > 7 && e.last_probe === "dead") return false;
     return true;
   });
 }
@@ -85,7 +189,7 @@ export function loadKeyPool(): KeyPoolEntry[] {
   try {
     const raw = fs.readFileSync(KEY_POOL_FILE, "utf-8");
     const pool = JSON.parse(raw) as KeyPoolEntry[];
-    // Auto-prune stale keys on every load — expired or older than 3 days
+    // Auto-prune stale keys on every load — expired or older than 7 days
     return pruneStaleKeys(pool);
   } catch {
     return [];
@@ -105,7 +209,7 @@ export function clearKeyPool(): void {
 export async function probeKey(
   apiKey: string,
   timeoutMs = 3000
-): Promise<{ status: "alive" | "throttled" | "dead" | "alive_but_exhausted" | "timeout"; latencyMs: number; remaining: number; resetAt: number }> {
+): Promise<{ status: "alive" | "throttled" | "dead" | "alive_but_exhausted" | "timeout" | "server_error"; latencyMs: number; remaining: number; resetAt: number }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const t0 = Date.now();
@@ -126,6 +230,12 @@ export async function probeKey(
       return { status: "alive", latencyMs, remaining, resetAt };
     }
     if (res.status === 429) return { status: "throttled", latencyMs, remaining, resetAt };
+    // 5xx is a dead API, not a dead key. The key is still valid and should stay
+    // in the pool — probing it again later is cheap and it may well work then.
+    // Collapsing this into "dead" would permanently discard a good key because
+    // OpenSea had a bad minute.
+    if (res.status >= 500) return { status: "server_error" as const, latencyMs, remaining, resetAt };
+    // 401/403/404 and anything else: the key itself is the problem.
     return { status: "dead", latencyMs, remaining, resetAt };
   } catch (err: any) {
     clearTimeout(timer);
@@ -136,11 +246,15 @@ export async function probeKey(
 
 // ── Score a pool entry after probing ──────────────────────────────────────
 
-function computeScore(entry: KeyPoolEntry): number {
+export function computeScore(entry: KeyPoolEntry): number {
   const now = Date.now();
   // Higher = better.
   if (entry.last_probe === "dead") return -10000;
   if (entry.last_probe === "timeout") return 5;
+  // The API was unreachable or erroring, not the key. Worth far more than a
+  // timeout (the key is untested, not slow) but less than a confirmed-alive
+  // key, because we have no evidence it works right now.
+  if (entry.last_probe === "server_error") return 20;
   if (entry.last_probe === "throttled") {
     // 429 — actively rate-limited, can't use this call. Low score but keep
     // it in the pool; if reset time is recorded and in the future, it'll
@@ -173,13 +287,20 @@ export async function probeAndRankPool(
   const probed = await Promise.all(
     pool.map(async (entry) => {
       const result = await probeKey(entry.api_key, 3000);
-      return {
+      // Persist the fresh quota numbers. Without this the entry keeps whatever
+      // remaining_calls it had before — a stale value that can exceed the real
+      // limit (observed: 598 stored vs 114 actual) and inflates the score by
+      // thousands of points, letting a bad key outrank a good one.
+      const refreshed: KeyPoolEntry = {
         ...entry,
         last_probe: result.status,
         last_probe_at: new Date().toISOString(),
         probe_latency_ms: result.latencyMs,
-        score: computeScore({ ...entry, last_probe: result.status, probe_latency_ms: result.latencyMs }),
+        remaining_calls: result.remaining,
+        rate_limit_reset: result.resetAt,
       };
+      refreshed.score = computeScore(refreshed);
+      return refreshed;
     })
   );
 
@@ -187,7 +308,7 @@ export async function probeAndRankPool(
   // "alive_but_exhausted" is still usable but scored low — only picked if no
   // key with remaining calls exists.
   const usable = probed
-    .filter((e) => e.last_probe === "alive" || e.last_probe === "alive_but_exhausted" || e.last_probe === "throttled")
+    .filter((e) => e.last_probe === "alive" || e.last_probe === "alive_but_exhausted" || e.last_probe === "throttled" || e.last_probe === "server_error")
     .sort((a, b) => b.score - a.score);
 
   const best = usable.length > 0 ? usable[0] : null;
@@ -268,8 +389,28 @@ const mintFreeKey = async (
       signal: controller.signal,
     });
     clearTimeout(timer);
+    // Documented success is 201 Created. The previous code required exactly 200,
+    // so every successfully minted key was discarded and the pool could never
+    // refill itself. Accept any 2xx.
+    if (res.status < 200 || res.status >= 300) {
+      if (res.status === 429) {
+        // Remember the failure so subsequent runs skip the POST entirely.
+        // Retry-After is the server's own statement of when the window opens —
+        // verified live as ~11.5 hours, which no fixed period would guess.
+        const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
+        markQuotaExhausted(retryAfter);
+        console.log(
+          chalk.yellow(
+            `  OpenSea: free key creation rate-limited — try again later.${
+              retryAfter > 0 ? ` (retry after ${Math.round(retryAfter / 3600)}h)` : ""
+            }`
+          )
+        );
+      }
+      return null;
+    }
     const body = (await res.json()) as any;
-    if (res.status !== 200 || !body?.api_key) return null;
+    if (!body?.api_key) return null;
     return {
       api_key: body.api_key,
       name: body.name || "agent_free",
@@ -283,7 +424,7 @@ const mintFreeKey = async (
 // ── Main entry point: get a valid key, probing pool first ────────────────
 
 export async function getValidApiKey(
-  opts?: { timeoutMs?: number }
+  _opts?: { timeoutMs?: number },
 ): Promise<{ api_key: string; source: string } | null> {
   const pool = loadKeyPool();
 
@@ -310,17 +451,25 @@ export async function getValidApiKey(
   // 2. Pool empty or all dead — try to mint a fresh one, if today's quota allows.
   const poolForQuota = loadKeyPool();
   const createdToday = keysCreatedToday(poolForQuota);
-  if (createdToday >= 2) {
-    console.log(
-      chalk.yellow(
-        `  ⚠ Daily key creation quota exhausted (${createdToday}/2 today).`
-      )
-    );
-    console.log(
-      chalk.gray(
-        "    OpenSea free tier allows max 2 key creations per day per IP."
-      )
-    );
+  if (createdToday >= 2 || quotaExhaustedToday()) {
+    if (createdToday >= 2) {
+      console.log(
+        chalk.yellow(
+          `  ⚠ Daily key creation quota exhausted (${createdToday}/2 today).`
+        )
+      );
+      console.log(
+        chalk.gray(
+          "    OpenSea free tier allows max 2 key creations per day per IP."
+        )
+      );
+    } else {
+      console.log(
+        chalk.yellow(
+          "  ⚠ Free key creation already failed today (rate-limited) — skipping the request."
+        )
+      );
+    }
     console.log(chalk.gray("    Re-trying cached keys instead..."));
   } else {
     console.log(
@@ -382,6 +531,7 @@ export async function getValidApiKey(
       const statusLabel = entry.last_probe === "alive" ? chalk.green("alive")
         : entry.last_probe === "alive_but_exhausted" ? chalk.yellow("exhausted")
         : entry.last_probe === "throttled" ? chalk.yellow("throttled")
+        : entry.last_probe === "server_error" ? chalk.gray("api error")
         : entry.last_probe === "timeout" ? chalk.gray("timeout")
         : chalk.red("dead");
       const resetInfo = entry.rate_limit_reset > 0

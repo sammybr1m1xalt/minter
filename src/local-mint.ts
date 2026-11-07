@@ -78,9 +78,26 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
       );
       const readable = perEndpoint.filter((p) => p.nonce != null);
       const nonces = readable.map((p) => p.nonce!);
-      const highest = nonces.length > 0 ? Math.max(...nonces) : 0;
-      const agreed = nonces.length > 0 && new Set(nonces).size === 1;
-      return { address: w.address, nonce: highest, agreed, mismatched: readable.filter((p) => p.nonce !== highest).map((p) => p.url) };
+      // Highest AGREED nonce: the largest value that at least two endpoints
+      // report. A lone endpoint claiming a higher nonce is the one most likely
+      // to be ahead (it saw a tx the others haven't), and signing against it
+      // leaves every other endpoint rejecting the tx as a stale nonce.
+      const counts = new Map<number, number>();
+      for (const n of nonces) counts.set(n, (counts.get(n) ?? 0) + 1);
+      const agreed = [...counts.entries()]
+        .filter(([, c]) => c >= 2)
+        .map(([n]) => n);
+      const highest = agreed.length > 0
+        ? Math.max(...agreed)
+        : (nonces.length > 0 ? Math.max(...nonces) : 0);
+      // "agreed" is true only when every readable endpoint reported the same value.
+      const unanimous = nonces.length > 0 && new Set(nonces).size === 1;
+      return {
+        address: w.address,
+        nonce: highest,
+        agreed: unanimous,
+        mismatched: readable.filter((p) => p.nonce !== highest).map((p) => p.url),
+      };
     })
   );
 

@@ -10,7 +10,11 @@
 import * as fs from "fs";
 import * as path from "path";
 
-const LOG_DIR = path.resolve(process.cwd(), ".minter-logs");
+// Resolved lazily rather than at module load, so a caller that changes
+// process.cwd() (tests, embedders) still lands in the directory it expects.
+function logDir(): string {
+  return path.resolve(process.cwd(), ".minter-logs");
+}
 
 export interface RunLogger {
   info(msg: string): void;
@@ -22,7 +26,7 @@ export interface RunLogger {
 }
 
 export function createRunLogger(opts: { mode: string; label?: string }): RunLogger {
-  try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (e) {
+  try { fs.mkdirSync(logDir(), { recursive: true }); } catch (e) {
     // fs.mkdirSync throws on failure; best-effort only
   }
 
@@ -34,7 +38,7 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
   const label = opts.label || mode;
   const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const runId = `${ts}-${process.pid}`;
-  const logFile = path.join(LOG_DIR, `run-${runId}-${label}.log`);
+  const logFile = path.join(logDir(), `run-${runId}-${label}.log`);
 
   const push = (level: string, msg: string) => {
     const t = new Date().toISOString();
@@ -122,12 +126,12 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
 
       try {
         fs.writeFileSync(logFile, out, "utf-8");
-        const logs = fs.readdirSync(LOG_DIR)
+        const logs = fs.readdirSync(logDir())
           .filter(f => f.startsWith("run-") && f.endsWith(".log"))
           .sort()
           .reverse();
         for (const old of logs.slice(50)) {
-          try { fs.unlinkSync(path.join(LOG_DIR, old)); } catch {}
+          try { fs.unlinkSync(path.join(logDir(), old)); } catch {}
         }
       } catch (e) {
         process.stderr.write(`Failed to write log: ${e}\n`);

@@ -8,11 +8,11 @@
 //   2. RPC_URL + EXTRA_RPC_URLS — only when CHAIN in .env matches the selection
 //   3. the public endpoints in src/chains.ts
 //
-// verifyChainId() then confirms the node actually is that chain before we sign.
+// (verifyChainId was removed — chain confirmation is done inline now)
 
 import { ChainProfile, resolveChain } from "./chains";
 
-export interface ResolvedRpcs {
+interface ResolvedRpcs {
   urls: string[];
   source: string; // human label describing where these came from
 }
@@ -138,7 +138,7 @@ export function maskRpc(url: string): string {
   }
 }
 
-export interface RpcPlan {
+interface RpcPlan {
   urls: string[]; // blast list — index 0 is always query-capable when one exists
   verified: boolean; // at least one endpoint confirmed the expected chain id
   dropped: { url: string; chainId: number }[]; // removed: reported another chain
@@ -205,27 +205,3 @@ export async function planRpcs(urls: string[], expectedChainId: number): Promise
   };
 }
 
-// Ask the node what chain it's on. Returns null on any failure — the caller
-// decides whether an unreachable RPC is fatal.
-export async function verifyChainId(
-  rpcUrl: string,
-  timeoutMs = 8000
-): Promise<number | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(rpcUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", method: "eth_chainId", params: [], id: 1 }),
-      signal: controller.signal,
-    });
-    const json = (await res.json()) as { result?: string };
-    if (!json.result) return null;
-    return parseInt(json.result, 16);
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}

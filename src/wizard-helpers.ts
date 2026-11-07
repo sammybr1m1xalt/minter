@@ -32,7 +32,7 @@ export interface SnipeReadyInput {
 }
 
 // Thin key→value line used in the READY summary screen.
-export function line(label: string, value: string, color = chalk.gray): void {
+function line(label: string, value: string, color = chalk.gray): void {
   console.log(color(`  ${label.padEnd(10)} ${value}`));
 }
 
@@ -78,7 +78,7 @@ export async function promptGasGwei(
 }
 
 // Same base-fee helper, in case callers need it outside promptGasGwei.
-export async function currentBaseFeeGwei(provider: any): Promise<number | null> {
+async function currentBaseFeeGwei(provider: any): Promise<number | null> {
   const block = await provider.getBlock("latest");
   const baseFee = block.baseFeePerGas;
   if (!baseFee) return null;

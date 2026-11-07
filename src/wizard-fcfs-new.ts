@@ -4,16 +4,13 @@ import { ChainProfile, resolveChain } from "./chains";
 import { RunLogger } from "./logger";
 import {
   fetchAllActiveDrops,
-  DropPhase,
   printDropsInventory,
   reportInventoryEligibility,
-  assessDropEligibility,
   fetchGasState,
   printGasState,
   recommendGasSettings,
   printGasRecommendation,
   gasChoiceAssessment,
-  GasRecommendation,
 } from "./fcfs-drops";
 import {
   fetchOnChainDrops,
@@ -21,11 +18,11 @@ import {
 } from "./seadrop-onchain";
 import {
   fetchSignedPayload,
-  identifyAllowlistPreFetchCandidates,
+  fetchSignedPayloadForWallet,
   classifyMintMode,
   buildFcfsMintPlan,
-  FcfsMintPlan,
   executeFcfsSnipe,
+  FcfsSignedPayload,
 } from "./fcfs-mint";
 import { getValidApiKey } from "./opensea-key";
 import {
@@ -34,7 +31,6 @@ import {
   askYesNo,
   closePrompts,
 } from "./prompt";
-import { resolveRpcsForChain } from "./rpc-resolver";
 import { parseNftLink } from "./nft-link";
 import {
   promptGasGwei,
@@ -100,7 +96,7 @@ export async function runFcfsBranch(
     // phases on-chain rather than through OpenSea's drops API.
     console.log(chalk.gray(`    OpenSea REST drops 404'd — trying on-chain SEADROP fallback...`));
 
-    const onChainDrops = await fetchOnChainDrops(nftContract, 12000);
+    const onChainDrops = await fetchOnChainDrops(nftContract, 12000, chainKey);
     if (onChainDrops.length > 0) {
       console.log(chalk.green(`  ✓ Found ${onChainDrops.length} on-chain phase(s).`));
       // Create a synthetic inventory from on-chain data
@@ -116,7 +112,7 @@ export async function runFcfsBranch(
         // For collections like de-bots that use signed minting, also check
         // the on-chain singleton directly for this specific contract
         console.log(chalk.gray(`    Also checking single-contract on-chain drop...`));
-        const singleDrop = await fetchSingleOnChainDrop(nftContract, 8000);
+        const singleDrop = await fetchSingleOnChainDrop(nftContract, 8000, chainKey);
         if (singleDrop) {
           console.log(chalk.green(`  ✓ Found on-chain drop for this contract.`));
           inventory.drops = [singleDrop];
@@ -191,7 +187,7 @@ export async function runFcfsBranch(
     }
     throw new Error(
       `No targetable phases for ${nftContract}. ` +
-        `All ${eligibility.length} phase(s) either are skipped or need manual investigation.`,
+        `All ${eligibility.length} phase(s) either are skipped (${skip.length}) or need manual investigation.`,
     );
   }
 
@@ -450,6 +446,29 @@ export async function runFcfsBranch(
 
   const mintPlan = buildFcfsMintPlan(payload, gasLimit, maxFeePerGas, maxPriorityFeePerGas, quantity);
 
+  // Pre-fetch a per-wallet payload for every wallet while the drop is still
+  // future, so the T-0 path makes no API calls. Falls back to a live fetch at
+  // T-0 for any wallet that returns null here.
+  console.log(chalk.gray(`\n  Pre-fetching signed payloads for ${walletKeys.length} wallet(s)...`));
+  const preFetched: (FcfsSignedPayload | null)[] = [];
+  for (let i = 0; i < walletKeys.length; i++) {
+    const w = new Wallet(walletKeys[i]);
+    try {
+      const p = await fetchSignedPayloadForWallet(
+        nftContract,
+        quantity,
+        w.address,
+        apiKey || undefined,
+        { timeoutMs: 15000 },
+      );
+      preFetched.push(p);
+      if (!p) console.log(chalk.yellow(`    ${w.address} — no payload (will retry at T-0)`));
+    } catch (err: any) {
+      console.log(chalk.yellow(`    ${w.address} — pre-fetch failed: ${err.message}`));
+      preFetched.push(null);
+    }
+  }
+
   await executeFcfsSnipe({
     nftContract,
     quantity,
@@ -460,6 +479,7 @@ export async function runFcfsBranch(
     gasLimit,
     targetStart: targetStart || startsAt,
     plan: mintPlan,
+    payloads: preFetched,
   });
 }
 
@@ -467,7 +487,7 @@ export async function runFcfsBranch(
 // ── CLI entry: eligibility + gas check, no mint ──────────────────────────────
 // Polls all phases for a contract, shows eligibility + gas state, exits.
 
-export async function runEligibilityCheck(log: RunLogger, nftContract: string): Promise<void> {
+export async function runEligibilityCheck(_log: RunLogger, nftContract: string): Promise<void> {
   const { resolveChain } = require("./chains");
   const { fetchAllActiveDrops, reportInventoryEligibility, printDropsInventory, fetchGasState, printGasState } = require("./fcfs-drops");
   const { parseNftLink } = require("./nft-link");
@@ -478,7 +498,13 @@ export async function runEligibilityCheck(log: RunLogger, nftContract: string): 
   if (!chainProfile) throw new Error(`Unknown chain "${chainKey}"`);
 
   const envRpcs = (process.env[`RPC_URL_${chainKey.toUpperCase()}`] || "").split(",").filter(Boolean);
-  const { urls: rpcUrls } = await require("./rpc-resolver").resolveRpcsForChain(chainKey, envRpcs);
+  const { urls: candidateRpcs } = await require("./rpc-resolver").resolveRpcsForChain(chainKey, envRpcs);
+  // rpcUrls[0] is used as the read provider below, so it must be an endpoint
+  // that answers eth_call. planRpcs drops wrong-chain endpoints and puts a
+  // verified query-capable one first; without it a send-only sequencer can
+  // land at index 0 and every read fails.
+  const plan = await require("./rpc-resolver").planRpcs(candidateRpcs, chainProfile.chainId);
+  const rpcUrls = plan.urls;
   if (rpcUrls.length === 0) throw new Error(`No usable RPC endpoints for ${chainProfile.name}`);
 
   const parsed = parseNftLink(nftContract);

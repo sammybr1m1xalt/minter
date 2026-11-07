@@ -1,0 +1,403 @@
+OPENSEA DROPS API — AUTOMATED MINTER LAYOUT
+==============================================
+Source: docs.opensea.io, OpenAPI specs, upstream nft-minter-bot
+Date: 2026-10-16
+
+BASE URLS
+---------
+REST API:   https://api.opensea.io/api/v2/
+GraphQL:    https://gql.opensea.io/graphql
+SIWE auth:  https://opensea.io/__api/auth/siwe/
+API Key:    X-API-KEY header — required for ALL requests
+Bearer:     Authorization: Bearer <accessToken> — for wallet-specific endpoints
+
+
+API KEY MANAGEMENT
+-----------------
+- mintFreeKey() returns { api_key, name, expires_at } | { rate_limited: true } | null
+- Quota state (QUOTA_FILE) — CORRECTION (verified live 2026-11-06):
+  The rate-limit window is ROLLING, not anchored to midnight. A live probe
+  returned X-RateLimit-Reset = 1794036334 = 07:25:34 UTC, which had already
+  expired a minute before the probe. The original claim of "resets at UTC
+  midnight (not 24h from 429)" is WRONG. The code's local-midnight marker is
+  an approximation — useful to avoid re-POSTing every run, but it can block a
+  mint when the rolling window has recovered and the local day has not.
+  JSON fields: rate_limited_today, last_429_at, cached_keys_created_today
+- pruneStaleKeys: CORRECTION — keys are pruned when expired AND probed dead,
+  not on age alone. OpenSea's expires_at is NOT enforced: a key with
+  expires_at 2026-10-17 (21 days past) still returned HTTP 200 on
+  /api/v2/collections. Pruning on the timestamp alone discards working keys.
+- keysCreatedToday: counts unique minted_at timestamps after pruning
+- Key expiry: docs say 7 days (api-keys.md); auth-endpoints.md says 30. The
+  live evidence (a 21-day-past-expiry key still working) suggests expiry is
+  either not enforced or much longer than documented.
+
+
+STAGE TYPE VALUES — REST vs GQL (CRITICAL)
+------------------------------------------
+REST API v2 (/api/v2/drops/{slug}):
+  Field:  stage_type (lowercase snake_case)
+  Values: "public_sale", "signed_presale", "merkle_presale",
+          "token-gated" (or "tokengated")
+
+GraphQL (CollectionDropsQuery, DropEligibilityQuery):
+  Field:  stageType (camelCase)
+  Values: "PUBLIC_SALE", "SIGNED_PRESALE", "MERKLE_PRESALE",
+          "TOKEN_GATED" (SCREAMING_SNAKE_CASE)
+
+
+  Note: MERKLE_PRESALE/merkle_presale is in the enum but REJECTED
+  by OpenSea — no drop has ever used it, mints fail.
+
+
+STAGE TYPE → MINT MECHANISM MAPPING (SCREAMING_SNAKE_CASE in GQL)
+-----------------------------------------------------------------
+  PUBLIC_SALE   → mintPublic(price: 0 or >0)     [selector 0x161ac21f]
+  SIGNED_PRESALE → mintSigned (server signature)  [selector 0x4b61cd6f]
+  MERKLE_PRESALE → mintAllowList (on-chain merkle) [selector 0x4300a4e6]
+                ** REJECTED — never happens **
+  TOKEN_GATED   → token-gated (custom, address-bearing)
+  OVR / OVR     → override mode (custom logic)
+
+
+API ENDPOINTS — REST v2
+-----------------------
+
+1. GET /api/v2/drops/{slug}/eligibility
+   - Wallet-specific, REQUIRES authenticated session (Bearer token)
+   - Returns per-stage: isEligible, eligiblePrice, maxTotalMintableByWallet
+   - 401 without auth → use GQL DropEligibilityQuery instead
+
+2. POST /api/v2/drops/{slug}/mint
+   - No wallet auth required — only X-API-KEY
+   - Body: { minter: "0x...", quantity: N }
+   - Stage selection: backend picks first eligible stage (NOT configurable)
+   - Returns: { to, data, value } — ready-to-sign tx
+   - 400: bad address/quantity/missing fields
+   - 404: drop not found
+   - 422: mintable but not eligible (not on allowlist, supply exhausted,
+         limit exceeded, can't pay, paid stage with no creator payout)
+
+3. GET /api/v2/drops/{slug}
+   - Get drop details: active_stage, next_stage, stages[], price,
+     max_per_wallet, is_minting, supply, chain, contract_address, drop_type
+   - stages NOT sorted — sort by start_time yourself
+
+4. GET /api/v2/drops?{type}&{chains}&{limit}&{cursor}
+   - type: "featured" | "upcoming" | "recently-minted"
+   - Paginated with cursor
+
+
+API ENDPOINTS — GraphQL (PRIMARY PATH)
+--------------------------------------
+
+MintModuleQuery($collectionSlug):
+  dropBySlug(slug) {
+    stages {
+      stageType stageIndex startTime endTime
+      maxTotalMintableByWallet allowlistMemberCount
+      price { token { unit symbol contractAddress chain { identifier } } }
+      label
+    }
+  }
+
+DropEligibilityQuery($collectionSlug, $address):
+  dropBySlug(slug) {
+    ... on Erc721SeaDropV1 { minterQuantityMinted(minter: address) }
+    accountStageEligibility {
+      walletCount allowlistedWalletCount
+      wallets { address quantityMinted stages { dropStageUuid isEligible maxTotalMintableByWallet } }
+    }
+    stages {
+      uuid stageType stageIndex isEligible eligibleMinterAddress
+      maxTotalMintableByWallet allowlistMemberCount
+      eligibleMaxTotalMintableByWallet
+      eligiblePrice { token { unit symbol } }
+    }
+  }
+  NOTE: Response key is `dropBySlug`, NOT `drop`.
+
+CollectionDropsQuery($slug):
+  collectionBySlug(slug) {
+    slug name address
+    chain { identifier networkId }
+    stages(first: 50) {
+      edges { node {
+        uuid stageType label startTime endTime price
+        maxPerWallet allowlistWalletCount
+        ... on CollectionDropStage {
+          mintData mintSignature gasLimit maxFeePerGas maxPriorityFeePerGas
+          eligible eligibleCount totalAllocated
+          allowlistedAddresses { address }
+          allowlistHash feeRecipient
+        }
+      } }
+    }
+    activeStage { uuid stageType ... }
+    nextStage { uuid stageType ... }
+  }
+
+
+AUTHENTICATION FLOW (SIWE WARMING)
+----------------------------------
+1. GET https://opensea.io/__api/auth/siwe/nonce
+   - Returns: { nonce } (also sets nonce cookie)
+   - Use for each wallet in parallel
+2. personal_sign the nonce with wallet private key
+3. POST .../verify with signature
+   - Returns: session cookie (Set-Cookie header)
+4. POST /api/v2/auth/tokens with session cookie
+   - Body: { label, scopes: ["read:eligibility"], expiresInDays }
+   - Returns: { token, expiresAt }
+5. POST /api/v2/auth/tokens/exchange
+   - Body: { subjectToken, subjectTokenType: "ACCESS_TOKEN" }
+   - Returns: { accessToken, expiresIn: 43200, scope: "openid read:eligibility" }
+6. Use accessToken as Bearer token for /eligibility endpoint
+
+SIWE SESSION COVERING:
+  - ALL loaded wallets must be warmed in parallel (not just primary)
+  - Private keys without 0x prefix must be normalized before new Wallet(k)
+  - Session cookies needed for: GQL DropEligibilityQuery, REST
+    GET /drops/{slug}/eligibility
+
+
+ELIGIBILITY CHECK FLOW
+----------------------
+Per wallet:
+  1. Warm SIWE session (parallel across all wallets)
+  2. GraphQL DropEligibilityQuery($slug, $address) with Bearer token
+     OR — fallback — REST GET /drops/{slug}/eligibility
+  3. Parse stages[]: stageType (normalize to lowercase), isEligible
+  4. Report per-stage:
+     - Signed stage + isEligible: true → WL ✅ for that stage
+     - Signed stages present + all false → not on allowlist
+     - No signed stage returned → treat as not on WL
+  5. Skip PUBLIC_SALE in "WL scoreboard"
+
+
+MINT MODE CLASSIFICATION (classifyMintMode)
+--------------------------------------------
+Input: drop.type (normalized lowercase), mintData, mintSignature,
+       allowlistHash, allowlistedAddresses
+
+Priority order:
+  1. isPublicStage && mintPrice >= 0 → "public"
+  2. mintData && mintSignature → "signed"
+  3. type === "signed_presale" → "signed"
+  4. allowlistHash hex length >= 2 → "allowlist"
+  5. allowlistedAddresses.length > 0 → "allowlist"
+  6. type === "ovr" → "ovr"
+  7. token-gated/tokengated → "token-gated"
+  8. default → "unknown"
+
+NOTE: signed_presale from GQL CollectionDropsQuery does NOT have
+mintData/mintSignature — those only come from MintActionTimelineQuery
+at fire time. Use type === "signed_presale" check to classify.
+
+
+SIGNATURE DETECTION (isAddressBearingSelector)
+------------------------------------------------
+Selectors marked as address-bearing (require post-sign):
+  0x4b61cd6f  mintSigned   (SIGNED_PRESALE — server signature)
+  0x4300a4e6  mintAllowList  (MERKLE_PRESALE — on-chain merkle)
+  0x2369b850  mintTokenGated
+
+PUBLIC_SALE (0x161ac21f) does NOT require post-sign signature.
+
+The wizard default path should default to post-sign for address-bearing
+selectors (signed_presale, ovr, token-gated).
+
+
+CHAIN RESOLUTION
+----------------
+From slug: resolveChain via fetchGraphqlDrops or REST dropDetails
+From CA: resolveChain from contract address
+
+Known chains must resolve correctly. Unknown chains returning "not found"
+is intentional behavior.
+
+
+DROP TYPE VALUES
+----------------
+REST: drop_type field → "seadrop_v1_erc721" (SeaDrop),
+      other values may indicate non-SeaDrop (ERC-1155, etc.)
+GQL: __typename on dropBySlug → "Erc721SeaDropV1", "Erc1155Drop", etc.
+
+Only ERC-721 SeaDrop V1 drops are mintable via POST /drops/{slug}/mint.
+ERC-1155 drops return 400.
+
+
+TIMESTAMP / TIME HANDLING
+--------------------------
+- Unix ms timestamps (13-digit) for all OpenSea timestamps
+- All times in UTC (HH:MM interpreted as UTC)
+- Stages array NOT sorted by start_time — sort explicitly
+- Stage end_time: ISO 8601 or Unix ms
+- Stage start_time: ISO 8601 or Unix ms
+
+
+ERROR CODES — POST /drops/{slug}/mint
+--------------------------------------
+  400  Bad request: invalid address, quantity, missing fields, ERC-1155
+  404  Drop not found
+  409  Conflict (mint already in progress)
+  422  Preconditions failed: not on allowlist, limit exceeded,
+       supply exhausted, can't pay, paid stage + no creator payout
+  429  Rate limited
+
+
+KEY POOLING PIPELINE
+--------------------
+  loadQuotaState() → loadKeyPool() → mintFreeKey() → pruneStaleKeys()
+  Quota reset: UTC midnight (todayMidnightMs)
+  Key lifetime: 3 days (minted_at timestamp)
+  mintFreeKey return: { api_key, name, expires_at } | { rate_limited: true } | null
+  Dead key pruning: clean out dead entries when pool has entries but all dead/throttled
+
+API KEY CREATION — POST /api/v2/auth/keys
+-----------------------------------------
+  No auth needed for this endpoint.
+  curl -X POST https://api.opensea.io/api/v2/auth/keys
+  Response:
+    {
+      "api_key": "a1b2c3d4e5f6...",
+      "name": "agent_free_e753a54c",
+      "expires_at": "2026-05-14T00:00:00Z",
+      "rate_limits": { "read": "600/h", "write": "30/h", "fulfillment": "5/m" }
+    }
+  Also returns rate limit headers per response:
+    X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset (Unix epoch timestamp)
+
+  Rate limits / constraints:
+    - Free-tier keys: read 600/h, write 30/h, fulfillment 5/m
+    - Keys expire after 7 days (NOT 30 days — docs vary; 
+      auth-endpoints.md says 30 days, api-keys.md says 7)
+    - Key creation rate limit — CORRECTION (verified live 2026-11-06):
+      The original claim of "2 keys per hour per IP" is WRONG. A live 429
+      returned Retry-After: 41550 seconds = ~11.5 hours. The code's "2 keys
+      per day" is also an approximation. The real window is roughly 12 hours,
+      and the only authoritative signal is the Retry-After header on the 429.
+      The code should read Retry-After rather than assuming a fixed period.
+    - For higher limits, upgrade via developer portal
+
+  PAT management (scoped access tokens):
+    GET /api/v2/auth/tokens   — list PATs
+    POST /api/v2/auth/tokens  — create PAT
+    DELETE /api/v2/auth/tokens/{id}  — revoke
+    POST /api/v2/auth/tokens/{id}/rotate  — rotate
+    POST /api/v2/auth/tokens/exchange   — exchange PAT for wallet JWT
+
+
+DROP STAGE — REQUIRED FIELDS (REST DropStageResponse)
+------------------------------------------------------
+  uuid            string   (stage UUID)
+  stage_type      string   (lowercase in REST, SCREAMING_SNAKE in GQL)
+  label           string   (stage label)
+  price           string   (wei, decimal string)
+  price_currency_address string (0x000...000 for native)
+  start_time      string   (ISO 8601)
+  end_time        string   (ISO 8601)
+  max_per_wallet  string   (max tokens per wallet)
+
+Optional:
+  allowlist_wallet_count   integer
+  active_stage, next_stage
+
+
+PRICE FIELD HANDLING
+---------------------
+REST: price is a string (wei decimal) + price_currency_address
+GQL:  price { token { unit symbol contractAddress chain { identifier } } }
+GQL eligibility: eligiblePrice { token { unit symbol } }
+IMPORTANT: eligiblePrice may differ from listed price — use eligiblePrice
+when available for price protection checks.
+
+
+DROP LISTING — GET /api/v2/drops
+--------------------------------
+Parameters (query string):
+  type     string  — "featured" | "upcoming" | "recently_minted" (required)
+  limit    int     — 1-100, default 20
+  chains   array   — comma-separated chain list, omit = all chains
+  cursor   string  — pagination cursor from previous response's `next` field
+
+Response:
+  {
+    "drops": [
+      {
+        "collection_slug": string,
+        "collection_name": string,
+        "chain": string,
+        "contract_address": string,
+        "drop_type": string,
+        "is_minting": boolean,
+        "image_url": string,
+        "opensea_url": string
+      }
+    ],
+    "next": string  — cursor for next page (may be present even if drops
+                    are empty due to post-fetch filtering; continue
+                    paginating until next is null)
+  }
+
+Supported chains: blast, base, ethereum, zora, arbitrum, sei, avalanche,
+polygon, optimism, ape_chain, flow, b3, soneium, ronin, bera_chain, solana,
+shape, unichain, gunzilla, abstract, animechain, hyperevm, somnia, monad,
+hyperliquid, megaeth, ink
+
+
+FULL AUTOMATED MINTER WORKFLOW
+------------------------------
+Step 1: Discover drops
+  GET /api/v2/drops?type=upcoming&chains=ethereum&limit=20
+  Parse drops[].collection_slug + chain
+
+Step 2: Get drop details + stages
+  GET /api/v2/drops/{slug}?chains=ethereum
+  Fields returned per drop:
+    - chain (string)
+    - collection_name, collection_slug
+    - contract_address
+    - drop_type (string) — e.g. "seadrop_v1_erc721"
+    - is_minting (bool)
+    - max_supply, total_supply (decimal strings)
+    - image_url, opensea_url
+    - stages[] — each: uuid, stage_type, label, price, price_currency_address,
+      start_time, end_time, max_per_wallet, allowlist_wallet_count
+    - active_stage, next_stage
+
+  Check: remaining = max_supply - total_supply; abort if < quantity
+
+Step 3: Check wallet eligibility (if wallet-specific)
+  If signed_presale stage exists:
+    - Warm SIWE session (POST /siwe/nonce → sign → POST /siwe/verify)
+    - GQL DropEligibilityQuery($slug, $address) with Bearer token
+      OR — fallback — GET /drops/{slug}/eligibility with Bearer token
+    - Parse stages[]: isEligible, eligibleMinterAddress, eligiblePrice
+
+Step 4: Build mint transaction
+  POST /api/v2/drops/{slug}/mint
+  Headers: X-API-KEY, Content-Type: application/json
+  Body: { "minter": "0x...", "quantity": N }
+  Stage selection: OpenSea auto-selects first eligible stage (backend decides)
+  Mint response shape (flat — no transactions[] wrapper):
+    {
+      "to": "0xContractAddress",      — target contract address
+      "data": "0x...",                 — hex-encoded calldata
+      "value": "0x...",                — value in wei, ALREADY HEX (no conversion)
+      "chain": "ethereum"             — chain identifier
+    }
+  NOTE: Unlike swap/fulfillment endpoints, mint returns a flat object,
+        NOT wrapped in "transactions": [...]. And value is already hex.
+
+Step 5: Execute
+  sendTransaction({ to, data, value }) on the correct chain
+  waitForTransactionReceipt({ hash })
+
+Error handling reference:
+  400 — bad address/quantity/empty body/ERC-1155 (mint unsupported)
+  401/403 — API key missing/invalid OR not eligible (no wallet session)
+  404 — drop not found
+  429 — rate limited (read: 600/h, write: 30/h, fulfillment: 5/m)
+  422 — not on allowlist, supply exhausted, max per wallet met,
+        can't pay, paid stage + no creator payout
