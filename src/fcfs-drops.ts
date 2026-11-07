@@ -998,11 +998,16 @@ export function printDropsInventory(
       console.log(chalk.gray(`    Note:       ${report.reason}`));
     }
 
-    // Show mint data availability
-    if (drop.mintData) {
+    // Show mint data availability.
+    // The second branch must test mintSignature ALONE: the first branch already
+    // caught mintData, so `else if (drop.mintData || ...)` was unreachable and a
+    // signature-only payload silently reported "No signed mint data".
+    if (drop.mintData && drop.mintSignature) {
       console.log(chalk.green(`    ✓ Signed mint data available — targetable`));
-    } else if (drop.mintData || drop.mintSignature) {
-      console.log(chalk.yellow(`    ⚠ Partial signed data (${!!drop.mintData ? "calldata" : ""}${!!drop.mintData && !!drop.mintSignature ? " + " : ""}${!!drop.mintSignature ? "signature" : ""}) — may need session`));
+    } else if (drop.mintData) {
+      console.log(chalk.green(`    ✓ Signed mint data available — targetable`));
+    } else if (drop.mintSignature) {
+      console.log(chalk.yellow(`    ⚠ Partial signed data (signature only, no calldata) — may need session`));
     } else {
       console.log(chalk.gray(`    No signed mint data from OpenSea`));
     }

@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import { Wallet, formatEther } from "ethers";
 import { ChainProfile, resolveChain } from "./chains";
+import { planRpcs, resolveRpcsForChain } from "./rpc-resolver";
 import { RunLogger } from "./logger";
 import {
   fetchAllActiveDrops,
@@ -32,6 +33,7 @@ import {
   closePrompts,
 } from "./prompt";
 import { parseNftLink } from "./nft-link";
+import { resolveContractToSlug } from "./slug-resolver";
 import {
   promptGasGwei,
   promptTiming,
@@ -247,12 +249,38 @@ export async function runFcfsBranch(
   // signature. The inventory's mintData is the generic template; the real call
   // needs to go through OpenSea's mintSigned flow.
 
-  // Try with the key first
+  // Try with the key first.
+  // Both slug and walletAddress are REQUIRED: fetchSignedPayload's GraphQL and
+  // REST branches are gated on `slug && walletAddress`, so omitting them makes
+  // both unreachable and the function falls through to the on-chain branch,
+  // which only ever returns PUBLIC drops. A signed/allowlist phase therefore
+  // returned null on every run — the FCFS wizard could never obtain a payload.
+  // The slug is resolved from the contract when we don't already have one.
+  // runFcfsBranch does not receive a slug — only a contract address — so the
+  // slug must be resolved here. Without it fetchSignedPayload's GraphQL and
+  // REST branches are both unreachable.
+  let effectiveSlug: string | undefined;
+  try {
+    effectiveSlug = (await resolveContractToSlug(nftContract, apiKey || "")) || undefined;
+    if (effectiveSlug) {
+      console.log(chalk.gray(`    Resolved slug: ${effectiveSlug}`));
+    }
+  } catch {
+    effectiveSlug = undefined;
+  }
+
+  const primaryWallet = wallets[0].address;
+
   const payload = await fetchSignedPayload(
     nftContract,
     quantity,
     apiKey || undefined,
-    { timeoutMs: 12000 },
+    {
+      timeoutMs: 12000,
+      walletAddress: primaryWallet,
+      slug: effectiveSlug,
+      chainKey,
+    },
   );
 
   if (!payload) {
@@ -548,12 +576,14 @@ export async function runFcfsBranchCli(log: RunLogger, targetArg: string): Promi
   if (!chainProfile) throw new Error(`Unknown chain "${chainKey}"`);
 
   const envRpcs = (process.env[`RPC_URL_${chainKey.toUpperCase()}`] || "").split(",").filter(Boolean);
-  let rpcUrls: string[];
-  if (envRpcs.length > 0) {
-    rpcUrls = envRpcs;
-  } else {
-    rpcUrls = chainProfile.rpc.public;
-  }
+  const { urls: candidateRpcs } = await resolveRpcsForChain(chainKey, envRpcs);
+  // rpcUrls[0] is used as the read provider for balances/eth_call, so it must be
+  // an endpoint that answers those. planRpcs drops wrong-chain endpoints and
+  // puts a verified query-capable one first — without it a send-only sequencer
+  // can land at index 0 and every read fails. runEligibilityCheck already does
+  // this; the CLI path did not, which is how a mis-ordered endpoint survived.
+  const plan = await planRpcs(candidateRpcs, chainProfile.chainId);
+  const rpcUrls = plan.urls;
   if (rpcUrls.length === 0) throw new Error(`No usable RPC endpoints for ${chainProfile.name}`);
 
   const parsed = parseNftLink(targetArg);

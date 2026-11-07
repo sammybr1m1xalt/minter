@@ -834,7 +834,12 @@ export function encodeAllowlistMintCalldata(
 export type MintMode = "public" | "signed" | "allowlist" | "token-gated" | "unknown";
 
 export function classifyMintMode(drop: DropPhase): { mode: MintMode; fireableLocally: boolean; preFetchNeeded: boolean } {
-  if (drop.isPublicStage && drop.mintPrice > 0n) {
+  // A public stage is fireable locally whether or not it costs anything.
+  // Requiring mintPrice > 0 here misclassified every FREE public mint as
+  // "unknown" + preFetchNeeded, sending it down the signed-payload path where
+  // it can never succeed. Free mints are common (and are the whole point of a
+  // public-mint tool), so the price must not gate the classification.
+  if (drop.isPublicStage) {
     return { mode: "public", fireableLocally: true, preFetchNeeded: false };
   }
 

@@ -202,19 +202,13 @@ export async function resolveSlug(
     }
   }
 
-  // 3. REST v2 with key as last resort
-  if (apiKey && apiKey.trim()) {
-    const rest2 = await restCollectionBySlug(slug, apiKey);
-    if (rest2?.address) {
-      return {
-        name: rest2.slug,
-        contractAddress: rest2.address,
-        chain: rest2.chain.identifier ?? "",
-      };
-    }
-  }
+  // NOTE: there is deliberately no third REST attempt here. It used to re-run
+  // restCollectionBySlug(slug, apiKey) with the identical arguments as step 1,
+  // so it could only ever repeat step 1's failure. A real retry would need a
+  // different input (e.g. a CA-based lookup) — until then, go straight to the
+  // HTML scrape.
 
-  // 4. HTML scrape — final fallback (mirrors upstream resolve.js)
+  // 3. HTML scrape — final fallback (mirrors upstream resolve.js)
   const scraped = await htmlScrapeCollection(slug);
   if (scraped?.address) {
     return {
