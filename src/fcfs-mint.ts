@@ -1031,7 +1031,10 @@ export async function fetchTokenGatedMintParams(
     ")",
   ];
   const iface = new Interface(ABI);
-  const provider = new JsonRpcProvider(rpcUrl);
+  // staticNetwork: true — without it ethers performs a network detection
+  // (eth_chainId) on first use, which adds a round trip and, on a slow or
+  // rate-limited endpoint, times out before the read it was created for.
+  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
 
   try {
     const data = iface.encodeFunctionData("getTokenGatedDrop", [nftContract, gateToken]);

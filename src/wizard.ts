@@ -69,6 +69,7 @@ import { parseWhen } from "./schedule";
 import { parsePriceSpec } from "./price-protection";
 import { findUniversalMint, explainFailure, UniversalMintPlan } from "./universal-mint";
 import { getMintMechanisms } from "./seadrop-public";
+import { verifyContract } from "./contract-verify";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
 import { blastToAll } from "./rpc-blast";
 import { parsePriceToWei } from "./opensea-gql";
@@ -254,7 +255,13 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     console.log(chalk.green(`  ✓ Confirmed chain id ${chainProfile.chainId} (${chainProfile.name})`));
   }
   const rpcUrls = plan.urls;
-  const provider = new JsonRpcProvider(rpcUrls[0]);
+  // The chain id is already known here — pass it so ethers never has to detect
+  // the network. Detection costs a round trip and, on a slow endpoint, times out
+  // before the first read. staticNetwork also stops ethers from re-detecting if
+  // the endpoint ever reports a different chain.
+  const provider = new JsonRpcProvider(rpcUrls[0], chainProfile.chainId, {
+    staticNetwork: true,
+  });
   try {
 
     // ── 6. Resolve slug + API key ────────────────────────────────────────────
@@ -326,6 +333,34 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
 
     const inventory = await discoverAllPhases(nftInput, slug, apiKey, chainKey, 12000);
     log.field("phases_found", inventory.drops.length);
+
+    // ── 7a. Verify the target is a contract ─────────────────────────────────
+    // A scraped or mistyped address is untrusted input. Before treating it as a
+    // mint target, confirm it has bytecode — and that the bytecode is not an
+    // EIP-7702 delegation designator, which an eth_getCode check alone would
+    // misread as a contract. An EOA here means the user pasted a wallet, a
+    // token, or a dead link, and every downstream probe would be meaningless.
+    if (!isSlug(nftInput)) {
+      const verification = await verifyContract(nftInput, chainProfile.chainId);
+      if (!verification.isContract) {
+        console.log(
+          chalk.yellow(
+            `\n  ⚠ ${nftInput} is not a contract on ${chainProfile.name} (${verification.reason}).`
+          )
+        );
+        console.log(
+          chalk.gray(
+            `    Nothing will be minted. Check the address and chain, then re-run.`
+          )
+        );
+        closePrompts();
+        return;
+      }
+      console.log(
+        chalk.green(`  ✓ Verified contract on ${chainProfile.name} (${verification.reason})`)
+      );
+      log.field("contract_verified", "true");
+    }
 
     // ── 8a. Gas (needed by both the phase path and the universal fallback) ──
    
@@ -752,7 +787,7 @@ async function executeUniversalMint(
     // Re-simulate immediately before signing. The plan was simulated during
     // discovery, but a live sale can close between then and now — and a revert
     // costs gas to discover on-chain.
-    const simProvider = new JsonRpcProvider(rpcUrls[0]);
+    const simProvider = new JsonRpcProvider(rpcUrls[0], undefined, { staticNetwork: true });
     let sim: SimulateResult;
     try {
       sim = await simulateTx(simProvider, {
@@ -838,8 +873,15 @@ async function discoverAllPhases(
       inventory.drops = onChainDrops;
       inventory.fetchedAt = Date.now();
       inventory.apiKeyUsed = !!apiKey;
-    } else if (!apiKey) {
-      // Try single-contract on-chain drop as last resort
+    } else {
+      // Try single-contract on-chain drop as last resort.
+      //
+      // This must run regardless of whether an API key is present. Gating it on
+      // `!apiKey` meant that with a key configured, a contract that OpenSea
+      // simply does not index (or indexes under a slug we failed to resolve) was
+      // never probed on-chain at all — the run fell straight through to the
+      // universal probe with no SeaDrop phase data. A key is irrelevant to an
+      // eth_call against the SeaDrop singleton.
       console.log(chalk.gray(`    OpenSea REST 404'd — checking single-contract on-chain drop...`));
       const singleDrop = await fetchSingleOnChainDrop(nftContract, 8000, chainKey);
       if (singleDrop) {

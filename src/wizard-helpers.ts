@@ -274,7 +274,7 @@ export async function planSellAfterMint(ctx: SellPromptContext): Promise<SellPla
 
   // Report the estimated gas cost in USD for all three modes at this moment.
   const usd = await fetchUsdPrice(ctx.chainKey, ctx.apiKey).catch(() => null);
-  const estProvider = new JsonRpcProvider(ctx.rpcUrl);
+  const estProvider = new JsonRpcProvider(ctx.rpcUrl, undefined, { staticNetwork: true });
   let base = 0n;
   let tip = 0n;
   try {

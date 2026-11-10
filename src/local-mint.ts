@@ -199,7 +199,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
         )
       );
     } else {
-      const simProvider = new JsonRpcProvider(rpcUrls[0]);
+      const simProvider = new JsonRpcProvider(rpcUrls[0], undefined, { staticNetwork: true });
       try {
         sim = await simulateTx(simProvider, {
           to: plan.to,
