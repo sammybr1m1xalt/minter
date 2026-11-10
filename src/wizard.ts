@@ -462,7 +462,15 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       console.log(chalk.gray("  Will poll the on-chain open time."));
     } else if (knownStart) {
       const prompted = await promptTiming(knownStart);
-      targetStart = prompted.targetStart ?? knownStart;
+      if (!prompted.targetStart) {
+        // The user declined to wait for the stage. Abort rather than silently
+        // falling back to the stage's start time — that would schedule a mint
+        // they just said they did not want.
+        console.log(chalk.yellow("\n  Not scheduled — nothing was sent.\n"));
+        closePrompts();
+        return;
+      }
+      targetStart = prompted.targetStart;
       timingLabel = prompted.timingLabel;
     } else {
       // Unknown opening time. Never silently default to "now".
@@ -656,6 +664,12 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         // OpenSea's per-wallet quote for the selected stage, so a price that
         // rose after the eligibility check is refused before fetching a payload.
         quotedPriceWei: phaseEligibility.priceWei ?? null,
+        // A future phase has no payload yet. Phase 1 must not fetch one (it
+        // would always come back null and drop the wallet); phase 2 fetches at
+        // T-0 instead.
+        phaseOpensInFuture:
+          selectedDrop.startTime > 0 &&
+          selectedDrop.startTime * 1000 > Date.now(),
       });
       mintOutcomes = snipeResults.map((r) => ({
         walletIndex: r.walletIndex,

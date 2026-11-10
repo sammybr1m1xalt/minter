@@ -1094,8 +1094,9 @@ export interface ExecuteSnipeOpts {
   gasLimit: number;
   targetStart: Date;
   /** Structural template from buildFcfsMintPlan. `payload` is used when it is
-   *  already bound to wallets[0]; otherwise a per-wallet fetch is required. */
-  plan: FcfsMintPlan;
+   *  already bound to wallets[0]; otherwise a per-wallet fetch is required.
+   *  Null when the selected phase opens in the future and no payload exists yet. */
+  plan: FcfsMintPlan | null;
   openSeaApiKey?: string | null;
   slug?: string;                    // collection slug for OpenSea GraphQL/REST calls
   chainKey?: string;               // chain key (e.g., "ethereum", "base") for GraphQL
@@ -1103,6 +1104,14 @@ export interface ExecuteSnipeOpts {
   /** Per-wallet pre-fetched payloads (indexed by walletKeys). When present,
    *  these are used directly and NO API call happens in the critical path. */
   payloads?: (FcfsSignedPayload | null)[];
+  /**
+   * True when the selected phase opens in the future. A signed payload for a
+   * future phase cannot exist — OpenSea only signs a mint for a stage that is
+   * live — so phase 1 must not fetch one and phase 2 must fetch at T-0.
+   * Without this the payload is fetched before the wait, found missing, and the
+   * wallet is dropped before it ever had a chance to mint.
+   */
+  phaseOpensInFuture?: boolean;
   /** Maximum total price (wei) the user will accept. Asserted before signing. */
   maxPriceWei?: bigint | null;
   /** Per-unit price OpenSea quoted for this wallet during the eligibility check.
@@ -1213,6 +1222,9 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     gasLimit: number;
   }
   const ready: ReadyTx[] = [];
+  // Wallets held back because the phase opens in the future. Their payloads are
+  // fetched at T-0, after the wait — see phase 2.
+  const pendingAtT0: { walletIndex: number; addr: string }[] = [];
 
   // Establish the TCP/TLS sessions NOW, while there is time to spare. Without
   // this the first RPC at T-0 pays the handshake, and the public path has always
@@ -1225,8 +1237,12 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     try {
       // Prefer the pre-fetched per-wallet payload; fall back to a live fetch NOW
       // (still before T-0) — never at fire time.
+      //
+      // EXCEPT when the phase opens in the future. OpenSea will not sign a mint
+      // for a stage that is not live, so a fetch here always returns null and
+      // the wallet is dropped before the wait even starts. Defer it to T-0.
       let payload: FcfsSignedPayload | null = opts.payloads?.[i] ?? null;
-      if (!payload) {
+      if (!payload && !opts.phaseOpensInFuture) {
         payload = await fetchSignedPayloadForWallet(
           nftContract,
           quantity,
@@ -1234,6 +1250,12 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
           openSeaApiKey,
           { timeoutMs: 15000, session: opts.sessions?.[i] ?? null, slug, chainKey },
         );
+      }
+      if (!payload && opts.phaseOpensInFuture) {
+        // Not an error — the payload cannot exist yet. Hold the wallet back and
+        // let phase 2 fetch it at T-0.
+        pendingAtT0.push({ walletIndex: i, addr });
+        return;
       }
       if (!payload) {
         results[i] = {
@@ -1310,8 +1332,9 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   }));
 
   // Nothing survived phase 1 — do not sit through the wait for a fire that
-  // cannot happen.
-  if (ready.length === 0) {
+  // cannot happen. Wallets held back for a future phase are the exception: they
+  // have not failed, they are waiting for T-0.
+  if (ready.length === 0 && pendingAtT0.length === 0) {
     return results.filter((r): r is SnipeResult => r != null);
   }
 
@@ -1327,6 +1350,88 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   // Per wallet, ONE parallel batch: nonce + gas estimate + simulation. That is
   // the entire fire-time RPC cost — a single round trip — followed by local
   // signing and the blast.
+  //
+  // Wallets held back for a future phase get their payload fetched HERE, after
+  // the wait. OpenSea signs a mint only for a live stage, so this is the first
+  // moment the payload can exist. A short retry window covers the lag between
+  // the on-chain start and OpenSea's signer coming online.
+  if (pendingAtT0.length > 0) {
+    console.log(
+      `  Phase is live — fetching signed payloads for ${pendingAtT0.length} wallet(s)...`
+    );
+    const fetched = await Promise.all(
+      pendingAtT0.map(async ({ walletIndex, addr }) => {
+        // Retry briefly: the stage can be live on-chain a few seconds before
+        // OpenSea will sign for it. A single attempt would fail the whole run.
+        let payload: FcfsSignedPayload | null = null;
+        let lastErr: string | null = null;
+        for (let attempt = 0; attempt < 4 && !payload; attempt++) {
+          if (attempt > 0) {
+            await new Promise((r) => setTimeout(r, 1500));
+          }
+          try {
+            payload = await fetchSignedPayloadForWallet(
+              nftContract,
+              quantity,
+              addr,
+              openSeaApiKey,
+              {
+                timeoutMs: 8000,
+                session: opts.sessions?.[walletIndex] ?? null,
+                slug,
+                chainKey,
+              },
+            );
+          } catch (err: any) {
+            lastErr = err?.message || String(err);
+          }
+        }
+        if (!payload) {
+          results[walletIndex] = {
+            walletIndex,
+            walletAddress: addr,
+            success: false,
+            error:
+              `No signed payload at T-0 for ${addr}` +
+              (lastErr ? ` — last error: ${lastErr}` : " — OpenSea did not return signed data."),
+            retryable: true,
+          };
+          return null;
+        }
+        if (!isPayloadBoundToWallet(payload, addr)) {
+          results[walletIndex] = {
+            walletIndex,
+            walletAddress: addr,
+            success: false,
+            error: `T-0 payload for ${addr} is bound to a different wallet — refusing to broadcast.`,
+          };
+          return null;
+        }
+        return { walletIndex, addr, payload };
+      })
+    );
+
+    // Promote the successful fetches into the ready set so the blast below
+    // treats them exactly like wallets that had a payload all along.
+    for (const entry of fetched) {
+      if (!entry) continue;
+      ready.push({
+        walletIndex: entry.walletIndex,
+        addr: entry.addr,
+        to: entry.payload.seaDropAddress,
+        data: entry.payload.mintData,
+        value: entry.payload.value,
+        gasLimit: gasLimit || 250_000,
+      });
+    }
+  }
+
+  // The wait may have produced no ready wallets at all (every wallet was held
+  // back and every T-0 fetch failed) — nothing to blast.
+  if (ready.length === 0) {
+    return results.filter((r): r is SnipeResult => r != null);
+  }
+
   // The chainId is passed explicitly. Without it ethers performs a network
   // detection (eth_chainId) on the first request — an extra round trip inside
   // the T-0 critical path, and on some endpoints it retries first.

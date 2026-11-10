@@ -202,6 +202,17 @@ export async function promptTiming(dropStartTime: Date | null): Promise<{ target
   const waitStr = `in ${Math.round(delay / 1000)}s`;
   console.log(chalk.bold.white(`\nTiming`));
   console.log(chalk.gray(`  Stage opens ${toIST(dropStartTime)} (${waitStr} from now)`));
+
+  // A future signed phase has no payload yet — OpenSea signs a mint only for a
+  // live stage. Ask whether to wait for it rather than assuming, so the user
+  // knows the run will sit idle until T-0 and that the payload is fetched then.
+  const fireWhenOpen = await askYesNo(
+    `  Fire when the stage opens?`,
+    true
+  );
+  if (!fireWhenOpen) {
+    return { targetStart: null, timingLabel: "Declined — not scheduled" };
+  }
   return { targetStart: dropStartTime, timingLabel: `Fires at ${toIST(dropStartTime)}` };
 }
 

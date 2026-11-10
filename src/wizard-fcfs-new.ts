@@ -255,6 +255,10 @@ export async function runFcfsBranch(
   let sel: EligibilityReport | null = null;
   let drop0: DropPhase | null = null;
   let pay0: FcfsSignedPayload | null = null;
+  // True when the selected phase opens in the future and the user accepted
+  // waiting for it. The payload is then fetched at T-0, so every payload-derived
+  // display and check below is skipped.
+  let futurePhaseAccepted = false;
 
   for (;;) {
     // ── Step 6: Let the user pick a phase ────────────────────────────────────
@@ -336,6 +340,61 @@ export async function runFcfsBranch(
     );
 
     if (!pay0) {
+      // ── Future phase: no payload can exist yet ────────────────────────────
+      // OpenSea signs a mint only for a stage that is live. A phase that opens
+      // later therefore returns null here on every run — this is expected, not
+      // an error. Ask whether to wait for it instead of throwing.
+      const phaseStartMs =
+        drop0.startTime > 0 ? drop0.startTime * 1000 : null;
+      const opensInFuture = phaseStartMs != null && phaseStartMs > Date.now();
+
+      if (opensInFuture) {
+        console.log(chalk.yellow(`\n  This phase is not open yet.`));
+        console.log(
+          chalk.gray(
+            `    It opens ${toIST(new Date(phaseStartMs!))} — OpenSea will not sign a mint\n` +
+              `    for a stage that is not live, so no signed payload exists yet.`
+          )
+        );
+        console.log(
+          chalk.gray(
+            `    The run can wait and fetch the payload at T-0, then mint.`
+          )
+        );
+
+        const wait = await askYesNo(`  Wait for this phase and fire when it opens?`, true);
+        if (!wait) {
+          // Offer another phase, then abort.
+          const currentDropId = drop0.dropId;
+          const otherTargetable = eligibility.filter(
+            (e) => e.recommendation === "target" && e.drop.dropId !== currentDropId,
+          );
+          if (otherTargetable.length > 0) {
+            const tryOther = await askYesNo(`  Switch to another phase?`, false);
+            if (tryOther) {
+              console.log(chalk.gray(`  Re-selecting phase...\n`));
+              continue;
+            }
+          }
+          throw new Error(
+            `Not scheduled — phase "${drop0.name || "unnamed"}" opens later and no signed payload exists yet.`,
+          );
+        }
+
+        // Accepted the wait. Carry the phase through with a null payload and
+        // let executeFcfsSnipe fetch at T-0.
+        console.log(
+          chalk.green(`  ✓ Will wait for the phase and fetch signed payloads at T-0.`)
+        );
+        // Re-select with the payload marked absent; the timing step below will
+        // schedule for the phase's start.
+        pay0 = null;
+        // Fall through to timing with a flag the snipe reads.
+        sel = sel; // keep selection
+        drop0 = drop0;
+        // Mark via a module-level sentinel consumed below.
+        futurePhaseAccepted = true;
+      } else {
       console.log(chalk.red(`\n  ✗ Could not fetch signed mint data for this phase.`));
       console.log(chalk.gray(`    Possible reasons:`));
       console.log(chalk.gray(`    • The phase exists but doesn't use OpenSea's signature flow`));
@@ -389,11 +448,16 @@ export async function runFcfsBranch(
           `The phase exists but OpenSea didn't return wallet-specific signed data. ` +
           `This may require a live OAuth session, or the phase isn't using OpenSea's signature flow.`,
       );
+      }
     }
     break;
   }
 
-  if (!sel || !drop0 || !pay0) {
+  if (!sel || !drop0) {
+    throw new Error("No phase selected — aborting.");
+  }
+  // A future phase legitimately has no payload yet. It is fetched at T-0.
+  if (!pay0 && !futurePhaseAccepted) {
     throw new Error("No phase selected — aborting.");
   }
   // Narrow once; the rest of the function uses these names.
@@ -402,7 +466,10 @@ export async function runFcfsBranch(
   const payload = pay0;
 
   // ── Step 8: Show the fetched drop details ────────────────────────────────
-  const drop = payload.drop;
+  // With no payload (future phase accepted), fall back to the inventory's drop
+  // metadata — it carries the window, price and per-wallet cap, which is all we
+  // can know before T-0.
+  const drop = payload?.drop ?? selectedDrop;
   // The GQL MintActionTimelineQuery response does not carry the stage window, so
   // openseaMintTxToSignedPayload sets startTime/endTime = 0. Reading those
   // literally yields 1970: promptTiming sees a past date, executeFcfsSnipe
@@ -419,17 +486,29 @@ export async function runFcfsBranch(
   const endsAt = endMs != null ? new Date(endMs) : null;
   const live = startMs != null && endMs != null && Date.now() >= startMs && Date.now() < endMs;
 
-  console.log(chalk.green(`  ✓ Fetched signed mint data from OpenSea`));
-  console.log(chalk.gray(`    SeaDrop:       ${payload.seaDropAddress}`));
-  console.log(chalk.gray(`    NFT:           ${nftContract}`));
-  console.log(chalk.gray(`    Fee recipient: ${payload.feeRecipient}`));
-  console.log(
-    chalk.gray(
-      `    Price:         ${formatEther(drop.mintPrice)} × ${quantity} = ${formatEther(payload.value)} per wallet`,
-    ),
-  );
-  console.log(chalk.gray(`    Max per wallet: ${drop.maxTotalMintableByWallet || "unlimited"}`));
-  console.log(chalk.gray(`    Calldata:      ${(payload.mintData.length - 2) / 2} bytes (per-wallet signed)`));
+  if (payload) {
+    console.log(chalk.green(`  ✓ Fetched signed mint data from OpenSea`));
+    console.log(chalk.gray(`    SeaDrop:       ${payload.seaDropAddress}`));
+    console.log(chalk.gray(`    NFT:           ${nftContract}`));
+    console.log(chalk.gray(`    Fee recipient: ${payload.feeRecipient}`));
+    console.log(
+      chalk.gray(
+        `    Price:         ${formatEther(drop.mintPrice)} × ${quantity} = ${formatEther(payload.value)} per wallet`,
+      ),
+    );
+    console.log(chalk.gray(`    Max per wallet: ${drop.maxTotalMintableByWallet || "unlimited"}`));
+    console.log(chalk.gray(`    Calldata:      ${(payload.mintData.length - 2) / 2} bytes (per-wallet signed)`));
+  } else {
+    console.log(chalk.yellow(`  ⟳ No signed payload yet — the phase is not open.`));
+    console.log(chalk.gray(`    NFT:           ${nftContract}`));
+    console.log(
+      chalk.gray(
+        `    Price:         ${formatEther(selectedDrop.mintPrice)} × ${quantity} per wallet (from the phase inventory)`,
+      ),
+    );
+    console.log(chalk.gray(`    Max per wallet: ${selectedDrop.maxTotalMintableByWallet || "unlimited"}`));
+    console.log(chalk.gray(`    Calldata:      fetched at T-0, per wallet`));
+  }
   const fmtWhen = (d: Date | null) => (d ? toIST(d) : "unknown");
   const nowMs = Date.now();
   const timingNote = live
@@ -460,7 +539,7 @@ export async function runFcfsBranch(
       }
     : null;
 
-  const recommendation = recommendGasSettings(gasState, openSeaGas, payload.gasData?.gasLimit || 250_000);
+  const recommendation = recommendGasSettings(gasState, openSeaGas, payload?.gasData?.gasLimit || 250_000);
   printGasRecommendation(recommendation, chainProfile.name);
 
   // ── Step 10: Gas selection ───────────────────────────────────────────────
@@ -468,7 +547,7 @@ export async function runFcfsBranch(
   let maxFeePerGas = recommendation.suggestedMaxFeePerGasWei;
   let maxPriorityFeePerGas = recommendation.suggestedMaxPriorityFeePerGasWei;
 
-  if (payload.gasData?.maxFeePerGas) {
+  if (payload?.gasData?.maxFeePerGas) {
     // OpenSea provided gas — use it as the baseline, but show the recommendation
     gasLimit = payload.gasData.gasLimit || gasLimit;
     maxFeePerGas = payload.gasData.maxFeePerGas;
@@ -520,6 +599,14 @@ export async function runFcfsBranch(
     // promptTiming accepts null and returns a null targetStart when the opening
     // time is unknown; fall back to the inventory's window, then to now.
     const prompted = await promptTiming(startsAt);
+    if (!prompted.targetStart && startsAt) {
+      // The user declined to wait for this phase. Abort rather than falling
+      // back to the stage's start time, which would schedule a mint they just
+      // said they did not want.
+      console.log(chalk.yellow("\n  Not scheduled — nothing was sent.\n"));
+      closePrompts();
+      return;
+    }
     targetStart = prompted.targetStart ?? startsAt ?? new Date();
     timingLabel = prompted.timingLabel;
   }
@@ -542,7 +629,10 @@ export async function runFcfsBranch(
     }
   }
 
-  const required = BigInt(gasLimit) * maxFeePerGas + payload.value;
+  // Without a payload the mint value is unknown until T-0; quote the phase's
+  // inventory price instead so the affordability check still means something.
+  const mintValue = payload ? payload.value : BigInt(selectedDrop.mintPrice) * BigInt(quantity);
+  const required = BigInt(gasLimit) * maxFeePerGas + mintValue;
 
   console.log(chalk.gray(`  Each wallet needs: ${formatEther(required)} ETH (gas reservation + mint value)`));
   const shortCount = wallets.filter(
@@ -567,7 +657,7 @@ export async function runFcfsBranch(
     balances,
     nftContract,
     quantity,
-    valuePerWallet: payload.value,
+    valuePerWallet: mintValue,
     required,
     gasLimit,
     maxFeePerGas,
@@ -595,7 +685,7 @@ export async function runFcfsBranch(
       apiKey,
       symbol: chainProfile.nativeSymbol,
       mintQuantity: quantity,
-      valuePerWallet: payload.value,
+      valuePerWallet: mintValue,
       rpcUrl: rpcUrls[0],
     });
   } else {
@@ -608,7 +698,11 @@ export async function runFcfsBranch(
     );
   }
 
-  const mintPlan = buildFcfsMintPlan(payload, gasLimit, maxFeePerGas, maxPriorityFeePerGas, quantity);
+  // Without a payload (future phase) there is no structural template to build —
+  // the plan is derived per wallet at T-0. Pass null and let the snipe skip it.
+  const mintPlan = payload
+    ? buildFcfsMintPlan(payload, gasLimit, maxFeePerGas, maxPriorityFeePerGas, quantity)
+    : null;
 
   // ── Price protection ────────────────────────────────────────────────────
   // Without this a drop that raised its price between planning and firing is
@@ -625,27 +719,40 @@ export async function runFcfsBranch(
   // Pre-fetch a per-wallet payload for every wallet while the drop is still
   // future, so the T-0 path makes no API calls. Falls back to a live fetch at
   // T-0 for any wallet that returns null here.
+  //
+  // Skipped entirely for a future phase: OpenSea will not sign for a stage that
+  // is not live, so every fetch would return null and waste a round trip per
+  // wallet. executeFcfsSnipe fetches at T-0 instead.
   console.log(chalk.gray(`\n  Pre-fetching signed payloads for ${walletKeys.length} wallet(s)...`));
   const preFetched: (FcfsSignedPayload | null)[] = [];
-  for (let i = 0; i < walletKeys.length; i++) {
-    const w = new Wallet(walletKeys[i]);
-    try {
-      const p = await fetchSignedPayloadForWallet(
-        nftContract,
-        quantity,
-        w.address,
-        apiKey || undefined,
-        // slug + chainKey are REQUIRED: fetchSignedPayload gates both its GraphQL
-        // and REST branches on them. Omitting them here made the pre-fetch fall
-        // through to the on-chain branch, which only ever returns PUBLIC drops —
-        // so the pre-fetch could never populate a signed/allowlist payload.
-        { timeoutMs: 15000, slug: effectiveSlug, chainKey },
-      );
-      preFetched.push(p);
-      if (!p) console.log(chalk.yellow(`    ${w.address} — no payload (will retry at T-0)`));
-    } catch (err: any) {
-      console.log(chalk.yellow(`    ${w.address} — pre-fetch failed: ${err.message}`));
+  if (futurePhaseAccepted) {
+    for (let i = 0; i < walletKeys.length; i++) {
       preFetched.push(null);
+    }
+    console.log(
+      chalk.gray(`    Skipped — the phase is not open. Payloads are fetched at T-0.`)
+    );
+  } else {
+    for (let i = 0; i < walletKeys.length; i++) {
+      const w = new Wallet(walletKeys[i]);
+      try {
+        const p = await fetchSignedPayloadForWallet(
+          nftContract,
+          quantity,
+          w.address,
+          apiKey || undefined,
+          // slug + chainKey are REQUIRED: fetchSignedPayload gates both its GraphQL
+          // and REST branches on them. Omitting them here made the pre-fetch fall
+          // through to the on-chain branch, which only ever returns PUBLIC drops —
+          // so the pre-fetch could never populate a signed/allowlist payload.
+          { timeoutMs: 15000, slug: effectiveSlug, chainKey },
+        );
+        preFetched.push(p);
+        if (!p) console.log(chalk.yellow(`    ${w.address} — no payload (will retry at T-0)`));
+      } catch (err: any) {
+        console.log(chalk.yellow(`    ${w.address} — pre-fetch failed: ${err.message}`));
+        preFetched.push(null);
+      }
     }
   }
 
@@ -670,6 +777,9 @@ export async function runFcfsBranch(
     // Threading it in lets the snipe refuse a risen price before fetching a
     // payload, rather than only comparing the payload's own value.
     quotedPriceWei: selected.priceWei ?? null,
+    // A future phase has no payload yet — phase 1 must not fetch one, phase 2
+    // fetches at T-0.
+    phaseOpensInFuture: futurePhaseAccepted,
   });
 
   // ── Step 14: Sell after mint ─────────────────────────────────────────────
