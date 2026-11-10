@@ -14,6 +14,23 @@ import chalk from "chalk";
 // above dist/ (or the source dir itself under ts-node).
 const repoRoot = __dirname.endsWith("dist") ? path.dirname(__dirname) : __dirname;
 
+// Prefer IPv4 for outbound connections.
+//
+// Node's default DNS order is "verbatim", so it tries the IPv6 records first.
+// When IPv6 is blackholed (observed: opensea.io returned UND_ERR_CONNECT_TIMEOUT
+// on 6 consecutive attempts while the same endpoint answered over IPv4 in
+// 0.3s), undici's connect timeout can fire before the IPv4 fallback completes —
+// the request fails with a transport error that looks like a dead host.
+//
+// IPv4-first removes the dead route from the path entirely. Measured on the
+// affected host: 4/4 successes with ipv4first during a window where the default
+// order failed 6/6. This is a process-wide default and affects every fetch.
+try {
+  require("dns").setDefaultResultOrder("ipv4first");
+} catch {
+  // Older Node without the API — the retry in opensea-session.ts still covers it.
+}
+
 // Repo .env first; a .env in the CWD overrides it so a user can point at a
 // different config without editing the repo.
 dotenv.config({ path: path.resolve(repoRoot, ".env") });

@@ -92,16 +92,50 @@ function jwtExp(token: string): number {
 }
 
 // ── SIWE flow ─────────────────────────────────────────────────────────────────
+
+// A transport failure (UND_ERR_CONNECT_TIMEOUT, ECONNRESET, socket hangup) says
+// nothing about the wallet or the credentials — the request never completed.
+// Observed live: the same SIWE nonce endpoint returned UND_ERR_CONNECT_TIMEOUT
+// on 6 consecutive attempts and then 200 on the next, with no change on our
+// side. Throwing on the first one made session creation a coin flip.
+//
+// Two attempts, and the underlying cause is preserved in the message so a real
+// outage is still diagnosable instead of reading as a bad wallet.
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  attempts = 2
+): Promise<Response> {
+  let lastErr: any;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fetch(url, init);
+    } catch (err: any) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        // Brief backoff — the failures cluster, so a short pause lets the
+        // network recover rather than immediately re-hitting the same route.
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+  }
+  const code = lastErr?.cause?.code || lastErr?.name || "unknown";
+  throw new Error(`transport ${code}: ${lastErr?.message || "fetch failed"}`);
+}
+
 async function fetchNonce(jar: Map<string, string>): Promise<string> {
-  const r = await fetch(`${BASE}/siwe/nonce`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      cookie: cookieHeader(jar),
-      ...BROWSER_HEADERS,
-    },
-    signal: AbortSignal.timeout(10_000),
-  });
+  const r = await fetchWithRetry(
+    `${BASE}/siwe/nonce`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        cookie: cookieHeader(jar),
+        ...BROWSER_HEADERS,
+      },
+      signal: AbortSignal.timeout(10_000),
+    }
+  );
   absorbCookies(jar, extractSetCookie(r));
   if (!r.ok) throw new Error(`siwe nonce ${r.status}`);
   const j = (await r.json()) as { nonce?: string };
@@ -133,7 +167,7 @@ async function loginSiwe(wallet: Wallet): Promise<StoredSession> {
     issuedAt,
     accountType: "Ethereum",
   };
-  const r = await fetch(`${BASE}/siwe/verify`, {
+  const r = await fetchWithRetry(`${BASE}/siwe/verify`, {
     method: "POST",
     headers: {
       "content-type": "application/json",

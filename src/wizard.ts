@@ -1041,9 +1041,14 @@ async function warmAllSessions(
           const session = cookiesToStoredSession(cookies);
           return { walletIndex: i, wallet: w, session, error: null };
         }
-        return { walletIndex: i, wallet: w, session: null, error: "SIWE login failed" };
+        return { walletIndex: i, wallet: w, session: null, error: "SIWE login failed (no cookies returned)" };
       } catch (err: any) {
-        // Non-fatal — some collections don't need sessions
+        // Non-fatal — some collections don't need sessions.
+        //
+        // Report the REAL cause. The previous generic "SIWE login failed" hid
+        // transport faults (UND_ERR_CONNECT_TIMEOUT) behind what looked like a
+        // credential problem, sending the user to check their wallet/allowlist
+        // when nothing was wrong with either.
         return { walletIndex: i, wallet: w, session: null, error: err.message };
       }
     })
