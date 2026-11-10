@@ -359,7 +359,12 @@ async function resolveTargetUnchecked(
       // An explicit chain on the target wins; preferredChain is the fallback.
       // Ignoring preferredChain here meant `resolveTarget(t, "", "base")` on a
       // bare address silently returned ethereum.
-      const chainKey = target.chain || preferredChain || "ethereum";
+      //
+      // There is no third default: with neither a chain on the input nor a
+      // preferredChain from the caller, the chain is genuinely unknown and
+      // returning a guess would put the mint on an arbitrary network.
+      const chainKey = target.chain || preferredChain;
+      if (!chainKey) return null;
       return {
         platform: "direct",
         contract: target.contract,

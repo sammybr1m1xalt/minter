@@ -62,17 +62,19 @@ export function privateRpcsFromEnv(chainKey: string): string[] {
     ...splitList(process.env.RPC_URL),
     ...splitList(process.env.EXTRA_RPC_URLS),
   ];
+  if (generic.length === 0) return [];
 
-  // 2. CHAIN pins the generic RPC_URL to one network.
-  const envChain = (process.env.CHAIN || "").trim().toLowerCase();
-  if (envChain === chainKey && generic.length > 0) return generic;
-
-  // 3. CHAIN unset — salvage any generic endpoint whose host names this chain,
-  //    so a configured Alchemy key isn't silently ignored.
-  const matched = generic.filter((u) => urlMatchesChain(u, profile));
-  if (matched.length > 0) return matched;
-
-  return [];
+  // A generic RPC_URL applies to whichever chain the user actually selected.
+  //
+  // It must NOT be gated on CHAIN matching: CHAIN is only a default for the
+  // chain prompt, and the user's runtime choice (--chain, or the prompt answer)
+  // is what matters. Gating on CHAIN meant selecting a different chain at
+  // runtime silently discarded the user's only configured endpoint and fell
+  // back to public RPCs — slow, rate-limited, and often wrong-chain.
+  //
+  // A generic endpoint is still verified against the selected chain by
+  // planRpcs(), so a mismatched URL cannot produce a wrong-chain mint.
+  return generic;
 }
 
 // `manual` (entered in the wizard) wins over anything in .env. Public endpoints

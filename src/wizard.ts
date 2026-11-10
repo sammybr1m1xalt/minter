@@ -151,32 +151,31 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
   const wallets = walletKeys.map((k) => new Wallet(k));
 
   // ── 2. Chain ──────────────────────────────────────────────────────────
-  // Precedence: explicit --chain flag > CHAIN env > interactive prompt.
+  // Precedence: explicit --chain flag > interactive prompt.
   //
-  // The env default is only a DEFAULT for the prompt — the user's answer always
-  // wins. Previously the prompt's default index was computed from CHAIN but the
-  // value was never pre-selected, so a user who pressed enter on a terminal
-  // that did not render the prompt got ethereum regardless of CHAIN=base.
+  // CHAIN from .env is a DEFAULT for the prompt, never a bypass. Previously a
+  // valid CHAIN skipped the prompt entirely, so switching chains meant editing
+  // .env by hand — the single most common runtime change and the most awkward
+  // one to make. The user is always asked, and their answer always wins.
   const envChain = process.env.CHAIN?.trim().toLowerCase() || undefined;
   let chainKey: string;
   if (opts.chain) {
     chainKey = chainSlug(opts.chain);
     console.log(chalk.gray(`  Chain: ${chainKey} (--chain)`));
-  } else if (envChain && resolveChain(chainSlug(envChain))) {
-    // A valid CHAIN in .env is used directly — no prompt. The user set it
-    // deliberately; asking again wastes a step and risks a mis-key.
-    chainKey = chainSlug(envChain);
-    console.log(chalk.gray(`  Chain: ${chainKey} (from CHAIN in .env)`));
   } else {
-    const defaultIndex = Math.max(
-      0,
-      CHAINS.findIndex((c) => c.key === (envChain || "ethereum"))
-    );
+    // Default to CHAIN when it names a chain we support, else ethereum.
+    const envIndex = envChain
+      ? CHAINS.findIndex((c) => c.key === chainSlug(envChain))
+      : -1;
+    const defaultIndex = envIndex >= 0 ? envIndex : 0;
     chainKey = await askChoice<string>(
       "Which chain?",
       CHAINS.map((c) => ({ label: c.name, value: c.key, hint: `chain id ${c.chainId}` })),
       defaultIndex
     );
+    if (envChain && chainSlug(envChain) === chainKey) {
+      console.log(chalk.gray(`  (default from CHAIN in .env)`));
+    }
   }
   if (!resolveChain(chainKey)) {
     // Derived from CHAINS so this can never list a chain the tool cannot
@@ -196,10 +195,31 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     throw new Error("Quantity must be at least 1. Aborting.");
   }
 
+  // ── 3b. OpenSea API key ─────────────────────────────────────────────────
+  // Resolved BEFORE the target. promptTarget needs a key to resolve a slug —
+  // OpenSea gates collection lookups, so a keyless resolve returns null for any
+  // slug that is not scrapeable, and the user sees "could not resolve" with no
+  // indication that the fix is a key. Fetching it after the target meant every
+  // slug resolution ran keyless.
+  console.log(chalk.bold.white("\nOpenSea API key"));
+  console.log(chalk.gray("  Checking for a usable key..."));
+
+  const keyResult = await getValidApiKey({ timeoutMs: 8000 });
+  const apiKey = keyResult?.api_key || undefined;
+  console.log(chalk.gray(`  Key source: ${keyResult?.source || "none"}`));
+
+  if (keyResult) {
+    console.log(chalk.green(`  ✓ Key ready: ${keyResult.source}`));
+  } else {
+    console.log(chalk.yellow(`  ⚠ No usable OpenSea key available.`));
+    console.log(chalk.gray(`    Public mints still work; signed/allowlist phases and`));
+    console.log(chalk.gray(`    slug resolution may not.\n`));
+  }
+
   // ── 4. NFT target ──────────────────────────────────────────────────────
   const target = opts.target
-    ? await promptTarget(log, chainKey, opts.target)
-    : await promptTarget(log, chainKey);
+    ? await promptTarget(log, chainKey, opts.target, apiKey)
+    : await promptTarget(log, chainKey, null, apiKey);
   const nftInput = target.contract;
   chainKey = target.chainKey;
   // The target can name a different chain than the one prompted for (a
@@ -309,24 +329,9 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       log.field("contract_verified", "true");
     }
 
-    // ── 6b. Resolve slug + API key ───────────────────────────────────────────
+    // ── 6b. Resolve slug ───────────────────────────────────────────────────
     // Need the slug for OpenSea drops endpoint access. If user gave a CA, resolve it.
-    console.log(chalk.bold.white("\nOpenSea API key + slug resolution"));
-    console.log(chalk.gray("  Checking for a usable key..."));
-
-    const keyResult = await getValidApiKey({ timeoutMs: 8000 });
-    const apiKey = keyResult?.api_key || undefined;
-    const apiKeySource = keyResult?.source || "none";
-    console.log(chalk.gray(`  Key source: ${apiKeySource}`));
-
-    if (keyResult) {
-      console.log(chalk.green(`  ✓ Key ready: ${keyResult.source}`));
-    } else {
-      console.log(chalk.yellow(`  ⚠ No usable OpenSea key available.`));
-      console.log(chalk.gray(`    Phase inventory will still be fetched, but signed`));
-      console.log(chalk.gray(`    mint data may be missing. You'll need a key for`));
-      console.log(chalk.gray(`    allowlist/FCFS phases. Public mint doesn't need one.\n`));
-    }
+    // The API key was resolved in step 3b, before the target.
 
     // Resolve slug — needed for OpenSea drops endpoint
     let slug: string | null = null;
@@ -1507,6 +1512,7 @@ async function promptTarget(
   log: RunLogger,
   chainKey: string,
   prefill?: string | null,
+  apiKey?: string,
 ): Promise<{ contract: string; label: string; chainKey: string; resolved: ResolvedTarget | null }> {
   console.log(chalk.bold.white("\nNFT target"));
   console.log(
@@ -1564,9 +1570,22 @@ async function promptTarget(
     // between OpenSea and Scatter.
     let resolved: ResolvedTarget | null = null;
     try {
-      resolved = await resolveTarget(parsed, process.env.OPENSEA_API_KEY || "", activeChain);
+      resolved = await resolveTarget(parsed, apiKey || "", activeChain);
     } catch (err: any) {
       console.log(chalk.yellow(`  ⚠ Resolution issue: ${err.message}`));
+    }
+
+    // A bare address resolves trivially — resolveTarget returns it unchanged
+    // without any lookup. Confirm it is a contract on the selected chain before
+    // accepting it, so a wallet address or a dead link is caught here rather
+    // than after a full discovery pass.
+    if (resolved && parsed.platform === "direct") {
+      const v = await verifyContract(resolved.contract, resolveChain(resolved.chainKey)!.chainId);
+      if (!v.isContract) {
+        console.log(chalk.red(`  ✗ ${resolved.contract} is not a contract on ${resolveChain(resolved.chainKey)?.name} (${v.reason}).`));
+        continue;
+      }
+      console.log(chalk.green(`  ✓ Verified contract on ${resolveChain(resolved.chainKey)?.name} (${v.reason})`));
     }
 
     if (!resolved) {

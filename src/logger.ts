@@ -12,8 +12,16 @@ import * as path from "path";
 
 // Resolved lazily rather than at module load, so a caller that changes
 // process.cwd() (tests, embedders) still lands in the directory it expects.
+//
+// The logs belong to the TOOL, not to wherever the user happened to run it.
+// Resolving against process.cwd() scattered them across every directory the
+// CLI was invoked from ($HOME, /tmp, …) and left the repo's own .minter-logs/
+// permanently empty. The repo root is one level above dist/ when compiled, or
+// the source dir itself under ts-node.
 function logDir(): string {
-  return path.resolve(process.cwd(), ".minter-logs");
+  const moduleDir = __dirname;
+  const repoRoot = moduleDir.endsWith("dist") ? path.dirname(moduleDir) : moduleDir;
+  return path.resolve(repoRoot, ".minter-logs");
 }
 
 export interface RunLogger {
