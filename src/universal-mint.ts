@@ -282,6 +282,138 @@ export async function findUniversalMint(
 }
 
 /**
+ * Collect EVERY mint plan that simulates, not just the first.
+ *
+ * A contract can have a SeaDrop stage AND its own mint(). They are often
+ * different prices — the native one frequently bypasses OpenSea's fee recipient
+ * and is cheaper. Returning only the first match hides that, so the caller can
+ * never choose. This runs the same adapters but keeps going after a success.
+ *
+ * Ordered cheapest-first by value, so the caller can offer a ranked list.
+ */
+export async function findAllUniversalMints(
+  contract: string,
+  provider: JsonRpcProvider,
+  from: string,
+  amount: bigint,
+  opts: { proof?: string[]; rpcUrl?: string } = {}
+): Promise<UniversalMintPlan[]> {
+  const plans: UniversalMintPlan[] = [];
+
+  // ── 0. Contract check (same as findUniversalMint) ──────────────────────
+  // A FAILED read is not evidence of "no contract" — a dropped RPC call would
+  // otherwise silently return an empty list, indistinguishable from a contract
+  // with no mint. Retry once before concluding.
+  let code = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      code = await provider.getCode(contract);
+      break;
+    } catch (e: any) {
+      if (attempt === 1) {
+        throw new Error(`eth_getCode failed after retry: ${e?.message ?? e}`);
+      }
+    }
+  }
+  if (!code || code === "0x") return [];
+
+  // ── 1. SeaDrop public ──────────────────────────────────────────────────
+  try {
+    const rpcUrl = opts.rpcUrl ?? "";
+    if (rpcUrl) {
+      const localPlan = await buildLocalMintPlan(rpcUrl, contract, Number(amount));
+      if (localPlan) {
+        const sim = await simulateTx(
+          provider,
+          { to: localPlan.to, from, data: localPlan.data, value: localPlan.value },
+          3_000
+        );
+        if (!sim.reverted) {
+          plans.push({
+            adapter: "seadrop-public",
+            to: localPlan.to,
+            data: localPlan.data,
+            value: localPlan.value,
+            description: `SeaDrop mintPublic × ${amount} (${formatEther(localPlan.value)} ETH)`,
+            signature: "mintPublic(address,address,address,uint256)",
+            simulated: true,
+          });
+        }
+      }
+    }
+  } catch {
+    // Not a SeaDrop contract — not an error.
+  }
+
+  // ── 2. Generic registry ────────────────────────────────────────────────
+  try {
+    const generic = await buildGenericMintTx(contract, provider, from, amount, opts);
+    if (generic && !generic.simulationReverted) {
+      plans.push({
+        adapter: "generic-registry",
+        to: generic.to,
+        data: generic.data,
+        value: generic.value,
+        description: `${generic.selector} (${formatEther(generic.value)} ETH)`,
+        signature: generic.selector,
+        simulated: true,
+      });
+    }
+  } catch {
+    // Registry probe failed — the ABI path may still work.
+  }
+
+  // ── 3. ABI-driven ─────────────────────────────────────────────────────
+  try {
+    const network = await provider.getNetwork();
+    const abiResult = await fetchAbi(Number(network.chainId), contract, {
+      etherscanKey: process.env.ETHERSCAN_API_KEY || undefined,
+    });
+    if (abiResult?.abi) {
+      const candidates = deriveMintCandidates(abiResult.abi);
+      const priceInfo = await readPriceFromAbi(contract, provider, abiResult.abi, amount);
+      const ordered = orderCandidates(candidates);
+
+      for (const candidate of ordered) {
+        const synth = synthFromAbi(candidate, { to: from, amount });
+        if (!synth.ok || !synth.args) continue;
+
+        const probe = await probeAbiCandidate(
+          contract,
+          provider,
+          candidate,
+          synth.args,
+          from,
+          priceInfo?.price ?? 0n
+        );
+        if (!probe.wouldSucceed) continue;
+
+        const iface = new Interface([
+          `function ${candidate.signature}${candidate.payable ? " payable" : ""}`,
+        ]);
+        plans.push({
+          adapter: "abi-driven",
+          to: contract,
+          data: iface.encodeFunctionData(candidate.name, synth.args),
+          value: priceInfo?.price ?? 0n,
+          description: `${candidate.signature} (${formatEther(priceInfo?.price ?? 0n)} ETH)`,
+          signature: candidate.signature,
+          simulated: true,
+        });
+      }
+    }
+  } catch {
+    // ABI fetch failed — return whatever the earlier adapters found.
+  }
+
+  // Cheapest first, then free (zero value) before paid, then by description.
+  return plans.sort((a, b) => {
+    if (a.value !== b.value) return a.value < b.value ? -1 : 1;
+    return a.description.localeCompare(b.description);
+  });
+}
+
+/**
  * Order ABI candidates: free mints first, then cheapest, then by name for
  * determinism. A free mint is the most likely to succeed and costs nothing to
  * try.

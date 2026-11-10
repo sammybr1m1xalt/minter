@@ -67,7 +67,7 @@ import { getSessionCookies } from "./opensea-session";
 import { parseTarget, resolveTarget, chainSlug, ResolvedTarget } from "./target-resolver";
 import { parseWhen } from "./schedule";
 import { parsePriceSpec } from "./price-protection";
-import { findUniversalMint, explainFailure, UniversalMintPlan } from "./universal-mint";
+import { findUniversalMint, findAllUniversalMints, explainFailure, UniversalMintPlan } from "./universal-mint";
 import { getMintMechanisms } from "./seadrop-public";
 import { verifyContract } from "./contract-verify";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
@@ -264,7 +264,35 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
   });
   try {
 
-    // ── 6. Resolve slug + API key ────────────────────────────────────────────
+    // ── 6. Verify the target is a contract ──────────────────────────────────
+    // A scraped or mistyped address is untrusted input, and every later step
+    // (OpenSea lookup, drops query, SIWE login) is wasted on an address with no
+    // code. One eth_call here turns a confusing multi-step failure into an
+    // instant, explanatory one.
+    //
+    // The selector query stays LAST — it is the expensive probe and should only
+    // run when no platform has claimed the contract.
+    if (!isSlug(nftInput)) {
+      const verification = await verifyContract(nftInput, chainProfile.chainId);
+      if (!verification.isContract) {
+        console.log(
+          chalk.yellow(
+            `\n  ⚠ ${nftInput} is not a contract on ${chainProfile.name} (${verification.reason}).`
+          )
+        );
+        console.log(
+          chalk.gray(`    Nothing will be minted. Check the address and chain, then re-run.`)
+        );
+        closePrompts();
+        return;
+      }
+      console.log(
+        chalk.green(`  ✓ Verified contract on ${chainProfile.name} (${verification.reason})`)
+      );
+      log.field("contract_verified", "true");
+    }
+
+    // ── 6b. Resolve slug + API key ───────────────────────────────────────────
     // Need the slug for OpenSea drops endpoint access. If user gave a CA, resolve it.
     console.log(chalk.bold.white("\nOpenSea API key + slug resolution"));
     console.log(chalk.gray("  Checking for a usable key..."));
@@ -307,26 +335,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     }
     log.field("slug", slug || "unknown");
 
-    // ── 7. Warm SIWE sessions for ALL wallets ──────────────────────────────
-    // Each wallet needs its own OpenSea session for eligibility + signed payload
-    // fetching. The session warming is parallelizable — do it for all wallets.
-    console.log(chalk.bold.white("\nOpenSea sessions"));
-    console.log(chalk.gray(`  Warming SIWE sessions for ${wallets.length} wallet(s)...`));
-
-    const sessionResults = await warmAllSessions(wallets, apiKey);
-    log.field("sessions_ready", sessionResults.filter((s) => s.session).length);
-    log.field("sessions_failed", sessionResults.filter((s) => !s.session).length);
-
-    for (const result of sessionResults) {
-      const label = `${result.wallet.address.slice(0, 6)}…${result.wallet.address.slice(-4)}`;
-      if (result.session) {
-        console.log(chalk.green(`  ✓ [W${result.walletIndex}] ${label} session ready`));
-      } else {
-        console.log(chalk.yellow(`  ⚠ [W${result.walletIndex}] ${label} session failed: ${result.error}`));
-      }
-    }
-
-    // ── 8. Discover ALL phases ─────────────────────────────────────────────
+    // ── 7. Discover ALL phases ─────────────────────────────────────────────
     // Fetch from OpenSea GraphQL first (primary), then REST, then on-chain SeaDrop
     // discovery for collections not registered on OpenSea.
     console.log(chalk.gray(`  Fetching all active phases for ${target.label}...`));
@@ -334,66 +343,47 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     const inventory = await discoverAllPhases(nftInput, slug, apiKey, chainKey, 12000);
     log.field("phases_found", inventory.drops.length);
 
-    // ── 7a. Verify the target is a contract ─────────────────────────────────
-    // A scraped or mistyped address is untrusted input. Before treating it as a
-    // mint target, confirm it has bytecode — and that the bytecode is not an
-    // EIP-7702 delegation designator, which an eth_getCode check alone would
-    // misread as a contract. An EOA here means the user pasted a wallet, a
-    // token, or a dead link, and every downstream probe would be meaningless.
-    if (!isSlug(nftInput)) {
-      const verification = await verifyContract(nftInput, chainProfile.chainId);
-      if (!verification.isContract) {
-        console.log(
-          chalk.yellow(
-            `\n  ⚠ ${nftInput} is not a contract on ${chainProfile.name} (${verification.reason}).`
-          )
-        );
-        console.log(
-          chalk.gray(
-            `    Nothing will be minted. Check the address and chain, then re-run.`
-          )
-        );
-        closePrompts();
-        return;
-      }
-      console.log(
-        chalk.green(`  ✓ Verified contract on ${chainProfile.name} (${verification.reason})`)
-      );
-      log.field("contract_verified", "true");
-    }
-
     // ── 8a. Gas (needed by both the phase path and the universal fallback) ──
    
     const gas = await promptGasGwei(chainProfile, rpcUrls);
 
-    // ── 8b. Universal fallback ─────────────────────────────────────────────
+    // ── 8b. Universal probe ─────────────────────────────────────────────────
     // OpenSea only knows about drops it hosts. A plain ERC721 with its own
     // mint(), a Manifold claim, a Zora collect, or any contract using a bespoke
-    // mint function is invisible to the drops endpoint — and previously that
-    // meant "no phases found" and a dead end.
+    // mint function is invisible to the drops endpoint.
     //
-    // Try the universal adapter before giving up. It probes SeaDrop, the generic
-    // signature registry, and the contract's own ABI, and only accepts a plan
-    // that SIMULATES — so a closed sale or a missing proof is reported as a
-    // reason, not silently minted.
+    // This runs even when OpenSea DID find phases. A contract can have a SeaDrop
+    // stage AND its own mint(), and the native one is frequently cheaper because
+    // it bypasses OpenSea's fee recipient. Probing only as a fallback hid that.
+    // Every candidate is simulation-gated, so a closed sale or a missing proof
+    // is reported as a reason rather than silently minted.
+    // A transient RPC failure here must not be mistaken for "no mint" — the
+    // throw is caught and reported, and the OpenSea phases still proceed.
+    let universalPlans: UniversalMintPlan[] = [];
+    try {
+      universalPlans = await findAllUniversalMints(
+        nftInput, provider, wallets[0].address, BigInt(quantity), { rpcUrl: rpcUrls[0] }
+      );
+    } catch (e: any) {
+      console.log(chalk.yellow(`  ⚠ On-chain probe failed: ${e?.message ?? e}`));
+    }
+    log.field("universal_candidates", universalPlans.length);
+
     if (inventory.drops.length === 0) {
       console.log(chalk.bold.white("\nUniversal mint probe"));
       console.log(
         chalk.gray("  OpenSea reports no phases — probing the contract directly...")
       );
 
-      const universal = await findUniversalMint(nftInput, provider, wallets[0].address, BigInt(quantity), {
-        rpcUrl: rpcUrls[0],
-      });
-
-      if (universal.plan) {
-        console.log(chalk.green(`  ✓ ${universal.plan.description}`));
-        console.log(chalk.gray(`    via ${universal.plan.adapter}`));
+      if (universalPlans.length > 0) {
+        const plan = universalPlans[0];
+        console.log(chalk.green(`  ✓ ${plan.description}`));
+        console.log(chalk.gray(`    via ${plan.adapter}`));
 
         // A universal plan is a single-wallet, single-contract mint. Confirm and
         // execute it directly — there is no phase matrix to pick from.
         const didConfirm = await askYesNo(
-          `Mint ${quantity} × ${universal.plan.description}?`,
+          `Mint ${quantity} × ${plan.description}?`,
           true
         );
         if (!didConfirm) {
@@ -402,13 +392,18 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
           return;
         }
 
-        await executeUniversalMint(universal.plan, walletKeys, rpcUrls, chainProfile, gas, quantity);
+        await executeUniversalMint(plan, walletKeys, rpcUrls, chainProfile, gas, quantity);
         closePrompts();
         return;
       }
 
       console.log(chalk.yellow("  ✗ No mintable mechanism found on this contract."));
-      console.log(chalk.gray(explainFailure(universal)));
+      // explainFailure wants the attempts array, which findAllUniversalMints
+      // does not return — run the single-plan variant purely for its diagnostics.
+      const diagnostic = await findUniversalMint(
+        nftInput, provider, wallets[0].address, BigInt(quantity), { rpcUrl: rpcUrls[0] }
+      );
+      console.log(chalk.gray(explainFailure(diagnostic)));
 
       // Explain WHY, when the contract is a SeaDrop drop with non-public
       // mechanisms. Reads getMintMechanisms() to warn
@@ -444,6 +439,45 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       );
       closePrompts();
       return;
+    }
+
+    // ── 8c. Report any on-chain candidate OpenSea did not surface ──────────
+    // When OpenSea found phases AND the on-chain probe found a different,
+    // cheaper route, say so. Silently preferring OpenSea would mint at the
+    // higher price with no explanation.
+    if (inventory.drops.length > 0 && universalPlans.length > 0) {
+      const best = universalPlans[0];
+      console.log(
+        chalk.gray(
+          `\n  On-chain probe also found: ${best.description} via ${best.adapter}` +
+            ` — compare against the OpenSea phase price before choosing.`
+        )
+      );
+    }
+
+    // ── 8d. Warm SIWE sessions ──────────────────────────────────────────────
+    // Only now, after a platform has actually claimed the contract and phases
+    // exist. Warming earlier meant paying a login round trip per wallet for
+    // targets that need no session at all (a plain ERC721 with its own mint()),
+    // and a SIWE failure was reported as a warning on runs where it made no
+    // difference. A session is only required for the signed/allowlist path.
+    //
+    // A failure here is non-fatal: public phases mint on-chain and never touch
+    // OpenSea. The eligibility probe reports per-wallet session state.
+    console.log(chalk.bold.white("\nOpenSea sessions"));
+    console.log(chalk.gray(`  Warming SIWE sessions for ${wallets.length} wallet(s)...`));
+
+    const sessionResults = await warmAllSessions(wallets, apiKey);
+    log.field("sessions_ready", sessionResults.filter((s) => s.session).length);
+    log.field("sessions_failed", sessionResults.filter((s) => !s.session).length);
+
+    for (const result of sessionResults) {
+      const label = `${result.wallet.address.slice(0, 6)}…${result.wallet.address.slice(-4)}`;
+      if (result.session) {
+        console.log(chalk.green(`  ✓ [W${result.walletIndex}] ${label} session ready`));
+      } else {
+        console.log(chalk.yellow(`  ⚠ [W${result.walletIndex}] ${label} session failed: ${result.error}`));
+      }
     }
 
     // ── 9. Probe eligibility for EACH wallet against EACH phase ──────────────
