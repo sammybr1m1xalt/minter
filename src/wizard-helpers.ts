@@ -31,6 +31,9 @@ export interface SnipeReadyInput {
   slug?: string;                // collection slug / target label shown in summary
   targetStart: Date | null;
   timingLabel: string;
+  /** True when the user has already confirmed the fire timing in promptTiming,
+   *  so the READY screen must not ask "Fire?" a second time. */
+  timingDecided?: boolean;
   modeLabel: string;
   targetLabel: string;
   promptForGas?: boolean;
@@ -172,6 +175,18 @@ export async function confirmSnipe(input: SnipeReadyInput): Promise<boolean> {
   }
   line("Timing", input.timingLabel);
   console.log(chalk.bold.white("───────────────────────"));
+
+  // A scheduled run has already been asked "Fire when the stage opens?" in
+  // promptTiming. Asking "Fire?" again here is the same decision twice — and
+  // the second ask is the dangerous one, because it sits immediately before the
+  // blast and reads as an emergency stop rather than a plan confirmation.
+  //
+  // When the timing was already decided, this screen is a summary: show it and
+  // proceed. The abort path remains available through the timing prompt.
+  if (input.timingDecided) {
+    console.log(chalk.gray("  Timing already confirmed — proceeding at the scheduled time."));
+    return true;
+  }
 
   if (!(await askYesNo(chalk.bold("Fire?"), false))) {
     console.log(chalk.yellow("\n  Aborted — nothing was sent.\n"));

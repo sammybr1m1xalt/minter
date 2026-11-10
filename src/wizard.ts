@@ -626,6 +626,9 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       maxPriorityFeePerGas: gas.maxPriorityFeePerGasWei,
       targetStart: targetStart,
       timingLabel,
+      // promptTiming already asked "Fire when the stage opens?" for a future
+      // stage, so the READY screen must not ask "Fire?" a second time.
+      timingDecided: knownStart != null,
       modeLabel: `${phaseEligibility.mode === "public" ? "PUBLIC (on-chain)" : "SIGNED (OpenSea)"} — ${selectedDrop.name || "selected phase"}`,
       targetLabel: target.label,
       promptForGas: false,

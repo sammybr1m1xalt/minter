@@ -664,6 +664,9 @@ export async function runFcfsBranch(
     maxPriorityFeePerGas,
     targetStart,
     timingLabel,
+    // promptTiming already asked "Fire when the stage opens?" for a future
+    // stage, so the READY screen must not ask "Fire?" a second time.
+    timingDecided: startsAt != null,
     modeLabel: `Allowlist / FCFS / OVR — ${drop0.name || "selected phase"}`,
     targetLabel: target.label,
     promptForGas: false,
