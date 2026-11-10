@@ -136,7 +136,13 @@ async function gqlCollectionBySlug(slug: string, timeoutMs = 10000): Promise<Gql
   return c as GqlCollection;
 }
 
-async function gqlSearchByAddress(address: string, timeoutMs = 10000): Promise<{ slug: string }[]> {
+interface GqlCollectionHit {
+  slug: string;
+  address?: string;
+  chain?: { identifier?: string; networkId?: number | string };
+}
+
+async function gqlSearchByAddress(address: string, timeoutMs = 10000): Promise<GqlCollectionHit[]> {
   const body = JSON.stringify({
     query: "query MintCollectionSearch($query: String!) { collectionsByQuery(query: $query, limit: 50) { __typename slug address chain { identifier networkId } } }",
     variables: { query: address },
@@ -162,9 +168,19 @@ async function gqlSearchByAddress(address: string, timeoutMs = 10000): Promise<{
   }
 
   if (!res.ok) return [];
-  const json = (await res.json()) as any;
+  // gql.opensea.io sits behind Cloudflare Access. An unauthenticated or blocked
+  // request returns 200 with an HTML sign-in page, which parses as neither JSON
+  // nor a GraphQL error — it would surface as a confusing SyntaxError.
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) return [];
+  let json: any;
+  try {
+    json = (await res.json()) as any;
+  } catch {
+    return [];
+  }
   if (json.errors && json.errors.length > 0) return [];
-  return (json.data?.collectionsByQuery ?? []) as { slug: string }[];
+  return (json.data?.collectionsByQuery ?? []) as GqlCollectionHit[];
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -234,11 +250,40 @@ export function isSlug(input: string): boolean {
 // ── Contract address → OpenSea slug (for drops endpoint) ────────────────────
 // /collections/{slug}/drops needs a slug. When given a CA, resolve it first.
 
+// The SeaDrop singleton is a shared minter contract, not a collection. GraphQL
+// still answers for it with a synthetic identifier shaped `<address>-<number>`
+// (observed: 0x00005ea00ac477b1030ce78506496e8c2de24bf5-541171828). That string
+// is not a collection slug — resolving it later returns the singleton itself but
+// on an arbitrary chain (observed: hyperevm), which is a silent wrong-chain mint.
+//
+// A singleton address can never identify a collection, so it is refused outright
+// rather than passed downstream.
+const SEADROP_SINGLETON = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
+
+function isSyntheticSeDropSlug(slug: string, address: string): boolean {
+  // <address>-<digits> is GraphQL's placeholder shape for a contract that is not
+  // a collection. A real slug is never a 42-char hex string followed by a number.
+  return (
+    slug.toLowerCase().startsWith(`${address.toLowerCase()}-`) &&
+    /-\d+$/.test(slug)
+  );
+}
+
 export async function resolveContractToSlug(
   nftContract: string,
   apiKey = "",
   timeoutMs = 10000
 ): Promise<string | null> {
+  // The SeaDrop singleton is not a collection and has no slug. Refuse it here
+  // rather than letting a downstream step discover the synthetic identifier.
+  if (nftContract.toLowerCase() === SEADROP_SINGLETON) {
+    console.error(
+      "[resolveContractToSlug] The address is the SeaDrop singleton — a shared minter, " +
+        "not a collection. It has no slug; target the collection's own contract instead."
+    );
+    return null;
+  }
+
   // REST v2 /collections/{slug or CA} returns:
   //   { collection: "<slug>", contracts: [{ address, chain }], ... }
   // not { slug, address } as the old parser expected.
@@ -266,14 +311,45 @@ export async function resolveContractToSlug(
     console.error("[resolveContractToSlug] REST failed:", err?.message || err);
   }
 
-  // 2. GraphQL search by address
+  // 2. GraphQL search by address.
+  //
+  // The response includes each hit's `address`, so the match can be verified.
+  // Previously the caller took hits[0].slug unconditionally — the address field
+  // was queried but discarded by the {slug: string}[] return type. A fuzzy
+  // search can return a collection that merely resembles the query, so an
+  // unverified first hit could resolve a CA to the WRONG slug, and every later
+  // step (SIWE, eligibility, payload) would run against the wrong collection.
   try {
     const hits = await gqlSearchByAddress(nftContract);
-    if (hits.length > 0 && hits[0].slug) {
-      console.error("[resolveContractToSlug] GraphQL found slug:", hits[0].slug);
-      return hits[0].slug;
+    if (hits.length === 0) {
+      console.error("[resolveContractToSlug] GraphQL returned no hits for", nftContract);
+    } else {
+      const wanted = nftContract.toLowerCase();
+      // Prefer an exact address match; a chain match is a weaker but usable signal.
+      const exact = hits.find((h) => (h.address || "").toLowerCase() === wanted);
+      const chosen = exact || hits.find((h) => h.address);
+      if (chosen?.slug) {
+        // Reject GraphQL's synthetic placeholder for a contract that is not a
+        // collection. Passing it downstream resolves to the wrong chain.
+        if (isSyntheticSeDropSlug(chosen.slug, nftContract)) {
+          console.error(
+            `[resolveContractToSlug] GraphQL returned a synthetic identifier (${chosen.slug}) ` +
+              `for ${nftContract} — this contract is not an OpenSea collection.`
+          );
+          return null;
+        }
+        if (!exact) {
+          console.error(
+            `[resolveContractToSlug] ⚠ no exact address match for ${nftContract}; ` +
+              `using ${chosen.slug} (${chosen.address}) — verify before minting.`
+          );
+        } else {
+          console.error("[resolveContractToSlug] GraphQL found slug:", chosen.slug);
+        }
+        return chosen.slug;
+      }
+      console.error("[resolveContractToSlug] GraphQL hits had no usable slug/address:", hits.length);
     }
-    console.error("[resolveContractToSlug] GraphQL returned no hits for", nftContract);
   } catch (err: any) {
     console.error("[resolveContractToSlug] GraphQL failed:", err?.message || err);
   }

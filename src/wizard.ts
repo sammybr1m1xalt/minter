@@ -105,6 +105,8 @@ interface PhaseEligibility {
   priceWei?: bigint | null;
   // Eligibility verdict
   eligible: boolean;
+  /** False when `eligible` is a guess (OpenSea returned null / lookup failed). */
+  eligibilityKnown: boolean;
   reason: string;
   // Mode for this wallet+phase combo
   mode: "public" | "signed" | "allowlist" | "token-gated" | "unknown";
@@ -1127,6 +1129,9 @@ async function probePhaseForWallet(
   // remaining evidence.
   let eligible = false;
   let reason = "";
+  // Whether `eligible` is a real verdict or a guess. OpenSea returns null for
+  // "could not tell"; that must never be printed as a confident "NOT ELIGIBLE".
+  let eligibilityKnown = false;
   let signedPayload: FcfsSignedPayload | null = null;
   let signedPayloadError: string | null = null;
 
@@ -1143,16 +1148,27 @@ async function probePhaseForWallet(
   if (baseReport) {
     eligible = baseReport.ourWalletEligible ?? false;
     reason = baseReport.reason;
+    // "null" from OpenSea means "could not tell", not "no". Collapsing it to
+    // false made an unverifiable phase print as a confident ✗ NOT ELIGIBLE,
+    // which reads as a verdict the data does not support.
+    eligibilityKnown = baseReport.ourWalletEligible !== null && baseReport.ourWalletEligible !== undefined;
   } else {
     const fallback = assessDropEligibility(drop, walletAddr);
     eligible = fallback.ourWalletEligible ?? false;
     reason = fallback.reason;
+    eligibilityKnown = fallback.ourWalletEligible !== null && fallback.ourWalletEligible !== undefined;
   }
 
   // 3. Signed stages that are not a confirmed NO are still worth attempting:
   //    OpenSea only issues a per-wallet payload to allowlisted wallets, so a
   //    payload is itself evidence of eligibility. A confirmed NO skips the call.
-  const confirmedIneligible = baseReport != null && baseReport.ourWalletEligible === false;
+  //
+  //    "Confirmed" must mean OpenSea actually answered NO — not merely that we
+  //    failed to ask. Previously this required baseReport != null, so a GraphQL
+  //    error or timeout (baseReport null) left a genuinely ineligible phase
+  //    looking unconfirmed, and the code went on to fetch a payload that could
+  //    never exist.
+  const confirmedIneligible = eligibilityKnown && eligible === false;
   if (!eligible && !confirmedIneligible && (mode === "signed" || mode === "allowlist")) {
     try {
       // Try with API key first (path A)
@@ -1219,6 +1235,7 @@ async function probePhaseForWallet(
     signedPayloadError,
     priceWei: baseReport?.priceWei ?? null,
     eligible,
+    eligibilityKnown,
     reason,
     mode,
     fireableLocally,
@@ -1275,6 +1292,10 @@ function printEligibilityReport(
       // Distinguish "no" from "could not tell". A missing session or an
       // unresolved lookup is UNKNOWN — printing "NOT ELIGIBLE" for it is a
       // false verdict, and it is the difference between "wait" and "give up".
+      //
+      // eligibilityKnown is the deciding flag: an explicit NO from OpenSea (or
+      // from the on-chain allowlist) is a verdict; anything derived from a
+      // failed lookup is not.
       const eligBadge = report.eligible
         ? chalk.green("✓ ELIGIBLE")
         : report.signedPayload
@@ -1283,7 +1304,9 @@ function printEligibilityReport(
             ? chalk.yellow("⚠ RATE-LIMITED")
             : report.signedPayloadError
               ? chalk.yellow("⚠ UNKNOWN — could not verify")
-              : chalk.red("✗ NOT ELIGIBLE");
+              : report.eligibilityKnown
+                ? chalk.red("✗ NOT ELIGIBLE")
+              : chalk.yellow("⚠ UNKNOWN — could not verify");
 
       console.log(chalk.gray(`    └─ Phase ${pIdx}: ${drop.name || "unnamed"} ${modeBadge} ${liveBadge} ${eligBadge}`));
       console.log(chalk.gray(`       type: ${drop.type || "unknown"} | price: ${formatEther(drop.mintPrice)} ETH`));
