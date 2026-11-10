@@ -281,7 +281,11 @@ export function clearKeyPool(): void {
 
 export async function probeKey(
   apiKey: string,
-  timeoutMs = 3000
+  // 5s, not 3s. Measured live against the collections endpoint: 860ms typical,
+  // 2139ms observed, and an occasional >3s stall. A 3s budget turned a slow-but-
+  // healthy key into a "timeout", which then made the key unusable and forced a
+  // fresh mint — burning the 2/day quota on a key that was working fine.
+  timeoutMs = 5000
 ): Promise<{ status: "alive" | "throttled" | "dead" | "alive_but_exhausted" | "timeout" | "server_error"; latencyMs: number; remaining: number; resetAt: number }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -378,14 +382,25 @@ export function computeScore(entry: KeyPoolEntry): number {
 // ── Probe ALL keys in parallel, re-score, return sorted best→worst ──────
 
 export async function probeAndRankPool(
-  pool: KeyPoolEntry[]
+  pool: KeyPoolEntry[],
+  timeoutMs = 5000
 ): Promise<{ pool: KeyPoolEntry[]; best: KeyPoolEntry | null }> {
   if (pool.length === 0) return { pool: [], best: null };
 
-  // Probe all in parallel — ~3s each, but all at once = ~3s total
+  // Probe all in parallel — each bounded by timeoutMs, but all at once, so the
+  // whole pass costs one timeout rather than one per key.
   const probed = await Promise.all(
     pool.map(async (entry) => {
-      const result = await probeKey(entry.api_key, 3000);
+      let result = await probeKey(entry.api_key, timeoutMs);
+      // A server_error means the API was unreachable or erroring — nothing about
+      // the key. Observed live: the same key returned server_error at 1112ms and
+      // alive at 860ms seconds later. One retry separates a transient hiccup
+      // from a key that genuinely cannot be validated, without paying for it on
+      // every probe.
+      if (result.status === "server_error") {
+        const retry = await probeKey(entry.api_key, timeoutMs);
+        if (retry.status !== "server_error") result = retry;
+      }
       // Persist the fresh quota numbers. Without this the entry keeps whatever
       // remaining_calls it had before — a stale value that can exceed the real
       // limit (observed: 598 stored vs 114 actual) and inflates the score by
@@ -404,22 +419,39 @@ export async function probeAndRankPool(
   );
 
   // Mark dead keys for removal (don't delete them, just deprioritize).
-  // "alive_but_exhausted" is still usable but scored low — only picked if no
-  // key with remaining calls exists.
+  //
+  // "timeout" is NOT usable. A timeout means the request never completed, so we
+  // have no evidence the key works — and the caller is about to spend a mint on
+  // it. Treating it as usable let a timed-out key win selection and be reported
+  // as "Key ready: timeout", then fail at the first real API call. A timeout is
+  // a network fault, not a property of the key, so it is scored low (below a
+  // confirmed-alive key) but it must not be selected while any key with a real
+  // answer exists.
+  //
+  // "server_error" stays usable: a 5xx or Cloudflare 403 is the API's fault, and
+  // the key is known-valid from earlier probes.
   const usable = probed
-    .filter((e) => e.last_probe === "alive" || e.last_probe === "alive_but_exhausted" || e.last_probe === "throttled" || e.last_probe === "server_error" || e.last_probe === "timeout")
+    .filter((e) => e.last_probe === "alive" || e.last_probe === "alive_but_exhausted" || e.last_probe === "throttled" || e.last_probe === "server_error")
     .sort((a, b) => b.score - a.score);
 
-  const best = usable.length > 0 ? usable[0] : null;
+  // Only fall back to a timed-out key when nothing with a real answer exists —
+  // and even then, only if it was alive the last time we actually reached the
+  // API. A key that has never been confirmed is not worth a mint.
+  const best = usable.length > 0
+    ? usable[0]
+    : probed
+        .filter((e) => e.last_probe === "timeout" && e.remaining_calls > 0)
+        .sort((a, b) => b.score - a.score)[0] ?? null;
   return { pool: probed, best };
 }
 
 // ── Pick the best key (probes pool, returns winner) ──────────────────────
 
 export async function pickBestKey(
-  pool: KeyPoolEntry[]
+  pool: KeyPoolEntry[],
+  timeoutMs?: number
 ): Promise<{ api_key: string; source: string; entry: KeyPoolEntry } | null> {
-  const { pool: ranked, best } = await probeAndRankPool(pool);
+  const { pool: ranked, best } = await probeAndRankPool(pool, timeoutMs);
   saveKeyPool(ranked); // persist scores
 
   if (!best) return null;
@@ -437,6 +469,10 @@ export async function pickBestKey(
     ? `alive but exhausted${remainingInfo}`
     : best.last_probe === "throttled"
     ? `throttled (${best.probe_latency_ms}ms)${remainingInfo} — use with caution`
+    : best.last_probe === "timeout"
+    ? `unconfirmed — probe timed out, no evidence this key works`
+    : best.last_probe === "server_error"
+    ? `api error (${best.probe_latency_ms}ms) — key untested this pass`
     : `probe: ${best.last_probe}`;
 
   return { api_key: best.api_key, source, entry: best };
@@ -637,8 +673,16 @@ const mintFreeKey = async (
 // ── Main entry point: get a valid key, probing pool first ────────────────
 
 export async function getValidApiKey(
-  _opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number },
 ): Promise<{ api_key: string; source: string } | null> {
+  // Honour the caller's deadline. The parameter was previously ignored (_opts),
+  // so a caller asking for an 8s budget could wait far longer when the pool
+  // needed a refresh or a mint — both of which run BEFORE the probe. Derive the
+  // per-probe timeout from what is left of the budget rather than a fixed value.
+  const budgetMs = opts?.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : 8000;
+  const deadline = Date.now() + budgetMs;
+  const probeTimeout = () => Math.max(1000, Math.min(5000, deadline - Date.now()));
+
   // A key pasted into .env must join the pool, or every path that resolves a
   // key through here would silently use a different one.
   seedEnvKeyIntoPool();
@@ -673,7 +717,7 @@ export async function getValidApiKey(
   // 1. If pool has keys, probe and pick the best — NON-BLOCKING (≤3s)
   if (pool.length > 0) {
     console.log(chalk.gray(`  OpenSea: probing ${pool.length} key(s) in pool...`));
-    const result = await pickBestKey(pool);
+    const result = await pickBestKey(pool, probeTimeout());
     if (result) {
       // Increment usage counter for the chosen key
       const updated = result.entry;
@@ -712,7 +756,7 @@ export async function getValidApiKey(
   console.log(chalk.gray("  OpenSea: can't mint new key — re-probing cached keys to check recovery..."));
   const cachedKeys = loadKeyPool();
   if (cachedKeys.length > 0) {
-    const result = await pickBestKey(cachedKeys);
+    const result = await pickBestKey(cachedKeys, probeTimeout());
     if (result && result.entry.last_probe !== "dead") {
       console.log(chalk.green(`  ✓ Re-using cached key: ${keyLabel(result.entry)} (status: ${result.entry.last_probe})`));
       const updated = result.entry;

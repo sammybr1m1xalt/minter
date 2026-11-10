@@ -210,7 +210,17 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
   console.log(chalk.gray(`  Key source: ${keyResult?.source || "none"}`));
 
   if (keyResult) {
-    console.log(chalk.green(`  ✓ Key ready: ${keyResult.source}`));
+    // A key that only timed out is not "ready" — it is unconfirmed. Saying
+    // "Key ready: timeout" sends the user into a mint on a key that was never
+    // proven to work, and the failure surfaces later as a signed-payload error
+    // with no obvious cause.
+    const unconfirmed = /timed out|untested/i.test(keyResult.source);
+    if (unconfirmed) {
+      console.log(chalk.yellow(`  ⚠ Key unconfirmed: ${keyResult.source}`));
+      console.log(chalk.gray(`    It will be used, but a mint may fail if the key is actually dead.`));
+    } else {
+      console.log(chalk.green(`  ✓ Key ready: ${keyResult.source}`));
+    }
   } else {
     console.log(chalk.yellow(`  ⚠ No usable OpenSea key available.`));
     console.log(chalk.gray(`    Public mints still work; signed/allowlist phases and`));
