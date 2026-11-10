@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import { Wallet, formatEther } from "ethers";
-import { ChainProfile, resolveChain } from "./chains";
+import { ChainProfile, CHAINS, resolveChain } from "./chains";
 import { planRpcs, resolveRpcsForChain } from "./rpc-resolver";
 import { RunLogger } from "./logger";
 import {
@@ -826,10 +826,17 @@ export async function runEligibilityCheck(
   const { parseNftLink } = require("./nft-link");
   const chalk = require("chalk");
 
-  // --chain wins over CHAIN, which wins over the base default. This command
-  // ignored --chain entirely, so `--eligibility <slug> --chain ethereum` polled
-  // gas on Base while the phases came from Ethereum.
-  const chainKey = (opts.chain || process.env.CHAIN || "base").toLowerCase();
+  // --chain wins over CHAIN. There is no interactive prompt on this path, so a
+  // missing value must be an ERROR, not a silent guess: defaulting to "base"
+  // meant `--eligibility <slug>` with no chain and no CHAIN env polled Base
+  // while the user's collection was almost certainly elsewhere.
+  const chainKey = (opts.chain || process.env.CHAIN || "").trim().toLowerCase();
+  if (!chainKey) {
+    throw new Error(
+      "No chain given. Pass --chain <key> or set CHAIN in .env " +
+        `(supported: ${require("./chains").CHAINS.map((c: any) => c.key).join(", ")}).`
+    );
+  }
   const chainProfile = resolveChain(chainKey);
   if (!chainProfile) throw new Error(`Unknown chain "${chainKey}"`);
 
@@ -948,7 +955,16 @@ export async function runFcfsBranchCli(
   targetArg: string,
   opts: FcfsCliOptions = {}
 ): Promise<void> {
-  const chainKey = (opts.chain || process.env.CHAIN || "base").toLowerCase();
+  // --chain wins over CHAIN. No interactive prompt on this path, so a missing
+  // value is an ERROR rather than a silent guess — defaulting to "base" meant
+  // `--fcfs <target>` with no chain and no CHAIN env minted on the wrong chain.
+  const chainKey = (opts.chain || process.env.CHAIN || "").trim().toLowerCase();
+  if (!chainKey) {
+    throw new Error(
+      "No chain given. Pass --chain <key> or set CHAIN in .env " +
+        `(supported: ${CHAINS.map((c) => c.key).join(", ")}).`
+    );
+  }
   const chainProfile = resolveChain(chainKey);
   if (!chainProfile) throw new Error(`Unknown chain "${chainKey}"`);
 

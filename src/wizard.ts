@@ -151,16 +151,33 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
   const wallets = walletKeys.map((k) => new Wallet(k));
 
   // ── 2. Chain ──────────────────────────────────────────────────────────
-  let chainKey = opts.chain
-    ? chainSlug(opts.chain)
-    : await askChoice<string>(
-        "Which chain?",
-        CHAINS.map((c) => ({ label: c.name, value: c.key, hint: `chain id ${c.chainId}` })),
-        Math.max(
-          0,
-          CHAINS.findIndex((c) => c.key === (process.env.CHAIN || "base").toLowerCase())
-        )
-      );
+  // Precedence: explicit --chain flag > CHAIN env > interactive prompt.
+  //
+  // The env default is only a DEFAULT for the prompt — the user's answer always
+  // wins. Previously the prompt's default index was computed from CHAIN but the
+  // value was never pre-selected, so a user who pressed enter on a terminal
+  // that did not render the prompt got ethereum regardless of CHAIN=base.
+  const envChain = process.env.CHAIN?.trim().toLowerCase() || undefined;
+  let chainKey: string;
+  if (opts.chain) {
+    chainKey = chainSlug(opts.chain);
+    console.log(chalk.gray(`  Chain: ${chainKey} (--chain)`));
+  } else if (envChain && resolveChain(chainSlug(envChain))) {
+    // A valid CHAIN in .env is used directly — no prompt. The user set it
+    // deliberately; asking again wastes a step and risks a mis-key.
+    chainKey = chainSlug(envChain);
+    console.log(chalk.gray(`  Chain: ${chainKey} (from CHAIN in .env)`));
+  } else {
+    const defaultIndex = Math.max(
+      0,
+      CHAINS.findIndex((c) => c.key === (envChain || "ethereum"))
+    );
+    chainKey = await askChoice<string>(
+      "Which chain?",
+      CHAINS.map((c) => ({ label: c.name, value: c.key, hint: `chain id ${c.chainId}` })),
+      defaultIndex
+    );
+  }
   if (!resolveChain(chainKey)) {
     // Derived from CHAINS so this can never list a chain the tool cannot
     // serve — it previously advertised polygon/arbitrum/optimism and omitted

@@ -4,7 +4,20 @@ import path from "path";
 import dotenv from "dotenv";
 import chalk from "chalk";
 
-dotenv.config({ path: path.resolve(process.cwd(), ".env") });
+// Load .env from the REPO, not from wherever the user happened to run the
+// command. Resolving against process.cwd() meant
+// `node /home/anon/minter/dist/index.js` from $HOME silently ignored CHAIN,
+// RPC_URL_* and OPENSEA_API_KEY — the run then defaulted to ethereum with
+// public RPCs, which is both wrong and slow.
+//
+// tsc emits CommonJS, so __dirname is available. The repo root is one level
+// above dist/ (or the source dir itself under ts-node).
+const repoRoot = __dirname.endsWith("dist") ? path.dirname(__dirname) : __dirname;
+
+// Repo .env first; a .env in the CWD overrides it so a user can point at a
+// different config without editing the repo.
+dotenv.config({ path: path.resolve(repoRoot, ".env") });
+dotenv.config({ path: path.resolve(process.cwd(), ".env"), override: true });
 
 import { createRunLogger } from "./logger";
 import { runWizard, runFcfsBranchCli, runEligibilityCheck } from "./wizard";
