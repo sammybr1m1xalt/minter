@@ -71,6 +71,7 @@ import { findUniversalMint, findAllUniversalMints, explainFailure, UniversalMint
 import { getMintMechanisms } from "./seadrop-public";
 import { verifyContract } from "./contract-verify";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
+import { formatRemaining } from "./time-format";
 import { blastToAll } from "./rpc-blast";
 import { parsePriceToWei } from "./opensea-gql";
 import {
@@ -702,8 +703,17 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         maxPriceWei,
       }));
     } else {
-      // Signed/allowlist phase — needs OpenSea signed payload
-      if (!phaseEligibility.signedPayload) {
+      // Signed/allowlist phase — needs OpenSea signed payload.
+      //
+      // A future phase has no payload yet: OpenSea only signs for a live stage.
+      // Throwing here made every future signed phase un-mintable — the run
+      // aborted before the timing prompt and before the T-0 fetch that would
+      // have produced the payload. The payload is only required when the phase
+      // is actually open (or already passed).
+      const phaseOpensInFuture =
+        selectedDrop.startTime > 0 && selectedDrop.startTime * 1000 > Date.now();
+
+      if (!phaseEligibility.signedPayload && !phaseOpensInFuture) {
         throw new Error(
           `Signed payload unavailable for phase "${selectedDrop.name || "selected"}".\n` +
             `  OpenSea did not return wallet-specific signed data.\n` +
@@ -713,16 +723,34 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       }
 
       const payload = phaseEligibility.signedPayload;
-      const mintPlan = buildFcfsMintPlan(
-        payload, gas.defaultGasLimit, gas.maxFeePerGasWei, gas.maxPriorityFeePerGasWei, quantity
-      );
+      const mintPlan = payload
+        ? buildFcfsMintPlan(
+            payload, gas.defaultGasLimit, gas.maxFeePerGasWei, gas.maxPriorityFeePerGasWei, quantity
+          )
+        : null;
 
       // Pre-fetch a signed payload for EVERY wallet now, while the drop is still
       // future. mintSignature is wallet-specific, so each wallet needs its own.
       // Passing these in keeps the T-0 path free of API calls.
-      console.log(chalk.gray(`\n  Pre-fetching signed payloads for ${walletKeys.length} wallet(s)...`));
+      //
+      // For a future phase the payload does not exist yet, so there is nothing to
+      // pre-fetch — every wallet is pushed as null and phase 2 fetches at T-0.
+      if (phaseOpensInFuture) {
+        console.log(
+          chalk.gray(
+            `\n  Phase opens ${formatRemaining(selectedDrop.startTime * 1000 - Date.now())} — ` +
+              `payloads will be fetched at T-0.`
+          )
+        );
+      } else {
+        console.log(chalk.gray(`\n  Pre-fetching signed payloads for ${walletKeys.length} wallet(s)...`));
+      }
       const preFetched: (FcfsSignedPayload | null)[] = [];
       for (let i = 0; i < walletKeys.length; i++) {
+        if (phaseOpensInFuture) {
+          preFetched.push(null);
+          continue;
+        }
         const w = new Wallet(walletKeys[i]);
         try {
           const p = await fetchSignedPayloadForWallet(
@@ -761,9 +789,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         // A future phase has no payload yet. Phase 1 must not fetch one (it
         // would always come back null and drop the wallet); phase 2 fetches at
         // T-0 instead.
-        phaseOpensInFuture:
-          selectedDrop.startTime > 0 &&
-          selectedDrop.startTime * 1000 > Date.now(),
+        phaseOpensInFuture,
       });
       mintOutcomes = snipeResults.map((r) => ({
         walletIndex: r.walletIndex,
@@ -1409,11 +1435,30 @@ async function promptKeys(log: RunLogger, spec?: string | null): Promise<string[
   const keys: string[] = [];
   const seen = new Set<string>();
 
+  // A non-TTY stdin with no key in the environment can never be answered.
+  // Without this check the loop below asks forever: askHidden returns "" on EOF,
+  // keys.length stays 0, and `continue` re-asks — a silent hang that looks like
+  // the tool is thinking. Fail with the fix instead.
+  if (!process.stdin.isTTY && envKeys.length === 0) {
+    throw new Error(
+      "No wallet keys available. Set PRIVATE_KEY (or PRIVATE_KEYS) in the environment, " +
+        "pass --wallets, or run interactively so keys can be pasted."
+    );
+  }
+
   for (;;) {
     const raw = await askHidden(chalk.gray(`  › key ${keys.length + 1}: `));
     if (!raw) {
       if (keys.length === 0) {
         console.log(chalk.red("  ✗ Need at least one key."));
+        // A blank line on a non-TTY means EOF, not a user choosing to stop.
+        // Re-asking here is the hang described above.
+        if (!process.stdin.isTTY) {
+          throw new Error(
+            "No wallet keys available. Set PRIVATE_KEY (or PRIVATE_KEYS) in the environment, " +
+              "pass --wallets, or run interactively so keys can be pasted."
+          );
+        }
         continue;
       }
       break;
