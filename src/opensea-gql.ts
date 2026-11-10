@@ -66,11 +66,11 @@ export const GQL_QUERY_TEXTS: Record<string, string> = {
 
 // Structured error codes OpenSea returns when a mint tx can't be built.
 const OS_ERROR_MEANINGS: Record<string, string> = {
-  InsufficientMintsRemainingError: "jatah mint habis (sudah mint maksimal)",
-  DropNotMintingError: "stage belum buka",
-  DropStageNotActiveError: "stage belum aktif",
-  NotEligibleError: "wallet tidak eligible",
-  InsufficientFundError: "saldo tidak cukup",
+  InsufficientMintsRemainingError: "mint supply exhausted (already at the per-wallet max)",
+  DropNotMintingError: "stage is not open yet",
+  DropStageNotActiveError: "stage is not active",
+  NotEligibleError: "wallet is not eligible",
+  InsufficientFundError: "insufficient balance",
 };
 
 export function explainOpenseaError(msg: string): { code: string | null; meaning: string } {
@@ -142,6 +142,20 @@ export function parsePriceToWei(value: unknown): bigint {
   return 0n;
 }
 
+/**
+ * Read a price field that may be a bare scalar (wei string, ETH float) or a
+ * nested { token: { unit } } object — OpenSea's REST and GraphQL surfaces
+ * return both. A nested object handed straight to parsePriceToWei yields 0n,
+ * which silently turns a paid mint into a free one.
+ */
+export function parsePriceField(value: unknown): bigint {
+  if (value != null && typeof value === "object") {
+    const v = value as Record<string, any>;
+    return parsePriceToWei(v.token?.unit ?? v.unit ?? v.value ?? 0);
+  }
+  return parsePriceToWei(value);
+}
+
 // ── Mint status semantics ────────────────────────────────────────────────────
 // Documented for POST /api/v2/drops/{slug}/mint:
 //   200  ready-to-sign transaction data
@@ -156,11 +170,47 @@ export function isEligibleStatus(status: number): boolean {
   return status === 200;
 }
 
+/**
+ * Normalize any OpenSea timestamp to UNIX seconds.
+ *
+ * GraphQL returns ISO-8601 strings; other surfaces return UNIX seconds as a
+ * number or numeric string. `new Date(1786000000)` reads a seconds value as
+ * MILLISECONDS and lands in 1970 — a silent wrong answer, not a throw.
+ * Returns null when the value is absent or unparseable.
+ */
+export function toUnixSecondsSafe(value: unknown): number | null {
+  if (value == null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? Math.floor(value) : null;
+  const s = String(value).trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return Number(s);            // UNIX seconds
+  const parsed = Date.parse(s);                      // ISO-8601
+  return Number.isNaN(parsed) ? null : Math.floor(parsed / 1000);
+}
+
 
 // Issue a persisted GraphQL query (GET, like the frontend). On
 // PERSISTED_QUERY_NOT_FOUND (OpenSea redeploys rotate hashes), re-register the
 // query via APQ — POST the full query text once with its sha256, then retry
 // hash-only. Returns parsed JSON; GraphQL errors stay in the payload.
+/**
+ * OpenSea's wallet-scoped endpoints authenticate with
+ * `Authorization: Bearer <wallet JWT>` — the docs are explicit that
+ * "Wallet-specific REST requests need both the API key and wallet JWT", and that
+ * the SIWE session cookies are only for managing personal access tokens.
+ *
+ * The session is stored here as an `access_token=…` cookie, so derive the token
+ * back out and send BOTH headers. Sending only the cookie left every
+ * eligibility lookup unauthenticated: OpenSea could not see which wallet was
+ * asking, so a wallet allowlisted for presale stages read as not eligible.
+ */
+export function bearerFromSessionCookie(cookie?: string | null): string | null {
+  if (!cookie) return null;
+  const m = cookie.match(/(?:^|;\s*)access_token=([^;]*)/);
+  const token = m?.[1]?.trim();
+  return token ? token : null;
+}
+
 export async function gqlPersistedQuery(
   operationName: string,
   hash: string,
@@ -178,6 +228,8 @@ export async function gqlPersistedQuery(
   };
   if (apiKey && apiKey.trim()) baseHeaders["X-API-KEY"] = apiKey.trim();
   if (cookie) baseHeaders["cookie"] = cookie;
+  const bearer = bearerFromSessionCookie(cookie);
+  if (bearer) baseHeaders["authorization"] = `Bearer ${bearer}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -250,6 +302,8 @@ export async function gqlApqQuery(
   };
   if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
   if (cookie) headers["cookie"] = cookie;
+  const bearer = bearerFromSessionCookie(cookie);
+  if (bearer) headers["authorization"] = `Bearer ${bearer}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -410,21 +464,25 @@ export async function postMintTx(
     }
     const mintData = json?.data || null;
     const seaDropAddress = json?.to || null;
-    const value = json?.value ? BigInt(String(json.value)) : null;
+    // `value` may be a wei string, an ETH float, or a nested { token: { unit } }
+    // object. BigInt(String(...)) throws on the object form and on a float,
+    // taking down the whole mint POST.
+    const value = json?.value ? parsePriceField(json.value) : null;
 
     // Documented DropMintResponse fields. stage_uuid names the stage the tx was
     // built for; a presale tx reverts if mined outside stage_start/end_time, so
     // the caller can and should verify these against the intended stage.
     const stageUuid = json?.stage_uuid ?? null;
     const stageType = json?.stage_type ?? null;
-    const stageStartRaw = json?.stage_start_time ?? null;
-    const stageEndRaw = json?.stage_end_time ?? null;
-    const stageStart = stageStartRaw ? Math.floor(new Date(stageStartRaw).getTime() / 1000) : null;
-    const stageEnd = stageEndRaw ? Math.floor(new Date(stageEndRaw).getTime() / 1000) : null;
+    const stageStart = toUnixSecondsSafe(json?.stage_start_time);
+    const stageEnd = toUnixSecondsSafe(json?.stage_end_time);
 
     return {
       eligible: isEligible,
-      reason: res.status === 422 ? reason || "not eligible" : undefined,
+      // Surface the explanation for EVERY non-success. The previous
+      // `res.status === 422 ? ... : undefined` computed the 409 reason and then
+      // threw it away, leaving the caller only a numeric status.
+      reason: isEligible ? undefined : reason || "not eligible",
       mintData,
       mintSignature: json?.mint_signature || json?.mintSignature || null,
       seaDropAddress,
@@ -461,7 +519,7 @@ export function isPayloadBoundToWallet(payload: { mintData: string | null }, wal
 }
 
 // ── OpenSea Drop (OS2) via GraphQL MintActionTimelineQuery ────────────────────
-// Mirrors repo (opensea-drop.js buildOpenseaMint): the mint transaction is
+// The mint transaction is
 // generated server-side (relayer + requestId). We replay the same persisted
 // GraphQL query the frontend uses. Returns { to, data, value, networkId,
 // crossChain, requestId, selector, stageType, stageIndex } — ready to sign+send.
@@ -528,14 +586,16 @@ export async function buildOpenseaMint(args: {
   const selector = data.slice(0, 10).toLowerCase();
   const stageType = SELECTOR_STAGE[selector] || null;
   // Decode the stage index with ethers rather than a hand-rolled slice. The
-  // previous offset (hex 522..586) landed inside the mintParams tuple and read
-  // garbage; dropStageIndex is mintParams field 4, at hex char 576.
+  // previous offset (hex 576..640) read the wrong word inside the mintParams
+  // tuple; dropStageIndex is mintParams field 4, at word 8 / hex char 522.
   const stageIndex = stageType === "PUBLIC_SALE" ? 0 : decodeStageIndexImpl(data);
 
   return {
     to: t.to,
     data,
-    value: BigInt(t.value || 0),
+    // MintActionTimeline values have appeared as wei strings and as ETH floats;
+    // a raw BigInt throws on a float and takes down the whole payload fetch.
+    value: parsePriceToWei(t.value),
     networkId: t.chain?.networkId ?? null,
     crossChain: !!mintAction.relayerFulfillment?.crossChain,
     requestId: mintAction.relayerFulfillment?.requestId || null,
@@ -564,7 +624,8 @@ export async function fetchRestEligibility(
 ): Promise<{
   stages: {
     stageUuid: string | null;
-    isEligible: boolean;
+    /** null = the endpoint could not tell (usually no JWT) — UNKNOWN, not false. */
+    isEligible: boolean | null;
     price: bigint | null;
     maxTotalMintableByWallet: number | null;
   }[];
@@ -576,6 +637,10 @@ export async function fetchRestEligibility(
     const headers: Record<string, string> = { accept: "application/json" };
     if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
     if (cookie) headers["cookie"] = cookie;
+    // This endpoint is wallet-scoped: it needs the wallet JWT as a Bearer token
+    // (the cookie alone is for PAT management and is not accepted here).
+    const bearer = bearerFromSessionCookie(cookie);
+    if (bearer) headers["authorization"] = `Bearer ${bearer}`;
 
     const res = await fetch(
       `https://api.opensea.io/api/v2/drops/${slug.trim()}/eligibility`,
@@ -589,9 +654,12 @@ export async function fetchRestEligibility(
     return {
       stages: stages.map((s: any) => ({
         stageUuid: s.stage_uuid ?? null,
-        isEligible: Boolean(s.is_eligible),
+        // `null` means the endpoint could not tell (usually no JWT). It is
+        // UNKNOWN, not a negative verdict — Boolean(null) turned every
+        // unauthenticated response into "wallet is not eligible for any stage".
+        isEligible: s.is_eligible == null ? null : Boolean(s.is_eligible),
         // Documented as a wei decimal string.
-        price: s.price != null ? parsePriceToWei(s.price) : null,
+        price: s.price != null ? parsePriceField(s.price) : null,
         maxTotalMintableByWallet:
           s.max_total_mintable_by_wallet != null
             ? Number(s.max_total_mintable_by_wallet)
@@ -628,9 +696,11 @@ export async function probeOpenseaMint(args: {
 }
 
 // ── Per-wallet stage eligibility via GraphQL ─────────────────────────────────
-// Mirrors nft-minter-bot/opensea-drop.js getDropEligibility: uses the
+// Uses the
 // authenticated DropEligibilityQuery to get per-stage isEligible for a wallet.
-// REQUIRES a session cookie — without it OpenSea returns isEligible: null.
+// REQUIRES an authenticated session — without one OpenSea returns
+// isEligible: null. The token goes out as a Bearer header (see
+// bearerFromSessionCookie); the cookie is also sent for compatibility.
 
 export interface DropEligibilityStage {
   stageIndex: number;
@@ -679,8 +749,8 @@ export async function getDropEligibility(
       stageIndex: s.stageIndex,
       uuid: s.uuid || null,
       stageType: s.stageType || null,
-      startTime: s.startTime ? Math.floor(new Date(s.startTime).getTime() / 1000) : null,
-      endTime: s.endTime ? Math.floor(new Date(s.endTime).getTime() / 1000) : null,
+      startTime: toUnixSecondsSafe(s.startTime),
+      endTime: toUnixSecondsSafe(s.endTime),
       isEligible: s.isEligible,
       eligibleMinterAddress: s.eligibleMinterAddress || null,
       maxPerWallet: s.eligibleMaxTotalMintableByWallet ?? s.maxTotalMintableByWallet ?? null,

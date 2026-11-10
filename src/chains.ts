@@ -72,18 +72,43 @@ export const CHAINS: ChainProfile[] = [
     },
   },
   {
-    // Arc Chain (Circle) — RPC not publicly available yet; placeholder ready.
-    // Chain ID confirmed 5042. Fill rpc.public + explorer when endpoints ship.
-    // Testnet explorer (read-only, no auth): https://testnet.arcscan.app
-    // Testnet API: https://testnet.arcscan.app/api/v2/...
+    // Arc Chain (Circle) — verified live 2026-11-08: chain id 5042 (0x13b2),
+    // USDC is the native gas token, sub-second finality.
+    // Public endpoints answered eth_chainId anonymously with no API key.
     key: "arc",
     chainId: 5042,
     name: "Arc",
-    explorer: "https://arcscan.app", // TODO: confirm mainnet explorer base URL
-    nativeSymbol: "USDC",            // TODO: confirm native symbol
+    explorer: "https://explorer.arc.io",
+    nativeSymbol: "USDC",
     rpc: {
-      alchemyHost: undefined,       // TODO: Alchemy host when available
-      public: [],                   // TODO: public RPC list when available
+      alchemyHost: "arc-mainnet.g.alchemy.com",
+      public: [
+        "https://rpc.mainnet.arc.io",
+        "https://rpc.drpc.mainnet.arc.io",
+      ],
+    },
+  },
+  {
+    // Soneium mainnet — verified live 2026-11-08: chain id 1868 (0x74c), ETH
+    // gas, SeaDrop singleton deployed at the same address as every other chain
+    // (eth_getCode returned bytecode). OpenSea lists it as "soneium" in
+    // /api/v2/chains, explorer https://soneium.blockscout.com.
+    // All three endpoints below answered eth_chainId anonymously.
+    // NOTE: Etherscan V2 does NOT support chainid 1868, so ABI-driven minting on
+    // Soneium depends on Sourcify alone (abi-mint tries Etherscan first only
+    // when a key is set, then falls through to Sourcify).
+    key: "soneium",
+    chainId: 1868,
+    name: "Soneium",
+    explorer: "https://soneium.blockscout.com",
+    nativeSymbol: "ETH",
+    rpc: {
+      alchemyHost: "soneium-mainnet.g.alchemy.com",
+      public: [
+        "https://rpc.soneium.org",
+        "https://soneium-rpc.publicnode.com",
+        "https://soneium.drpc.org",
+      ],
     },
   },
 ];
@@ -115,12 +140,10 @@ export function chainKeyFromId(chainId: number): string | null {
 }
 
 // ── Provider cache ──────────────────────────────────────────────────────────
-// Ported from nft-minter-bot/src/chains.js getProvider().
 //
-// The TS port constructed a fresh JsonRpcProvider at every call site — 12 of
-// them across 7 files — and destroyed only some. Every provider carries a
-// polling timer, so each leaked one keeps the Node event loop busy and the
-// process never exits. The original cached one provider per chain and reused it.
+// A fresh JsonRpcProvider at every call site leaks one: every provider carries
+// a polling timer, so each leaked one keeps the Node event loop busy and the
+// process never exits.
 //
 // A cached provider is also faster: the first request pays the connection
 // setup, and every later call reuses the keep-alive socket.
@@ -154,7 +177,7 @@ export function getProvider(idOrKey: string | number | bigint): JsonRpcProvider 
 }
 
 /**
- * Create a provider for a specific RPC URL, with a bounded request timeout.
+ * Create a provider for a specific RPC URL.
  *
  * Use this for one-off reads (simulation, eth_getCode, a gas estimate) where a
  * cached per-chain provider is not wanted. The caller owns the result and MUST
@@ -201,6 +224,7 @@ const OS_CHAIN: Record<string, string> = {
   avalanche: "avalanche",
   robinhood: "robinhood",
   arc: "arc",
+  soneium: "soneium",
 };
 
 /** Convert our internal chain key to OpenSea's GraphQL chain identifier. */

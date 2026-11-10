@@ -4,9 +4,6 @@
 // drop, not scatter, not Manifold). It probes the contract for a mint function,
 // reads its price, builds calldata, simulates, and returns a signed-ready plan.
 //
-// Ported from nft-minter-bot/src/mint.js (detectMintFunction, autoGas,
-// synthArg, MINT_SIGNATURES) and price.js (detectPrice, PRICE_READERS).
-//
 // ────────────────────────────────────────────────────────────────────────────
 // SAFETY — read this before changing anything
 // ────────────────────────────────────────────────────────────────────────────
@@ -24,11 +21,12 @@
 //      but reverted on state/payment". A revert WITH data means the function is
 //      there; a revert with NO data means it is not. See detectMintFunction.
 //   4. Every selector hash in MINT_SIGNATURES is verified against
-//      ethers id(sig).slice(2,10) by tests/mint-generic.test.mjs. A hand-typed
+//      ethers id(sig).slice(2,10) by tests/audit-fixes.test.js. A hand-typed
 //      hash fails silently — the probe never matches and the symptom looks like
 //      "contract has no mint function" rather than "our table is wrong".
 
 import { id as keccakId, Interface, JsonRpcProvider } from "ethers";
+import { autoGasBounded } from "./auto-gas";
 
 // ── Selector registry ───────────────────────────────────────────────────────
 //
@@ -210,15 +208,28 @@ export const PRICE_READERS: PriceReader[] = [
 
 // ── SeaDrop detection ───────────────────────────────────────────────────────
 
-export const SEADROP_V2 = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
-export const SEADROP_V1 = "0x00000000006c3852cbef3e08e8df289169ede581";
+// SeaDrop has exactly one shared singleton: `SeaDrop` 1.0, which powers every
+// OpenSea drop. SeaDrop v2 is not a singleton at all — v2 collections are
+// per-token contracts deployed through ERC1155SeaDropCloneFactory, so there is
+// no shared v2 address to probe. Verified against ProjectOpenSea/seadrop
+// docs/Deployments.md.
+//
+// The address previously held by SEADROP_V1 was Seaport 1.1
+// (0x00000000006c3852cbef3e08e8df289169ede581) — NOT SeaDrop. Probing it for
+// SeaDrop getters could never produce evidence.
+export const SEADROP_V1 = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
+export const SEADROP_V2 = SEADROP_V1;
+
+// Seaport 1.1 — the marketplace, not SeaDrop. Kept for callers that compare
+// against it; do not use it as a SeaDrop singleton.
+export const SEAPORT_1_1 = "0x00000000006c3852cbef3e08e8df289169ede581";
 
 // The return types use plain uintN. SeaDrop's documentation writes them as
 // uint16B/uint32B (a byte-width convention), but those are NOT valid Solidity
 // ABI types — ethers rejects the fragment and every call silently fails.
 const SEADROP_ABI = [
   "function getPublicDrop(address nftContract) view returns (uint80 mintPrice, uint48 startTime, uint48 endTime, uint16 maxTotalMintableByWallet, uint16 feeBps, bool restrictFeeRecipients)",
-  "function getAllowListMerkleRoot(address nftContract) view returns (bytes32 root, uint96 maxTotalMintablePerWallet, uint32 startTime, uint32 endTime, uint32 mintLimitPerWallet, uint32 mintStageIndex)",
+  "function getAllowListMerkleRoot(address nftContract) view returns (bytes32 root)",
   "function getCreatorPayoutAddress(address nftContract) view returns (address)",
 ];
 
@@ -241,10 +252,16 @@ export async function isSeadropContract(
   nftContract: string,
   provider: JsonRpcProvider
 ): Promise<SeaDropDetection> {
-  for (const [version, singleton] of [
-    ["v2", SEADROP_V2],
-    ["v1", SEADROP_V1],
-  ] as const) {
+  // v1 and v2 currently resolve to the one singleton (v2 has no address of its
+  // own), so probe each distinct address exactly once.
+  const singletons: readonly (readonly ["v1" | "v2", string])[] =
+    SEADROP_V2 === SEADROP_V1
+      ? [["v1", SEADROP_V1]]
+      : [
+          ["v2", SEADROP_V2],
+          ["v1", SEADROP_V1],
+        ];
+  for (const [version, singleton] of singletons) {
     const seadrop = new Interface(SEADROP_ABI);
     try {
       // Public drop: mintPrice/startTime/endTime all zero means "not managed".
@@ -262,7 +279,7 @@ export async function isSeadropContract(
         const rootData = seadrop.encodeFunctionData("getAllowListMerkleRoot", [nftContract]);
         const rootRaw = await provider.call({ to: singleton, data: rootData });
         const rootDecoded = seadrop.decodeFunctionResult("getAllowListMerkleRoot", rootRaw);
-        const root = rootDecoded.root ?? "0x" + "0".repeat(64);
+        const root: string = rootDecoded.root ?? rootDecoded[0] ?? "0x" + "0".repeat(64);
         hasAllowlist = root !== "0x" + "0".repeat(64);
       } catch {
         hasAllowlist = false;
@@ -301,6 +318,13 @@ export async function isSeadropContract(
 export interface SynthContext {
   to: string;
   amount: bigint;
+  /**
+   * Caller-supplied off-chain data. A proof or signature CANNOT be synthesized
+   * from a scalar — when the selected signature needs one and the caller did not
+   * supply it, buildArgs returns null and the candidate is skipped.
+   */
+  proof?: string[];
+  signature?: string;
 }
 
 /**
@@ -313,8 +337,8 @@ export interface SynthContext {
 export function buildArgs(
   selector: MintSelector,
   ctx: SynthContext
-): (string | bigint)[] | null {
-  const out: (string | bigint)[] = [];
+): (string | bigint | string[])[] | null {
+  const out: (string | bigint | string[])[] = [];
   for (const role of selector.args) {
     switch (role) {
       case "to":
@@ -333,9 +357,15 @@ export function buildArgs(
         out.push("0x");
         break;
       case "proof":
+        // A merkle proof is caller-supplied and cannot be synthesized.
+        if (!ctx.proof || ctx.proof.length === 0) return null;
+        out.push(ctx.proof);
+        break;
       case "signature":
-        // Cannot be synthesized. The caller must supply one or skip.
-        return null;
+        // Same: a server signature is caller-supplied.
+        if (!ctx.signature) return null;
+        out.push(ctx.signature);
+        break;
     }
   }
   return out;
@@ -369,6 +399,13 @@ export async function detectMintFunction(
 ): Promise<DetectedMint | null> {
   const candidates = [...MINT_SIGNATURES].sort((a, b) => b.weight - a.weight);
 
+  // A candidate that reverts WITH data exists but needs something we did not
+  // supply (payment, proof, a closed sale). Remember the first one, but keep
+  // probing: a later candidate that SUCCEEDS is a strictly better answer than
+  // the first one that merely exists, and returning early on a revert let a
+  // high-weight paid mint shadow a free mint further down the list.
+  let firstReverting: DetectedMint | null = null;
+
   for (const candidate of candidates) {
     if (candidate.needs === "proof" && !opts.proof) continue;
     if (candidate.needs === "signature" && !opts.signature) continue;
@@ -376,7 +413,7 @@ export async function detectMintFunction(
     // The ABI-driven path (abi-mint.ts) can fill them; the scalar path cannot.
     if (candidate.needs === "structured") continue;
 
-    const args = buildArgs(candidate, { to: from, amount });
+    const args = buildArgs(candidate, { to: from, amount, proof: opts.proof, signature: opts.signature });
     if (!args) continue;
 
     const iface = new Interface([`function ${candidate.sig} payable`]);
@@ -394,13 +431,13 @@ export async function detectMintFunction(
     } catch (e: any) {
       const errData = e?.data ?? e?.info?.error?.data;
       if (errData && errData !== "0x") {
-        return { selector: candidate, revertedWithData: true };
+        if (!firstReverting) firstReverting = { selector: candidate, revertedWithData: true };
       }
       continue;
     }
   }
 
-  return null;
+  return firstReverting;
 }
 
 // ── Price detection ─────────────────────────────────────────────────────────
@@ -445,35 +482,6 @@ export interface GasPlan {
   gasPrice?: bigint;
 }
 
-/**
- * Estimate gas with a 20% buffer and derive EIP-1559 fees with headroom.
- * Falls back to legacy gasPrice on chains without maxFeePerGas.
- */
-export async function autoGas(
-  provider: JsonRpcProvider,
-  tx: { to: string; from: string; data: string; value: bigint }
-): Promise<GasPlan> {
-  let gasLimit: bigint;
-  try {
-    gasLimit = ((await provider.estimateGas(tx)) * 120n) / 100n;
-  } catch (e: any) {
-    throw new Error(`gas estimate failed (likely revert): ${e?.shortMessage ?? e?.message ?? "unknown"}`);
-  }
-
-  const feeData = await provider.getFeeData();
-
-  if (feeData.maxFeePerGas == null) {
-    const gasPrice = feeData.gasPrice ?? 1_000_000_000n;
-    return { gasLimit, gasPrice };
-  }
-
-  const priorityFee = feeData.maxPriorityFeePerGas
-    ? (feeData.maxPriorityFeePerGas * 110n) / 100n
-    : 1_500_000_000n;
-  const maxFee = feeData.maxFeePerGas * 2n + priorityFee;
-  return { gasLimit, maxPriorityFeePerGas: priorityFee, maxFeePerGas: maxFee };
-}
-
 // ── Plan builder ────────────────────────────────────────────────────────────
 
 export interface GenericMintPlan {
@@ -508,7 +516,7 @@ export async function buildGenericMintTx(
   const priceInfo = await detectPrice(contract, provider, amount);
   const value = priceInfo?.price ?? 0n;
 
-  const args = buildArgs(detected.selector, { to: from, amount });
+  const args = buildArgs(detected.selector, { to: from, amount, proof: opts.proof, signature: opts.signature });
   if (!args) return null;
 
   const iface = new Interface([`function ${detected.selector.sig} payable`]);
@@ -527,9 +535,13 @@ export async function buildGenericMintTx(
     simulationError = e?.shortMessage ?? e?.reason ?? e?.info?.error?.message ?? e?.message ?? "unknown revert";
   }
 
-  const gas = simulationReverted
+  // Bounded and parallel. The previous local autoGas copy ran estimateGas then
+  // getFeeData sequentially with no timeout, so one stalled RPC hung the plan
+  // builder for ~5 minutes (ethers' FetchRequest default) — and it duplicated a
+  // decision auto-gas.ts already owns.
+  const gas: GasPlan = simulationReverted
     ? { gasLimit: 150_000n }
-    : await autoGas(provider, tx);
+    : (await autoGasBounded(provider, tx)) ?? { gasLimit: 150_000n };
 
   return {
     to: contract,

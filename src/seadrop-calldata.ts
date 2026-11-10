@@ -7,14 +7,22 @@
 // to the type-checker. Here the decoder is ethers itself: we encode a known
 // input, then ask the decoder where the value landed.
 //
-// Verified offsets (mintSigned, selector 0x4b61cd6f):
-//   nftContract         word 0   hex char 0
-//   feeRecipient        word 1   hex char 64
-//   minterIfNotPayer    word 2   hex char 128   <-- the wallet binding
-//   quantity            word 3   hex char 192
-//   mintParams[]        word 4   hex char 256   (offset word)
-//   mintParams field N  word 5+N hex char 320 + N*64
-//     dropStageIndex is mintParams field 4 -> word 9 -> hex char 576
+// Verified offsets (mintSigned, selector 0x4b61cd6f), measured by encoding a
+// known input with ethers and reading the decoded fields back:
+//   nftContract         word 0   hex char 10
+//   feeRecipient        word 1   hex char 74
+//   minterIfNotPayer    word 2   hex char 138   <-- the wallet binding
+//   quantity            word 3   hex char 202
+//   mintParams          word 4   — the tuple is INLINED, not offset-based
+//     mintPrice        word 4   hex char 266
+//     maxTotalMintableByWallet word 5
+//     startTime        word 6
+//     endTime          word 7
+//     dropStageIndex   word 8   hex char 522
+//
+// An earlier version of this comment called word 4 an "offset word" and put
+// dropStageIndex at word 9 / hex char 576. That layout does not exist; the
+// decoder below is authoritative and was checked against it.
 //
 // mintAllowList (0x4300a4e6) has the identical head layout, so the same
 // offsets apply.

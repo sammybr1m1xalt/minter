@@ -19,6 +19,7 @@ export async function warmConnections(rpcUrls: string[]): Promise<void> {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ jsonrpc: "2.0", method: "eth_chainId", params: [], id: 1 }),
+          signal: AbortSignal.timeout(5000),
         });
         const json = (await res.json()) as any;
         const latency = Math.round(performance.now() - t0);
@@ -44,4 +45,24 @@ export async function warmConnections(rpcUrls: string[]): Promise<void> {
     }
   }
   console.log(chalk.green(`  Warmed: ${ok}/${ok + fail} RPC(s) alive.`));
+}
+
+/**
+ * Silent keep-alive poll for the wait between preparation and T-0.
+ *
+ * Deliberately separate from warmConnections(), which reports: this runs every
+ * couple of seconds and must not spam the console. Failures are ignored — a
+ * failed ping is irrelevant and must never delay the wake-up.
+ */
+export async function pingRpcs(rpcUrls: string[]): Promise<void> {
+  await Promise.allSettled(
+    rpcUrls.map((url) =>
+      fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "eth_blockNumber", params: [], id: 1 }),
+        signal: AbortSignal.timeout(3000),
+      }).then(() => undefined)
+    )
+  );
 }

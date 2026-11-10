@@ -6,7 +6,7 @@
 const REST_URL = "https://api.opensea.io/api/v2/collections";
 const GQL_URL = "https://gql.opensea.io/graphql";
 
-// ── HTML scrape fallback (mirrors upstream resolve.js) ────────────────────────
+// ── HTML scrape fallback ─────────────────────────────────────────────────────
 // When REST + GraphQL both fail, scrape the public collection page.
 // OpenSea embeds a "contracts":[{...}] JSON block in the page HTML.
 
@@ -29,9 +29,15 @@ async function htmlScrapeCollection(slug: string, timeoutMs = 10000): Promise<{ 
   // The page embeds several JSON payloads. The "contracts" block only carries
   // chain info ({chain:{identifier}}), while the contract address lives in the
   // collection payload as "address":"0x…". Anchor on that field instead.
-  const addrM = html.match(/"address":"(0x[a-fA-F0-9]{40})"/);
   const contractsBlock = html.match(/"contracts":\[[^\]]{0,500}\]/);
   const chainM = contractsBlock ? contractsBlock[0].match(/"identifier":"([\w-]+)"/) : null;
+  // Prefer the address inside the contracts block — that is the collection's own
+  // contract. The first bare "address" anywhere in the page can belong to the
+  // owner, a fee recipient, or an unrelated collection embedded in the payload.
+  const addrInBlock = contractsBlock
+    ? contractsBlock[0].match(/"address":"(0x[a-fA-F0-9]{40})"/)
+    : null;
+  const addrM = addrInBlock || html.match(/"address":"(0x[a-fA-F0-9]{40})"/);
   if (!addrM || /^0x0+$/.test(addrM[1])) return null; // zero-address = placeholder
   return { address: addrM[1], chain: chainM ? chainM[1] : "ethereum" };
 }
@@ -44,14 +50,14 @@ interface RestCollection {
   chain: { identifier: string; networkId: number };
 }
 
-async function restCollectionBySlug(slugOrAddress: string, apiKey = ""): Promise<RestCollection | null> {
+async function restCollectionBySlug(slugOrAddress: string, apiKey = "", timeoutMs = 10000): Promise<RestCollection | null> {
   const url = `${REST_URL}/${slugOrAddress}`;
   const headers: Record<string, string> = { accept: "application/json" };
   if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
 
   let res: Response;
   try {
-    res = await fetch(url, { headers });
+    res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
   } catch {
     return null;
   }
@@ -97,7 +103,7 @@ interface GqlCollection {
   chain: { identifier: string; networkId: number };
 }
 
-async function gqlCollectionBySlug(slug: string): Promise<GqlCollection | null> {
+async function gqlCollectionBySlug(slug: string, timeoutMs = 10000): Promise<GqlCollection | null> {
   const body = JSON.stringify({
     query: "query MintCollectionMetadata($slug: String!) { collectionBySlug(slug: $slug) { __typename ... on Collection { slug address chain { identifier networkId } } } }",
     variables: { slug },
@@ -116,6 +122,7 @@ async function gqlCollectionBySlug(slug: string): Promise<GqlCollection | null> 
         "x-app-id": "os2-web",
       },
       body,
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
     return null;
@@ -129,7 +136,7 @@ async function gqlCollectionBySlug(slug: string): Promise<GqlCollection | null> 
   return c as GqlCollection;
 }
 
-async function gqlSearchByAddress(address: string): Promise<{ slug: string }[]> {
+async function gqlSearchByAddress(address: string, timeoutMs = 10000): Promise<{ slug: string }[]> {
   const body = JSON.stringify({
     query: "query MintCollectionSearch($query: String!) { collectionsByQuery(query: $query, limit: 50) { __typename slug address chain { identifier networkId } } }",
     variables: { query: address },
@@ -148,6 +155,7 @@ async function gqlSearchByAddress(address: string): Promise<{ slug: string }[]> 
         "x-app-id": "os2-web",
       },
       body,
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
     return [];
@@ -178,8 +186,6 @@ export async function resolveSlug(
   apiKey = "",
   preferredChain?: string
 ): Promise<CollectionInfo> {
-  const _wanted = preferredChain?.trim().toLowerCase();
-
   // 1. REST v2 — primary. Works unauthenticated for most collections.
   const rest = await restCollectionBySlug(slug, apiKey);
   if (rest?.address) {
@@ -208,7 +214,7 @@ export async function resolveSlug(
   // different input (e.g. a CA-based lookup) — until then, go straight to the
   // HTML scrape.
 
-  // 3. HTML scrape — final fallback (mirrors upstream resolve.js)
+  // 3. HTML scrape — final fallback
   const scraped = await htmlScrapeCollection(slug);
   if (scraped?.address) {
     return {

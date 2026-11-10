@@ -1,13 +1,13 @@
 // ── SeaDrop allowlist / merkle-proof resolution ────────────────────────────
 //
-// Ported from nft-minter-bot/src/allowlist.js.
+// 
 //
 // The TS port had NO allowlist resolution at all. It could detect that an
 // allowlist phase existed (a non-zero merkle root) but could never obtain the
 // proof needed to mint it — so every allowlist stage was reported as
 // "check-manually" and was effectively untargetable.
 //
-// Flow (unchanged from the original, because it is the only way to do this):
+// Flow:
 //   1. getAllowListMerkleRoot(nftContract) — zero means no allowlist.
 //   2. Scan AllowListUpdated event logs on the SeaDrop singleton for the most
 //      recent allowListURI.
@@ -91,8 +91,20 @@ interface AllowlistTree {
  * Accepts the common shapes: { allowList:[...] }, { merkleTree:[...] },
  * { entries:[...] }, or a bare array.
  */
-export async function fetchTree(uri: string): Promise<AllowlistTree> {
-  const r = await fetch(uri, { headers: { "User-Agent": "Mozilla/5.0" } });
+export async function fetchTree(uri: string, timeoutMs = 20_000): Promise<AllowlistTree> {
+  // A gateway that accepts the connection and then stalls would otherwise hang
+  // the allowlist path forever — every other fetch in this codebase is bounded.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let r: Response;
+  try {
+    r = await fetch(uri, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
   if (!r.ok) throw new Error(`allowlist fetch ${r.status}`);
   const j: any = await r.json();
 
@@ -180,14 +192,20 @@ export async function getAllowlistRoot(
   nftContract: string,
   provider: JsonRpcProvider
 ): Promise<string | null> {
+  // The real contract returns a SINGLE bytes32 (verified against the Sourcify
+  // ABI for 0x00005EA0…). Declaring a 6-field tuple here made
+  // decodeFunctionResult throw on every call, so this function always returned
+  // null and the local allowlist path could never engage.
   const iface = new Interface([
-    "function getAllowListMerkleRoot(address nftContract) view returns (bytes32 root, uint96 maxTotalMintablePerWallet, uint32 startTime, uint32 endTime, uint32 mintLimitPerWallet, uint32 mintStageIndex)",
+    "function getAllowListMerkleRoot(address nftContract) view returns (bytes32 root)",
   ]);
   try {
     const data = iface.encodeFunctionData("getAllowListMerkleRoot", [nftContract]);
     const raw = await provider.call({ to: seadropAddr, data });
     const decoded = iface.decodeFunctionResult("getAllowListMerkleRoot", raw);
-    const root = decoded.root ?? decoded[0];
+    const root: string = decoded.root ?? decoded[0];
+    if (!root || typeof root !== "string") return null;
+    // The contract returns 32 zero bytes for a contract with no allowlist.
     return /^0x0*$/.test(root) ? null : root;
   } catch {
     return null;

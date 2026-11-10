@@ -226,7 +226,7 @@ export async function findUniversalMint(
 
       // Try the most promising candidates first — cheapest to most expensive,
       // and free mints before paid ones.
-      const ordered = orderCandidates(candidates, priceInfo?.price ?? 0n);
+      const ordered = orderCandidates(candidates);
 
       for (const candidate of ordered) {
         const synth = synthFromAbi(candidate, { to: from, amount });
@@ -286,7 +286,7 @@ export async function findUniversalMint(
  * determinism. A free mint is the most likely to succeed and costs nothing to
  * try.
  */
-function orderCandidates(candidates: AbiMintCandidate[], _price: bigint): AbiMintCandidate[] {
+function orderCandidates(candidates: AbiMintCandidate[]): AbiMintCandidate[] {
   // Prefer non-payable (free) mints, then the fewest parameters (simplest arg
   // synthesis), then by name for determinism. Price is not known per-candidate
   // until probed, so it cannot be a sort key here.

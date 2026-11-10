@@ -171,6 +171,91 @@ function extractMintButtonAddresses(html: string): string[] {
 // ── Ranking ─────────────────────────────────────────────────────────────────
 
 /**
+ * The address marketplaces use to identify a chain's native currency when that
+ * currency has no contract of its own (ETH on Ethereum, Base, Soneium, …).
+ */
+const NATIVE_IDENTIFIER = "0x0000000000000000000000000000000000000000";
+
+/**
+ * Arc's gas token is USDC, which DOES have a contract — so Arc is the one
+ * supported chain where the native currency has an address of its own.
+ */
+const AR_USDC = "0x3600000000000000000000000000000000000000";
+
+/**
+ * Native-token sentinel per supported chain.
+ *
+ * These are the addresses a marketplace or launch platform uses to mean "this
+ * chain's currency". They repeat across a page's payloads under a plain
+ * "address" key, so they outscore the real collection unless excluded — but
+ * they are never a collection contract.
+ *
+ * Curated against OpenSea on 2026-11-10 (`GET /api/v2/chain/{chain}/token/{addr}`
+ * and each collection's `pricing_currencies`). Two findings worth recording:
+ *
+ *  - The zero address is the native-token IDENTIFIER on every EVM chain OpenSea
+ *    supports — verified against all 28 chains it lists. It is not
+ *    Ethereum-specific, and it is not the same thing as the native token's
+ *    contract.
+ *  - Arc is the exception to "the native token has no contract": its gas token
+ *    is USDC at 0x3600…0000, so both the identifier and the contract apply.
+ *
+ * `robinhood` carries the identifier only: OpenSea prices its collections in
+ * USDG, and the chain's native ETH has no contract of its own (Robinhood Chain
+ * is an Arbitrum Orbit chain). Its wrapped native is recorded separately below.
+ */
+export const NATIVE_TOKEN_SENTINELS: Readonly<Record<string, readonly string[]>> = {
+  // Chains the tool can serve (src/chains.ts).
+  ethereum: [NATIVE_IDENTIFIER],
+  base: [NATIVE_IDENTIFIER],
+  robinhood: [NATIVE_IDENTIFIER],
+  arc: [NATIVE_IDENTIFIER, AR_USDC],
+  soneium: [NATIVE_IDENTIFIER],
+  // Chains the tool can target but not serve (src/chains.ts OS_CHAIN).
+  polygon: [NATIVE_IDENTIFIER],
+  arbitrum: [NATIVE_IDENTIFIER],
+  optimism: [NATIVE_IDENTIFIER],
+  "zora-network": [NATIVE_IDENTIFIER],
+  avalanche: [NATIVE_IDENTIFIER],
+};
+
+/**
+ * Wrapped-native token per supported chain.
+ *
+ * A different currency address that is likewise never a collection contract and
+ * likewise repeated across payloads. This set previously held 0x4200…0006 under
+ * the WRONG label — "Base native token placeholder". It is WETH ("Wrapped
+ * Ethereum", confirmed on Base and Soneium), which is not the native token at
+ * all. Recorded here as what it actually is.
+ */
+export const WRAPPED_NATIVE_TOKENS: Readonly<Record<string, readonly string[]>> = {
+  ethereum: ["0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"],
+  base: ["0x4200000000000000000000000000000000000006"],
+  robinhood: ["0x0bd7d308f8e1639fab988df18a8011f41eacad73"], // L2 Weth (aeWETH)
+  soneium: ["0x4200000000000000000000000000000000000006"],
+  polygon: ["0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"],
+  arbitrum: ["0x82af49447d8a07e3bd95bd0d56f35241523fbab1"],
+  optimism: ["0x4200000000000000000000000000000000000006"],
+  "zora-network": ["0x4200000000000000000000000000000000000006"],
+  avalanche: ["0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7"],
+};
+
+function flattenSentinels(groups: Readonly<Record<string, readonly string[]>>): string[] {
+  const out: string[] = [];
+  for (const list of Object.values(groups)) out.push(...list);
+  return out;
+}
+
+/**
+ * Every known currency sentinel, flattened. The default exclusion set for
+ * callers that do not know which chain they are looking at.
+ */
+export const CURRENCY_SENTINELS: ReadonlySet<string> = new Set([
+  ...flattenSentinels(NATIVE_TOKEN_SENTINELS),
+  ...flattenSentinels(WRAPPED_NATIVE_TOKENS),
+]);
+
+/**
  * Rank candidates by evidence. The ordering reflects how trustworthy each
  * signal is:
  *
@@ -190,7 +275,13 @@ export function rankCandidates(
   buttonHits: string[],
   allAddresses: string[],
   /** Optional per-address nesting depth, from extractKeyedAddressesWithDepth. */
-  depths?: Map<string, number>
+  depths?: Map<string, number>,
+  /**
+   * Currency sentinels to exclude. Defaults to CURRENCY_SENTINELS — every
+   * supported chain's native and wrapped-native token. Pass a chain-specific
+   * set when the caller knows the network.
+   */
+  currencySentinels: ReadonlySet<string> = CURRENCY_SENTINELS
 ): AddressCandidate[] {
   const occurrences = new Map<string, number>();
   for (const a of allAddresses) {
@@ -209,16 +300,16 @@ export function rankCandidates(
     if (key) keyName.set(a, key);
   };
 
-  // Addresses that are never a collection contract. The zero address is a
-  // placeholder used throughout OpenSea's payloads; 0x4200…06 is Base's
-  // native-token placeholder. Both scored above the real collection because
-  // they appear under an "address" key, so they must be excluded outright.
+  // Addresses that are never a collection contract. Two independent rules:
+  //   1. an all-zero address is not a contract on ANY chain;
+  //   2. a native-token sentinel (see NATIVE_TOKEN_SENTINELS) is a per-chain
+  //      convention meaning "this chain's currency", never a contract.
+  // Both repeat across marketplace payloads under a plain "address" key and so
+  // outscore the real collection unless they are excluded.
   const isPlaceholder = (addr: string): boolean => {
     const a = addr.toLowerCase();
     if (/^0x0+$/.test(a)) return true;
-    // Base native token placeholder.
-    if (a === "0x4200000000000000000000000000000000000006") return true;
-    return false;
+    return currencySentinels.has(a);
   };
 
   // Dedupe keyed hits by (address, key). The same address appears under the
@@ -289,12 +380,9 @@ export function rankCandidates(
     if (count > 1) bump(addr, Math.min(count, 20), source.get(addr) ?? "html-text");
   }
 
-  const seen = new Set<string>();
   const out: AddressCandidate[] = [];
   for (const [addr, pts] of score) {
-    if (seen.has(addr)) continue;
     if (isPlaceholder(addr)) continue;
-    seen.add(addr);
     out.push({
       address: addr,
       score: pts,
@@ -315,8 +403,15 @@ export function rankCandidates(
  *
  * Pure function — the caller fetches the HTML. Keeping this separate from the
  * network means it can be tested against saved fixtures.
+ *
+ * `currencySentinels` defaults to CURRENCY_SENTINELS; pass a chain-specific
+ * set when the caller knows the network, or an empty set to disable the
+ * exclusion entirely.
  */
-export function scanHtml(html: string): ScanResult {
+export function scanHtml(
+  html: string,
+  currencySentinels: ReadonlySet<string> = CURRENCY_SENTINELS
+): ScanResult {
   const all = extractAddresses(html);
   if (all.length === 0) {
     return { candidates: [], totalFound: 0, empty: true };
@@ -348,7 +443,8 @@ export function scanHtml(html: string): ScanResult {
     [...scriptHits],
     buttons,
     all,
-    depths
+    depths,
+    currencySentinels
   );
 
   return { candidates, totalFound: all.length, empty: candidates.length === 0 };
@@ -368,25 +464,67 @@ export function scanHtml(html: string): ScanResult {
 // We do NOT execute JavaScript. We read the bundle as text and follow the
 // strings — which is enough for the common case where the API path is a literal.
 
-/** Extract API paths referenced in a JS bundle. */
+/**
+ * Prefixes that mark a path as a data endpoint with high confidence.
+ *
+ * These are tried FIRST, but they are not the only thing looked for: a site
+ * whose endpoints live under an unusual prefix is still covered by the general
+ * pass below. The scanner is not specific to any one platform.
+ */
+const API_PREFIXES = [
+  "/api/",
+  "/v1/",
+  "/v2/",
+  "/graphql",
+  "/public/",
+  "/mint/",
+  "/drops/",
+  "/campaigns/",
+  "/collections/",
+  "/nfts/",
+];
+
+/**
+ * Paths that are never a data endpoint: static assets and site chrome.
+ *
+ * This is a DENYLIST, not an allowlist — a denylist is what lets the scanner
+ * work on a site nobody has categorised. The cost of a wrong entry here is one
+ * extra HTTP call; the cost of a wrong allowlist entry is a site that can never
+ * be scanned at all.
+ */
+const NON_DATA_PATH: RegExp[] = [
+  // Static assets by extension.
+  /\.(m?js|css|svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|map|json|txt|xml|pdf|mp4|webm|wasm)$/i,
+  // Static asset directories.
+  /^\/(assets?|static|images?|img|fonts?|media|css|js|dist|build)\//i,
+  // Framework internals that never carry app data.
+  /^\/_next\/(static\/css|image|media)/i,
+  // Site chrome — pages that exist on every site and hold no contract.
+  /^\/(about|faq|help|support|contact|terms|tos|privacy|legal|login|log-in|signin|sign-in|signup|sign-up|register|account|profile|settings|search|cart|checkout|blog|news|docs?|careers|press|favicon)/i,
+];
+
+export function isHighConfidenceApiPath(p: string): boolean {
+  return API_PREFIXES.some((pre) => p.startsWith(pre));
+}
+
+/** Extract candidate data-endpoint paths referenced in a JS bundle. */
 export function extractApiPaths(js: string, baseUrl: string): string[] {
   const out = new Set<string>();
+  const keep = (p: string): boolean =>
+    p.length >= 3 && !NON_DATA_PATH.some((re) => re.test(p));
+
   // "/api/..." — absolute path from the app root.
   for (const m of js.matchAll(/["'`](\/[a-zA-Z][a-zA-Z0-9_\-\/]{2,60})["'`]/g)) {
-    const p = m[1];
-    // Skip static assets and route fragments.
-    if (/\.(js|css|svg|png|webp|woff2?|json)$/i.test(p)) continue;
-    if (p.startsWith("/assets/") || p.startsWith("/static/")) continue;
-    if (!p.startsWith("/api/") && !p.startsWith("/v1/") && !p.startsWith("/v2/")) continue;
-    out.add(p);
+    if (keep(m[1])) out.add(m[1]);
   }
   // Template literals: `/api/campaigns/drops/${...}`. The regex above stops at
   // the `$`, so the captured path is the literal prefix — which is exactly what
   // we want. Record it with a marker so expandApiPaths knows to substitute.
   // The prefix may end with a "/" before the "${" — strip it so substitution
   // does not produce a double slash.
-  for (const m of js.matchAll(/[`"'](\/api\/[a-zA-Z0-9_\-\/]{2,50}\/?)\$\{[^}]+\}[`"']/g)) {
-    out.add(m[1].replace(/\/$/, "") + "/:slug");
+  for (const m of js.matchAll(/[`"'](\/[a-zA-Z0-9_\-\/]{2,50}\/?)\$\{[^}]+\}[`"']/g)) {
+    const base = m[1].replace(/\/$/, "");
+    if (keep(base)) out.add(base + "/:slug");
   }
   return [...out];
 }
@@ -498,50 +636,163 @@ export interface BundleScanResult {
 }
 
 /**
+ * Run `fn` over `items` with at most `limit` in flight, preserving input order.
+ *
+ * The scanner's work is fan-out (bundles, API paths), and the fan-out is the
+ * whole cost: eight bundles serially at a 15s timeout each is two minutes of
+ * waiting for work that is completely independent.
+ */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const width = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: width }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/**
+ * Extract JS chunk references from a bundle.
+ *
+ * A Vite/Next/webpack app ships an entry bundle that loads the rest lazily, and
+ * the mint data is often behind a chunk the entry never mentions in the HTML.
+ * Following `<script src>` alone therefore misses exactly the pages that need
+ * the scanner most.
+ *
+ * Only string-literal references are resolved — `import("./chunk-x.js")`,
+ * `new URL("./x.js", import.meta.url)`, and quoted paths ending in .js/.mjs.
+ * Webpack's numeric chunk ids (`__webpack_require__.e("chunk-3")`) cannot be
+ * resolved without the runtime's filename template, so they are skipped rather
+ * than guessed.
+ */
+export function extractChunkUrls(js: string, bundleUrl: string): string[] {
+  const out = new Set<string>();
+  const base = new URL(bundleUrl);
+  const patterns = [
+    // import("./chunk-x.js") / import("/abs/chunk.js")
+    /import\s*\(\s*["']([^"']+\.m?js)["']\s*\)/g,
+    // new URL("./chunk-x.js", import.meta.url)
+    /new\s+URL\s*\(\s*["']([^"']+\.m?js)["']/g,
+    // Quoted path literals: "/_next/static/chunks/x.js", "/assets/index-abc.js"
+    /["']((?:\.{0,2}\/|\/)[a-zA-Z0-9_\-\/.]+\.m?js)["']/g,
+  ];
+  for (const re of patterns) {
+    for (const m of js.matchAll(re)) {
+      try {
+        const u = new URL(m[1], base);
+        // Same-origin only: a CDN bundle is a different host with its own rules.
+        if (u.origin !== base.origin) continue;
+        // Skip the bundle we are already reading.
+        if (u.toString() === base.toString()) continue;
+        out.add(u.toString());
+      } catch {
+        // Malformed reference — skip.
+      }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Fetch a page's bundles breadth-first, following chunk references.
+ *
+ * Returns the concatenated bundle text, or "" when nothing could be read. A
+ * bundle that fails is skipped, not fatal: the next one may carry the data.
+ */
+async function fetchBundlesBfs(
+  entryUrls: string[],
+  deadline: number,
+  maxBundles: number
+): Promise<string> {
+  const userAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  const seen = new Set<string>();
+  const queue = [...entryUrls];
+  const chunks: string[] = [];
+
+  while (queue.length > 0 && seen.size < maxBundles) {
+    const batch = queue.splice(0, Math.min(4, maxBundles - seen.size));
+    const texts = await mapLimit(batch, 4, async (u) => {
+      if (seen.has(u)) return "";
+      seen.add(u);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return "";
+      try {
+        const r = await fetch(u, {
+          headers: { "user-agent": userAgent },
+          signal: AbortSignal.timeout(Math.max(500, remaining)),
+        });
+        return r.ok ? await r.text() : "";
+      } catch {
+        return "";
+      }
+    });
+    for (let i = 0; i < texts.length; i++) {
+      const text = texts[i];
+      if (!text) continue;
+      chunks.push(text);
+      // Chunk references are resolved against the bundle they appear in.
+      for (const ref of extractChunkUrls(text, batch[i])) queue.push(ref);
+    }
+  }
+  return chunks.join("\n");
+}
+
+/**
  * Follow a shell page's JS bundles and their API calls.
  *
- * Order: shell HTML → script bundles → API endpoints discovered in the bundles.
- * Each stage is scanned with the same ranking as the raw HTML.
+ * Order: shell HTML → script bundles (and the chunks they reference) → API
+ * endpoints discovered in the bundles. Each stage is scanned with the same
+ * ranking as the raw HTML.
+ *
+ * `timeoutMs` is an OVERALL budget for the whole scan, not a per-request
+ * timeout: a scan that can take eight bundles × two endpoints × 15s each has no
+ * natural bound, and an unbounded scan is worse than a partial one. Returns null
+ * when the page itself cannot be retrieved — a 403 or a bot wall is "we could
+ * not look", which must never be reported as "this page has no contract".
  */
 export async function scanWithBundles(
   url: string,
   timeoutMs = 15000,
   maxBundles = 8,
-  maxApiCalls = 40
-): Promise<ScanResult & { apiCalls: BundleScanResult["apiCalls"] }> {
+  maxApiCalls = 40,
+  currencySentinels: ReadonlySet<string> = CURRENCY_SENTINELS
+): Promise<(ScanResult & { apiCalls: BundleScanResult["apiCalls"] }) | null> {
   const headers = {
     "user-agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     accept: "text/html,application/xhtml+xml",
   };
 
+  const deadline = Date.now() + timeoutMs;
+
   let html: string;
   try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { candidates: [], totalFound: 0, empty: true, apiCalls: [] };
+    const remaining = deadline - Date.now();
+    const res = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(Math.max(500, remaining)),
+    });
+    if (!res.ok) return null;
     html = await res.text();
   } catch {
-    return { candidates: [], totalFound: 0, empty: true, apiCalls: [] };
+    return null;
   }
 
   // Stage 1: the shell itself.
-  const shell = scanHtml(html);
+  const shell = scanHtml(html, currencySentinels);
 
-  // Stage 2: follow the bundles.
+  // Stage 2: follow the bundles, breadth-first through their chunk references.
   const scriptUrls = extractScriptUrls(html, url).slice(0, maxBundles);
-  let bundleText = "";
-  for (const su of scriptUrls) {
-    try {
-      const r = await fetch(su, {
-        headers: { "user-agent": headers["user-agent"] },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (r.ok) bundleText += "\n" + (await r.text());
-    } catch {
-      // A bundle we cannot read is not fatal — the next one may work.
-    }
-  }
-  const bundleScan = bundleText ? scanHtml(bundleText) : { candidates: [], totalFound: 0, empty: true };
+  const bundleText = await fetchBundlesBfs(scriptUrls, deadline, maxBundles);
+  const bundleScan = bundleText
+    ? scanHtml(bundleText, currencySentinels)
+    : { candidates: [], totalFound: 0, empty: true };
 
   // Stage 3: follow the API endpoints the bundles reference.
   //
@@ -553,50 +804,73 @@ export async function scanWithBundles(
   const base = new URL(url);
   const appRoot = deriveAppRoot(url);
   const apiPaths = expandApiPaths(extractApiPaths(bundleText, url), url)
-    // Concrete slug-substituted paths are far more likely to return this
-    // specific drop's data than a static listing endpoint or a raw
-    // placeholder. Try them first, shortest (most likely route) first.
+    // Known data-endpoint prefixes first — a path we recognise is far more
+    // likely to answer than an arbitrary route the bundle happens to link.
+    // Then concrete slug-substituted paths before raw placeholders, then
+    // shortest (most likely route) first.
     .sort((a, b) => {
+      const aH = isHighConfidenceApiPath(a) ? 1 : 0;
+      const bH = isHighConfidenceApiPath(b) ? 1 : 0;
+      if (aH !== bH) return bH - aH;
       const aC = !a.includes(":slug");
       const bC = !b.includes(":slug");
       if (aC !== bC) return aC ? -1 : 1;
       return a.length - b.length;
     })
     .slice(0, maxApiCalls);
+
   const apiCalls: BundleScanResult["apiCalls"] = [];
   let apiText = "";
-  for (const p of apiPaths) {
-    const candidates = [new URL(p, base).toString()];
-    if (appRoot) {
-      const alt = new URL(appRoot + p.replace(/^\//, ""), base).toString();
-      if (alt !== candidates[0]) candidates.push(alt);
-    }
-    for (const apiUrl of candidates) {
-      try {
-        const r = await fetch(apiUrl, {
-          headers: { "user-agent": headers["user-agent"], accept: "application/json" },
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (!r.ok) {
-          apiCalls.push({ url: apiUrl, ok: false, addressesFound: 0 });
-          continue;
+  // Set as soon as any path yields addresses. Every later call would be spent
+  // on a question already answered — the old code broke only the INNER loop and
+  // kept walking every remaining path.
+  let foundAny = false;
+
+  const workers = Array.from(
+    { length: Math.min(6, apiPaths.length) },
+    async () => {
+      while (apiPaths.length > 0 && !foundAny) {
+        const p = apiPaths.shift()!;
+        const candidates = [new URL(p, base).toString()];
+        if (appRoot) {
+          const alt = new URL(appRoot + p.replace(/^\//, ""), base).toString();
+          if (alt !== candidates[0]) candidates.push(alt);
         }
-        const body = await r.text();
-        const found = extractAddresses(body).length;
-        apiCalls.push({ url: apiUrl, ok: true, addressesFound: found });
-        if (found > 0) {
-          apiText += "\n" + body;
-          break; // This path worked — no need to try the alternative.
+        for (const apiUrl of candidates) {
+          if (foundAny) return;
+          try {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) return;
+            const r = await fetch(apiUrl, {
+              headers: { "user-agent": headers["user-agent"], accept: "application/json" },
+              signal: AbortSignal.timeout(Math.max(500, remaining)),
+            });
+            if (!r.ok) {
+              apiCalls.push({ url: apiUrl, ok: false, addressesFound: 0 });
+              continue;
+            }
+            const body = await r.text();
+            const found = extractAddresses(body).length;
+            apiCalls.push({ url: apiUrl, ok: true, addressesFound: found });
+            if (found > 0) {
+              apiText += "\n" + body;
+              foundAny = true;
+              return;
+            }
+          } catch {
+            apiCalls.push({ url: apiUrl, ok: false, addressesFound: 0 });
+          }
         }
-      } catch {
-        apiCalls.push({ url: apiUrl, ok: false, addressesFound: 0 });
       }
     }
-  }
-  const apiScan = apiText ? scanHtml(apiText) : { candidates: [], totalFound: 0, empty: true };
+  );
+  await Promise.all(workers);
 
-  // Merge and re-rank. The API is the most authoritative source, so its hits
-  // are scored as mint-button strength — the page itself links them to minting.
+  const apiScan = apiText
+    ? scanHtml(apiText, currencySentinels)
+    : { candidates: [], totalFound: 0, empty: true };
+
+  // Merge and re-rank.
   const merged = mergeScans([shell, bundleScan, apiScan]);
   return { ...merged, apiCalls };
 }
@@ -643,7 +917,8 @@ function sourceRank(s: AddressCandidate["source"]): number {
  */
 export async function scanUrl(
   url: string,
-  timeoutMs = 15000
+  timeoutMs = 15000,
+  currencySentinels: ReadonlySet<string> = CURRENCY_SENTINELS
 ): Promise<ScanResult | null> {
   let res: Response;
   try {
@@ -670,5 +945,5 @@ export async function scanUrl(
 
   // A bot wall or consent page is still a 200 with HTML. If it contains no
   // addresses we return empty — which is honest, unlike inventing one.
-  return scanHtml(html);
+  return scanHtml(html, currencySentinels);
 }

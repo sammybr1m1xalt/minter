@@ -23,8 +23,7 @@ const PUBLIC_ABI = [
   "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",
   "function getPublicDrop(address nftContract) view returns (tuple(uint80 mintPrice, uint48 startTime, uint48 endTime, uint16 maxTotalMintableByWallet, uint16 feeBps, bool restrictFeeRecipients))",
   "function getAllowedFeeRecipients(address nftContract) view returns (address[])",
-  // Mint mechanisms — ported from nft-minter-bot/src/seadrop.js
-  // getMintMechanisms(). These tell us whether a drop is signed or token-gated
+  // Mint mechanisms — these tell us whether a drop is signed or token-gated
   // rather than public, so a wallet that is not on the allowlist gets an
   // explanation instead of an on-chain revert.
   "function getSigners(address nftContract) view returns (address[])",
@@ -132,8 +131,7 @@ export interface MintMechanisms {
 /**
  * Read which non-public mint mechanisms a drop uses.
  *
- * Ported from nft-minter-bot/src/seadrop.js getMintMechanisms(). The original
- * used this to explain WHY a public mint would fail: when a drop has signers or
+ * Used to explain WHY a public mint would fail: when a drop has signers or
  * token-gated tokens, a wallet that is not on the allowlist cannot mint publicly
  * at all, and the failure is better reported as a reason than discovered as an
  * on-chain revert.

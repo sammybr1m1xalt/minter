@@ -12,7 +12,7 @@ import { closePrompts } from "./prompt";
 import { parseWhen, isValidWhen } from "./schedule";
 import { parsePriceSpec, extractMaxPriceSpec } from "./price-protection";
 import { parseTarget, resolveTarget } from "./target-resolver";
-import { destroyProviderCache } from "./chains";
+import { CHAINS, destroyProviderCache } from "./chains";
 
 // ── Provider cleanup ────────────────────────────────────────────────────────
 // ethers keeps a polling timer alive on every JsonRpcProvider. A provider that
@@ -26,7 +26,11 @@ process.on("exit", () => {
   destroyProviderCache();
 });
 
-const HELP = `\nNFT Mint Sniper\n\n  Mints public SeaDrop stages AND FCFS/allowlist/OVR stages, plus any\n  contract with a discoverable mint function (ERC721/ERC1155, Manifold,\n  Zora, Scatter, or a bespoke mint).\n  Public mints need no OpenSea account; FCFS stages fetch a signed\n  payload from OpenSea (free API key, auto-managed).\n\nUsage\n  npm start                          run the interactive wizard\n  npm start -- --fcfs <target>       run the FCFS/allowlist/OVR branch directly\n  npm start -- --eligibility <ca>   poll eligibility + gas for a contract (no mint)\n  npm start -- --help                show this message\n\nTarget\n  An OpenSea / Scatter / Zora / Manifold link, a collection slug, or a contract\n  address. Chain aliases work: "0xabc… on base", "slug matic", "slug arb".\n\nOptions\n  --at <time>           ISO 8601, unix seconds/ms, "in 5m", "30s", or "HH:MM"\n  --max-price <price>   max total price in ETH, "free", "0.05/unit", "0.05total",\n                        or "any" (no cap)\n  --wallets <spec>      all | N | 1,3,4  (default: single primary wallet)\n  --chain <key>         ethereum | base | polygon | arbitrum | optimism | ...\n  --quantity <n>        NFTs per wallet (default 1)\n\nExamples\n  npm start -- --fcfs de-bots\n  npm start -- --fcfs de-bots --at "in 5m" --max-price 0.01\n  npm start -- --eligibility 0x8d80efb61341e4b8459fbb52b213d5c25a1af179\n  npm start -- --fcfs 0xabc… on base --quantity 3 --wallets all\n\nEverything not passed as a flag is asked interactively: keys, chain, quantity,\nNFT link, RPC, gas and timing. Optional defaults can be set in .env.\n`;
+// Derived from the chain table so the help text can never advertise a chain the
+// tool cannot serve (it previously listed polygon/arbitrum/optimism).
+const SUPPORTED_CHAINS = CHAINS.map((c) => c.key).join(" | ");
+
+const HELP = `\nNFT Mint Sniper\n\n  Mints public SeaDrop stages AND FCFS/allowlist/OVR stages, plus any\n  contract with a discoverable mint function (ERC721/ERC1155, Manifold,\n  Zora, Scatter, or a bespoke mint).\n  Public mints need no OpenSea account; FCFS stages fetch a signed\n  payload from OpenSea (free API key, auto-managed).\n\nUsage\n  npm start                          run the interactive wizard\n  npm start -- --fcfs <target>       run the FCFS/allowlist/OVR branch directly\n  npm start -- --eligibility <ca>   poll eligibility + gas for a contract (no mint)\n  npm start -- --help                show this message\n\nTarget\n  An OpenSea / Scatter / Zora / Manifold link, a collection slug, or a contract\n  address. Chain aliases work: "0xabc… on base", "slug on arc", "slug eth".\n\nOptions\n  --at <time>           ISO 8601, unix seconds/ms, "in 5m", "30s", or "HH:MM"\n                        (HH:MM is read in IST, matching the times the wizard prints)\n  --when-open           poll the chain and fire the moment the stage opens\n  --max-price <price>   max total price in ETH, "free", "0.05/unit", "0.05total",\n                        or "any" (no cap)\n  --wallets <spec>      all | N | 1,3,4  (default: single primary wallet)\n  --chain <key>         ${SUPPORTED_CHAINS}\n  --quantity <n>        NFTs per wallet (default 1)\n\n  A target may also be given positionally (npm start -- <target>) when it is not\n  passed to --fcfs.\n\nExamples\n  npm start -- --fcfs de-bots\n  npm start -- --fcfs de-bots --at "in 5m" --max-price 0.01\n  npm start -- --eligibility 0x8d80efb61341e4b8459fbb52b213d5c25a1af179\n  npm start -- --fcfs 0xabc… on base --quantity 3 --wallets all\n\nEverything not passed as a flag is asked interactively: keys, chain, quantity,\nNFT link, RPC, gas and timing. Optional defaults can be set in .env.\n`;
 
 interface CliFlags {
   fcfs: string | null;
@@ -53,20 +57,33 @@ function parseFlags(argv: string[]): CliFlags {
     rest: [],
   };
 
+  /** Read the value that must follow a value-taking flag.
+   *  Previously a trailing flag read `undefined` and became null, so
+   *  `minter --eligibility` silently started the interactive wizard instead of
+   *  reporting the missing argument. */
+  const value = (flag: string, raw: string | undefined): string => {
+    if (raw === undefined || raw === "") throw new Error(`${flag} requires a value.`);
+    return raw;
+  };
+
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--fcfs") out.fcfs = argv[++i] ?? null;
-    else if (a === "--eligibility") out.eligibility = argv[++i] ?? null;
-    else if (a === "--at") out.at = argv[++i] ?? null;
+    if (a === "--fcfs") out.fcfs = value(a, argv[++i]);
+    else if (a === "--eligibility") out.eligibility = value(a, argv[++i]);
+    else if (a === "--at") out.at = value(a, argv[++i]);
     else if (a === "--when-open" || a === "--open") out.whenOpen = true;
-    else if (a === "--max-price" || a === "--maxprice" || a === "-p") out.maxPrice = argv[++i] ?? null;
+    else if (a === "--max-price" || a === "--maxprice" || a === "-p") out.maxPrice = value(a, argv[++i]);
     else if (a.startsWith("--max-price=") || a.startsWith("--maxprice=")) {
-      out.maxPrice = a.split("=")[1];
-    } else if (a === "--wallets" || a === "-w") out.wallets = argv[++i] ?? null;
-    else if (a === "--chain") out.chain = argv[++i] ?? null;
+      out.maxPrice = value("--max-price", a.split("=").slice(1).join("="));
+    } else if (a === "--wallets" || a === "-w") out.wallets = value(a, argv[++i]);
+    else if (a === "--chain") out.chain = value(a, argv[++i]);
     else if (a === "--quantity" || a === "-q") {
-      const n = Number(argv[++i]);
-      out.quantity = Number.isInteger(n) && n > 0 ? n : null;
+      const raw = value(a, argv[++i]);
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1) {
+        throw new Error(`${a} must be a positive integer, got "${raw}".`);
+      }
+      out.quantity = n;
     } else out.rest.push(a);
   }
   return out;
@@ -98,7 +115,13 @@ async function main(): Promise<void> {
     return;
   }
 
-  const flags = parseFlags(args);
+  let flags: CliFlags;
+  try {
+    flags = parseFlags(args);
+  } catch (e: any) {
+    console.error(chalk.red(`\n❌ ${e.message}\n`));
+    process.exit(1);
+  }
 
   const err = validateFlags(flags);
   if (err) {
@@ -153,7 +176,7 @@ async function main(): Promise<void> {
     log.field("api_key_set", !!(process.env.OPENSEA_API_KEY));
     try {
       log.info("Calling runEligibilityCheck...");
-      await runEligibilityCheck(log, targetArg);
+      await runEligibilityCheck(log, targetArg, { chain: flags.chain });
       log.info("Eligibility check completed");
       log.end();
       closePrompts();

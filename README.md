@@ -1,19 +1,21 @@
 # NFT Mint Sniper
 
-A command-line tool for sniping NFT mints on OpenSea's SeaDrop, across
-Ethereum, Base and Robinhood Chain.
+A command-line tool for sniping NFT mints. It targets OpenSea's SeaDrop across
+five chains, and also mints **any** contract with a discoverable mint function —
+ERC721/ERC1155, Manifold, Zora, Scatter, or a bespoke `mint()`.
 
-Public stages are built entirely from on-chain data — price, fee recipient
-and per-wallet limit all come straight from the SeaDrop contract. That means:
+Two ways to mint:
 
-- **No OpenSea account, login, or access token for public stages.**
-- **No API rate limits** to lose a public mint to.
-- **Faster.** Every transaction is signed and serialised *before* the stage opens,
-  so at the exact start time the only work left is writing bytes to the network.
+- **Public stages** are built entirely from on-chain data — price, fee recipient
+  and per-wallet limit all come straight from the SeaDrop contract. That means
+  **no OpenSea account, login, or access token**, and **no API rate limits** to
+  lose a public mint to.
+- **Signed / allowlist / OVR / FCFS stages** need a free OpenSea API key to fetch
+  a per-wallet signed mint payload. The signing itself is done locally; the API
+  only supplies the signature bytes.
 
-Signed / allowlist / OVR stages need a free OpenSea API key to fetch a
-per-wallet signed mint payload (mintSignature + mintData). The signing itself
-is done locally — the API only provides the signature bytes.
+Every transaction is signed and serialised **before** the stage opens, so at the
+exact start time the only work left is writing bytes to the network.
 
 Multi-wallet: paste as many keys as you like and they all fire in parallel.
 
@@ -21,25 +23,20 @@ Multi-wallet: paste as many keys as you like and they all fire in parallel.
 
 ## Requirements
 
-- **Node.js 18 or newer** — check with `node --version`. Get it from
-  [nodejs.org](https://nodejs.org) if you don't have it.
-- A wallet with some ETH on the chain you're minting on.
+- **Node.js 18 or newer** — check with `node --version`.
+- A wallet with the native token of the chain you're minting on
+  (ETH on Ethereum/Base/Robinhood/Soneium, USDC on Arc).
 
 ---
 
 ## Step 1 — Install
 
-Run these **one line at a time**, pressing Enter after each:
-
 ```bash
-git clone https://github.com/morsyxbt/nft-public-mint.git
-cd nft-public-mint
+git clone https://github.com/sammybr1m1xalt/minter.git
+cd minter
 npm install
 npm run build
 ```
-
-Before running `npm install`, check your prompt ends in `nft-public-mint` — if the
-`cd` didn't take, everything after it fails.
 
 Then confirm the build worked:
 
@@ -50,12 +47,8 @@ npm start -- --help
 <details>
 <summary>Install errors</summary>
 
-**`Set-Location : A positional parameter cannot be found`** (Windows PowerShell)
-Two commands got pasted onto one line — you'll see something like
-`cd nft-public-mintnpm install`. Run each line separately.
-
 **`Could not read package.json` / `Missing script: build`**
-You're in the wrong folder. Run `cd nft-public-mint` first.
+You're in the wrong folder. Run `cd minter` first.
 
 **`npm` or `git` is not recognised**
 Install [Node.js 18+](https://nodejs.org) and [Git](https://git-scm.com/downloads),
@@ -63,31 +56,7 @@ then reopen your terminal.
 
 </details>
 
-## Post-mint digest tracker
-
-`scripts/run_digest_tracker.sh` reads `debot-minted-out.csv` per `batchId`, queries the SeaDrop/OpenSea public drop events for each batch, deduplicates/searches for known digests to recover transaction hashes, fetches the mint events from each transaction, and writes one accumulated `.digesttracker.data` line per (chainId, digest) minting event. Output is grouped by `batchId` with total counts across all batches and all installs.
-
-The script installs its own dependencies (`jq` for JSON parsing; `axios` via npm as a fallback HTTP client) and auto-resumes on interrupted runs. Run it after any minting session — public FCFS, allowlist, or OVR — to get per-endpoint latency, acceptance/rejection, receipt status, and gas info for every mint.
-
-```bash
-bash scripts/run_digest_tracker.sh
-```
-
-See the script header for the full invocation and output format.
-
-## Step 2 — Configure (optional but recommended)
-
-| Command | What it does |
-|---|---|
-| `npm start` | Interactive wizard — keys, chain, quantity, NFT link, RPC, gas, timing |
-| `npm start -- --help` | Print all CLI flags |
-| `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
-| `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases and whether your wallet can target each |
-| `node dist/index.js --help` | Same as above, bypassing npm |
-
-The `--fcfs` and `--eligibility` flags target signed-mint, allowlist, and OVR phases in addition to public stages. `--fcfs` runs the full sniper (pre-fetch per wallet, fire at T-0). `--eligibility` is read-only and prints a report so you can inspect a collection before committing keys.
-
-For the digest tracker (post-mint logging across batches), see [`scripts/run_digest_tracker.sh`](scripts/run_digest_tracker.sh).
+---
 
 ## Step 2 — Configure (optional but recommended)
 
@@ -95,7 +64,7 @@ For the digest tracker (post-mint logging across batches), see [`scripts/run_dig
 cp .env.example .env
 ```
 
-Open `.env` and add a private RPC URL for the chain you'll mint on, e.g.:
+Open `.env` and add a private RPC URL for the chain you'll mint on:
 
 ```
 RPC_URL_BASE=https://base-mainnet.g.alchemy.com/v2/YOUR_KEY
@@ -109,37 +78,100 @@ nodes.
 > **Never put private keys in `.env`.** You paste them into the CLI at run time.
 > They're held in memory for that run only and never written to disk.
 
+### Every `.env` key
+
+| Key | What it does | Default |
+|---|---|---|
+| `RPC_URL_ETHEREUM` / `RPC_URL_BASE` / `RPC_URL_ROBINHOOD` / `RPC_URL_ARC` / `RPC_URL_SONEIUM` | Private RPC for that chain. Overrides the built-in public endpoints. | _(empty — public nodes)_ |
+| `EXTRA_RPC_URLS` | Comma-separated extra endpoints, any chain. | _(empty)_ |
+| `CHAIN` | Chain highlighted in the wizard menu, and the default for the FCFS branch. | `base` |
+| `MAX_FEE_PER_GAS` | Max-fee ceiling, in gwei. Pre-filled at the prompt. | `2` |
+| `MAX_PRIORITY_FEE` | Tip, in gwei. Pre-filled at the prompt. | `0.05` |
+| `GAS_LIMIT` | Gas limit per mint transaction. | `250000` |
+| `OPENSEA_API_KEY` | Your own OpenSea key. Optional — see below. | _(empty)_ |
+| `OPENSEA_SESSION_DIR` | Where SIWE session cookies are cached. | `.minter-session/` inside the project |
+| `RPC_TIMEOUT_MS` | Per-request RPC timeout. | `15000` |
+| `ETHERSCAN_API_KEY` | Needed for ABI lookups on chains Sourcify doesn't cover. | _(empty)_ |
+| `OPENSEA_KEY_SYNC` | Set to `0` to stop the tool mirroring its auto-minted key into `.env`. | `1` |
+| `PRIVATE_KEY` | A single wallet key, for headless runs. | _(empty)_ |
+| `PRIVATE_KEYS` | Comma-separated wallet keys, for headless runs. | _(empty)_ |
+| `WALLETS_FILE` | Path to a JSON file of wallet keys, for headless runs. | `wallets.json` |
+
+**Headless runs.** If `PRIVATE_KEY`, `PRIVATE_KEYS` or `WALLETS_FILE` supplies
+keys, the wizard loads them instead of prompting — which is what makes an
+unattended `npm start -- --fcfs <slug> --at "in 5m"` possible. Keys from the
+environment are still held in memory only and never written to disk.
+
+**You do not need an OpenSea API key.** A free key is auto-minted at runtime and
+cached to disk in `.minter-cache/`, so the FCFS path works with a blank
+`OPENSEA_API_KEY`. Keys older than 3 days are replaced automatically. Paste one
+only if you want to manage your own.
+
+---
+
 ## Step 3 — Run it
 
 ```bash
 npm start
 ```
 
-The wizard asks you seven things:
+The wizard walks you through everything. Nothing is broadcast until you
+explicitly confirm.
+
+### The wizard, step by step
 
 | Step | What it wants |
 |---|---|
 | **1. Private keys** | Paste one per line, hidden as you type. Blank line to finish. Each key is confirmed back to you by its wallet address, so you can check you pasted the right one. |
-| **2. Chain** | Ethereum, Base, or Robinhood. |
+| **2. Chain** | Ethereum, Base, Robinhood Chain, Arc, or Soneium. |
 | **3. Quantity** | How many NFTs **per wallet**. |
-| **4. NFT link** | An OpenSea collection link, an item link, a slug, or the raw `0x` contract address. A contract address or item link always works with no API key; a collection slug needs a lookup that usually works unauthenticated. |
-| **5. RPC** | Paste a full URL, or just your Alchemy key and it expands automatically. Blank uses `.env`, or public nodes. |
-| **6. Gas** | Ceiling and tip. The live base fee is shown right above the prompt. |
-| **7. Timing** | Wait for the stage to open, or fire now if it's already live. |
+| **4. NFT link** | An OpenSea / Scatter / Zora / Manifold link, a collection slug, or a raw `0x` contract address. Chain aliases work too: `0xabc… on base`, `slug on arc`, `slug eth`. A contract address or item link always works with no API key. |
+| **5. RPC** | Paste a full URL, or just your Alchemy key and it expands automatically. Blank uses `.env`, then public nodes. Every endpoint is checked for its chain ID — any on the wrong chain is dropped, not blasted at. |
+| **6. API key + slug** | Resolves a contract address to its OpenSea slug and obtains a working API key. |
+| **7. SIWE sessions** | Warms a session for **every** wallet in parallel, so no wallet is still authenticating at T-0. |
+| **8. Phase discovery** | Finds every active phase on the collection. If OpenSea knows nothing about the contract, the universal adapter probes the bytecode for a mint function instead. |
+| **8a. Gas** | Ceiling and tip, with the live base fee shown above the prompt. |
+| **9–10. Eligibility** | Probes every wallet against every phase and prints a matrix. |
+| **11. Wallet + phase** | Pick which wallets and which phase to fire. |
+| **12. Timing** | Wait for the stage to open, or fire now if it's already live. |
+| **12b. Price protection** | Optional cap — see below. |
+| **14. Balances** | Shows each wallet's balance and refuses to fire if none can afford the upfront gas reservation. |
+| **15. Confirm** | The summary. Type `y` to proceed. |
+| **15b. Sell-after-mint** | Optionally plan an automatic sale of the minted tokens. |
+| **16. Execute** | Pre-signs, holds, and fires at T-0. |
+| **17. Sell** | If you opted in, sells each wallet's tokens into the best OpenSea offer. |
 
-Then it shows a summary and asks `Fire?`. **Nothing is sent until you type `y`.**
+---
 
-## Step 4 — Set it and walk away
+## CLI reference
 
-If the drop opens later, choose **"Wait for the stage"**. It pre-signs everything,
-holds, and fires at the exact start time — no supervision needed. The `Fire?`
-confirmation comes *before* the wait, so there's no second prompt at mint time.
+| Command | What it does |
+|---|---|
+| `npm start` | Interactive wizard — keys, chain, quantity, NFT link, RPC, gas, timing |
+| `npm start -- --help` | Print all CLI flags |
+| `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
+| `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases and whether your wallet can target each |
 
-Two things to get right if you're leaving it running:
+### Flags
 
-- **Stop your computer from sleeping.** A sleeping machine suspends the process
-  and the countdown freezes.
-- **Leave the terminal window open.** Closing it kills the run.
+| Flag | Meaning |
+|---|---|
+| `--at <time>` | ISO 8601, unix seconds/ms, `"in 5m"`, `"30s"`, or `"HH:MM"` (HH:MM is read in IST, matching the times the wizard prints) |
+| `--when-open` | Poll the chain and fire the moment the stage opens |
+| `--max-price <price>` | Max total price in ETH, `"free"`, `"0.05/unit"`, `"0.05total"`, or `"any"` (no cap) |
+| `--wallets <spec>` | `all` \| `N` \| `1,3,4` — default is the single primary wallet |
+| `--chain <key>` | `ethereum` \| `base` \| `robinhood` \| `arc` \| `soneium` |
+| `--quantity <n>` | NFTs per wallet (default 1) |
+
+A target may also be given positionally (`npm start -- <target>`) when it is not
+passed to `--fcfs`.
+
+```bash
+npm start -- --fcfs de-bots
+npm start -- --fcfs de-bots --at "in 5m" --max-price 0.01
+npm start -- --eligibility 0x8d80efb61341e4b8459fbb52b213d5c25a1af179
+npm start -- --fcfs 0xabc… on base --quantity 3 --wallets all
+```
 
 ---
 
@@ -167,6 +199,176 @@ A SeaDrop mint uses roughly **135,000 gas** for quantity 1.
 
 ---
 
+## Sell-after-mint
+
+Optional, offered at step 15b. After a successful mint, the tool sells the minted
+tokens into the best OpenSea offer automatically.
+
+**The design, and why it's shaped that way:**
+
+- **The plan is made before the mint, and reads no offers.** An offer book read
+  now is stale by T-0. Only the gas cost is quoted, for all three gas modes, and
+  a per-token cost floor is shown: `mint unit price + estimated sell gas`.
+- **Offers are re-read after the mint, per wallet, before every single token.**
+- **A sale never happens below cost.** Net proceeds per token must exceed the
+  cost floor, or the token is skipped. The guard is applied twice — once on the
+  listing order and again on the full fulfillment order.
+- **Wallets are sold sequentially, in order.** Parallel wallets race into the
+  same criteria offer; `remaining_quantity` means one fills and the others revert.
+- **A failed mint sells nothing.** No sale and no token approval is sent for a
+  wallet whose mint did not succeed.
+
+Gas modes are rational multipliers of the live base fee and tip:
+`slow` = 1.1×base + 1×tip, `fast` = 1.5×base + 2×tip, `ultra` = 2×base + 4×tip.
+
+**Not yet verified:** the broadcast path. Selling needs a funded wallet holding a
+freshly minted token with a live offer, so the sign-and-send leg has never been
+executed. Everything up to and including the encoded transaction is verified
+against the live API.
+
+---
+
+## Supported chains
+
+| Chain | Chain ID | Native token | Explorer |
+|---|---|---|---|
+| Ethereum | 1 | ETH | etherscan.io |
+| Base | 8453 | ETH | basescan.org |
+| Robinhood Chain | 4663 | ETH | robinhoodchain.blockscout.com |
+| Arc | 5042 | USDC | explorer.arc.io |
+| Soneium | 1868 | ETH | soneium.blockscout.com |
+
+---
+
+## Adding a chain
+
+Everything chain-specific lives in [`src/chains.ts`](src/chains.ts), so a new
+network is normally one entry plus one mapping. There is no chain logic scattered
+elsewhere.
+
+### 1. Add the profile to `CHAINS`
+
+```ts
+{
+  key: "mychain",            // must match the OpenSea GQL `chain` field, the
+                             // `--chain` value, and the `CHAIN` env value
+  chainId: 12345,
+  name: "My Chain",
+  explorer: "https://explorer.mychain.io",   // NO trailing slash
+  nativeSymbol: "ETH",       // used for display and the sell cost floor
+  rpc: {
+    alchemyHost: "mychain-mainnet.g.alchemy.com",  // documentation only
+    public: [
+      "https://rpc.mychain.io",
+      // A send-only endpoint (rejects eth_chainId/eth_call) is kept for
+      // blasting and never read from — mark it with a comment.
+    ],
+  },
+},
+```
+
+### 2. Add it to `OS_CHAIN` if OpenSea spells it differently
+
+`OS_CHAIN` maps your internal key to OpenSea's chain identifier. Most chains are
+identity mappings and can be omitted; add one only when they differ (for example
+`"zora-network": "zora"`). Unknown keys pass through unchanged.
+
+### 3. Add `RPC_URL_<KEY>` to `.env.example`
+
+Uppercase the key: `RPC_URL_MYCHAIN=`. Add it to your own `.env` too.
+
+### 4. Add currency sentinels to the site scanner (optional)
+
+[`src/site-scanner.ts`](src/site-scanner.ts) keeps per-chain currency addresses in
+`NATIVE_TOKEN_SENTINELS` and `WRAPPED_NATIVE_TOKENS`, so a marketplace's own
+currency address is never mistaken for a collection contract. Add an entry if
+your chain's native token has a contract of its own (as Arc's USDC does) or if it
+has a wrapped native token.
+
+### Things that will not work automatically
+
+- **OpenSea must list the chain.** Check `GET /api/v2/chains`. If OpenSea does
+  not serve drops there, the FCFS path has nothing to fetch. Adding the chain
+  locally does not make OpenSea support it.
+- **The SeaDrop singleton must be deployed.** Public mints read price, fee
+  recipient and per-wallet limit from the contract itself; if the canonical
+  SeaDrop address has no code on your chain, there is nothing to read.
+- **ABI lookups.** Sourcify is tried first (no key, covers most verified
+  contracts) and Etherscan V2 second (needs `ETHERSCAN_API_KEY`). Sourcify uses
+  the chain ID directly in its URL, so it needs no per-chain map. Etherscan V2
+  does not support every chain — Soneium (1868) is one it rejects.
+- **Explorer links** fall back to Basescan for unknown chains rather than
+  breaking, so a missing entry degrades gracefully but points at the wrong site.
+
+### Verifying a new chain before you rely on it
+
+```bash
+# Does OpenSea list it?
+curl -H "X-API-KEY: $OPENSEA_API_KEY" https://api.opensea.io/api/v2/chains
+
+# Is the canonical SeaDrop singleton deployed?
+#   SeaDrop: 0x00005EA00Ac477B1030CE78506496e8C2dE24bf5
+cast code 0x00005EA00Ac477B1030CE78506496e8C2dE24bf5 --rpc-url <your-rpc>
+
+# Do the public endpoints answer eth_chainId?
+curl -X POST <your-rpc> -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+```
+
+---
+
+## Architecture
+
+39 TypeScript modules, ~22k lines. The important ones:
+
+| Module | Role |
+|---|---|
+| [`src/index.ts`](src/index.ts) | CLI entry — flag parsing, the three branches, provider cleanup |
+| [`src/chains.ts`](src/chains.ts) | Chain registry, provider cache, OpenSea chain mapping |
+| [`src/wizard.ts`](src/wizard.ts) | Interactive wizard (steps 1–17) |
+| [`src/wizard-fcfs-new.ts`](src/wizard-fcfs-new.ts) | `--fcfs` branch and `--eligibility` |
+| [`src/wizard-helpers.ts`](src/wizard-helpers.ts) | Gas prompt, balances, confirm, timing, sell plan/execution |
+| [`src/fcfs-mint.ts`](src/fcfs-mint.ts) | The T-0 fire coordinator for signed phases |
+| [`src/fcfs-drops.ts`](src/fcfs-drops.ts) | Drop/phase discovery across GQL, REST and on-chain |
+| [`src/local-mint.ts`](src/local-mint.ts) | Public-mint snipe — builds calldata on-chain, no OpenSea |
+| [`src/universal-mint.ts`](src/universal-mint.ts) | ABI-driven mint adapter for non-SeaDrop contracts |
+| [`src/abi-mint.ts`](src/abi-mint.ts) | ABI fetching (Sourcify, then Etherscan V2) |
+| [`src/mint-generic.ts`](src/mint-generic.ts) | Generic calldata builder for discovered mint functions |
+| [`src/target-resolver.ts`](src/target-resolver.ts) | Turns a link/slug/address into a chain + contract |
+| [`src/site-scanner.ts`](src/site-scanner.ts) | Generic any-site scanner — finds a site's API calls and contract addresses |
+| [`src/contract-verify.ts`](src/contract-verify.ts) | The gate that makes the scanner safe — checks a candidate really is a contract |
+| [`src/sell-after-mint.ts`](src/sell-after-mint.ts) | Offer ranking, net-proceeds guard, Seaport calldata, sale orchestration |
+| [`src/seaport-abi.ts`](src/seaport-abi.ts) | Verified Seaport 1.5 / 1.6 ABIs (from Sourcify) |
+| [`src/opensea-key.ts`](src/opensea-key.ts) | API key pool — auto-mint, probe, rank, 7-day refresh |
+| [`src/opensea-session.ts`](src/opensea-session.ts) | SIWE session cookies per wallet |
+| [`src/opensea-gql.ts`](src/opensea-gql.ts) | GraphQL queries and response parsing |
+| [`src/rpc-resolver.ts`](src/rpc-resolver.ts) | Endpoint discovery, chain-ID verification, blast-set planning |
+| [`src/rpc-blast.ts`](src/rpc-blast.ts) | Broadcasting a signed tx to many endpoints at once |
+| [`src/auto-gas.ts`](src/auto-gas.ts) | Gas estimation with a hard timeout |
+| [`src/deadline.ts`](src/deadline.ts) | `withDeadline` / `withDeadlineOrThrow` — the RPC timeout backstop |
+| [`src/simulate.ts`](src/simulate.ts) | Pre-flight eth_call simulation |
+| [`src/allowlist-onchain.ts`](src/allowlist-onchain.ts) | Reading allowlist state from chain |
+| [`src/scatter.ts`](src/scatter.ts) | Scatter.art collections and mint calldata |
+| [`src/price-protection.ts`](src/price-protection.ts) | Price-cap parsing and enforcement |
+| [`src/logger.ts`](src/logger.ts) | Per-run log files in `.minter-logs/` |
+
+### The two mint paths
+
+**Public phase** — `local-mint.ts`. Price, fee recipient and per-wallet limit are
+read from the SeaDrop contract on-chain. Calldata is built locally. No OpenSea
+credential is involved at any point.
+
+**Signed phase** — `fcfs-mint.ts`. OpenSea returns a per-wallet
+`mintSignature` + `mintData` pair; the transaction is assembled and signed
+locally. A free API key is auto-minted if you don't supply one.
+
+**Universal fallback** — `universal-mint.ts` + `mint-generic.ts`. If OpenSea knows
+nothing about the contract, the bytecode is probed for a known mint selector
+(ERC721/ERC1155, Manifold, Zora, Scatter, bespoke) and calldata is built from the
+verified ABI.
+
+---
+
 ## What it protects you from
 
 Each of these is checked *before* anything is broadcast:
@@ -178,24 +380,17 @@ Each of these is checked *before* anything is broadcast:
 - **Firing before the stage opens** — SeaDrop reverts with `NotActive` and burns
   gas. "Fire now" isn't offered when the stage opens later.
 - **Wrong network** — every RPC is checked for its chain ID; any on the wrong
-  chain is dropped rather than blasted at.
+  chain is dropped rather than blasted at. A target that resolves to a different
+  chain than the one you picked switches chains and re-resolves endpoints instead
+  of silently minting on the wrong one.
 - **Quantity above the per-wallet cap** — warned before you fire.
+- **A stalled RPC** — every network call is bounded; ethers' own 5-minute
+  `FetchRequest` default is not allowed to hold a mint hostage.
+- **A mint that never confirmed** — a missing receipt is reported as `UNKNOWN`,
+  not `SUCCESS`. A wallet that did not mint is never treated as having minted.
 
 If a transaction is rejected by every endpoint, it says so plainly instead of
 waiting for a receipt that will never exist.
-
----
-
-## Supported chains
-
-| Chain | Chain ID | Explorer |
-|---|---|---|
-| Ethereum | 1 | etherscan.io |
-| Base | 8453 | basescan.org |
-| Robinhood Chain | 4663 | robinhoodchain.blockscout.com |
-
-To add another, append one entry to [`src/chains.ts`](src/chains.ts) — no other
-code changes needed.
 
 ---
 
@@ -204,18 +399,64 @@ code changes needed.
 - Private keys are pasted at run time, kept in memory, and **never written to
   disk or transmitted anywhere** except as a locally-signed transaction.
 - `.env`, `wallets/` and `*.key` are all git-ignored.
+- Every piece of runtime state lives inside the project and is git-ignored:
+  `.minter-cache/` (API key pool), `.minter-session/` (SIWE sessions) and
+  `.minter-logs/` (per-run logs). All three are created automatically on first
+  use — nothing to pre-create.
 - Use dedicated hot wallets funded with only what you intend to spend.
 - Read [`src/local-mint.ts`](src/local-mint.ts) if you want to verify exactly what
-  gets signed and sent — it's about 150 lines.
+  gets signed and sent.
 
 ---
 
-## Allowlist / FCFS mints
+## Known issues
 
-Not supported here, and it isn't an oversight. An allowlist stage uses SeaDrop's
-`mintSigned()`, which needs a signature that OpenSea generates per wallet — that
-genuinely requires an authenticated OpenSea session. There's no way to build it
-from on-chain data, which is the whole premise of this tool.
+None of these block a mint.
+
+1. **`--fcfs` lists public phases as targetable.** `fetchSignedPayload` only
+   returns data for signed stages, so picking a public phase in that branch ends
+   at "Could not fetch signed mint data for this phase". The public phase is
+   meant to be run through the wizard, not `--fcfs`.
+2. **Intermittent empty discovery.** `--fcfs <slug>` has occasionally returned
+   "No active phases found" and fallen back to on-chain, finding only the public
+   stage, while a direct probe found more. Not reproducible since; the leading
+   suspect is transient GraphQL throttling.
+3. **Sell-after-mint broadcast is unverified.** See above.
+4. **Soneium ABI lookups depend on Sourcify alone** — Etherscan V2 rejects chain
+   ID 1868.
+5. **Stale audit documents.** `AUDIT.txt`, `AUDIT_FINDINGS.txt` and
+   `OPENSEA_API_LAYOUT.txt` are git-tracked and describe an older tree.
+   `AUDIT_FINDINGS.txt` is the current one.
+6. **No test suite is committed.** The test harness and fixtures were removed;
+   `npm test` is no longer defined in `package.json`. Typecheck
+   (`npm run typecheck`) and build (`npm run build`) are the remaining gates.
+
+---
+
+## Troubleshooting
+
+**`No usable RPC endpoint for <chain>`**
+Every candidate was on the wrong chain or unreachable. Paste a working URL at the
+prompt, or set `RPC_URL_<CHAIN>` in `.env`.
+
+**`No phases found`**
+OpenSea isn't hosting a drop for that contract. The wizard then tries the
+universal adapter; if that also fails, the contract simply has no discoverable
+mint function.
+
+**`Account can not perform trading operations`**
+The sell path needs the fulfiller to own a token covered by the offer. It's a
+OpenSea-side restriction, not a bug.
+
+**The process hangs after printing its final line**
+Fixed — a provider cleanup hook now runs on every exit path. If you still see it,
+upgrade; you're on an older build.
+
+**`--at "HH:MM"` fires at the wrong time**
+`HH:MM` is interpreted in IST, matching the times the wizard prints. Use an
+explicit ISO 8601 timestamp or unix seconds for anything else.
+
+---
 
 ## License
 

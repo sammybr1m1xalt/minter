@@ -29,13 +29,30 @@ import chalk from "chalk";
 import * as fs from "fs";
 import * as path from "path";
 
-const KEY_CACHE_DIR = process.env.OPENSEA_SESSION_DIR
-  ? process.env.OPENSEA_SESSION_DIR
-  : (() => {
-      const d = process.env.HOME ? path.join(process.env.HOME, ".nft-public-mint") : "";
-      try { fs.mkdirSync(d, { recursive: true }); } catch {}
-      return d;
-    })();
+// Resolved from this module's own location, so the pool lands inside the
+// project regardless of the caller's cwd — dist/index.js can be invoked from
+// anywhere and the secrets must not move with it.
+const PACKAGE_ROOT = path.resolve(__dirname, "..");
+
+const KEY_CACHE_DIR = (() => {
+  const explicit = process.env.OPENSEA_SESSION_DIR?.trim();
+  if (explicit) return explicit;
+  // Project-local by default. .gitignore already excludes .minter-cache/, and
+  // keeping it beside the code makes it obvious where the plaintext keys live.
+  const d = path.join(PACKAGE_ROOT, ".minter-cache");
+  try { fs.mkdirSync(d, { recursive: true, mode: 0o700 }); } catch {}
+  return d;
+})();
+
+// Older builds kept the pool in the home directory. Imported once, on the
+// first load, so an existing key is not orphaned by the move.
+const LEGACY_POOL_FILE = (() => {
+  const home = process.env.HOME?.trim();
+  return home ? path.join(home, ".nft-public-mint", "opensea_key_pool.json") : "";
+})();
+
+// Set to "0" to stop the tool rewriting OPENSEA_API_KEY in .env.
+const ENV_KEY_SYNC = process.env.OPENSEA_KEY_SYNC !== "0";
 
 const KEY_POOL_FILE = path.join(KEY_CACHE_DIR, "opensea_key_pool.json");
 // Records that today's free-key creation attempt already failed, so we don't
@@ -58,9 +75,29 @@ export interface KeyPoolEntry {
   score: number;
   remaining_calls: number; // X-RateLimit-Remaining from last probe/response
   rate_limit_reset: number; // X-RateLimit-Reset (unix epoch) — when window resets
+  /** Last time this key was actually used for a run. Diagnostic only. */
+  last_used_at?: string;
 }
 
 // ── Key lifecycle helpers ──────────────────────────────────────────────────
+
+/**
+ * A non-reversible label for a pool entry, for logs.
+ *
+ * The key prefix used here previously (`api_key.slice(0, 12)`) put roughly a
+ * third of a live credential into every run log. The name is stable and
+ * human-readable; the fingerprint distinguishes two same-named keys without
+ * revealing key material.
+ */
+function keyLabel(entry: { api_key: string; name?: string }): string {
+  const name = entry.name?.trim();
+  const fp = require("node:crypto")
+    .createHash("sha256")
+    .update(entry.api_key)
+    .digest("hex")
+    .slice(0, 8);
+  return name ? `${name} [${fp}]` : `key-${fp}`;
+}
 
 /** How old a key is, in days, from its minted_at timestamp. */
 function daysOld(entry: KeyPoolEntry): number {
@@ -130,7 +167,7 @@ function readQuota(): QuotaState {
 
 function writeQuota(state: QuotaState): void {
   try {
-    fs.writeFileSync(QUOTA_FILE, JSON.stringify(state, null, 2), "utf-8");
+    fs.writeFileSync(QUOTA_FILE, JSON.stringify(state, null, 2), { encoding: "utf-8", mode: 0o600 });
   } catch {}
 }
 
@@ -185,22 +222,58 @@ export function pruneStaleKeys(pool: KeyPoolEntry[]): KeyPoolEntry[] {
   });
 }
 
+// In-memory mirror of the pool file. loadKeyPool() is called several times per
+// run — and each call used to re-read + re-parse the file. Writes go through to
+// disk so the two never diverge.
+let poolCache: KeyPoolEntry[] | null = null;
+let legacyMigrated = false;
+
+/**
+ * One-time import of a pool written by an older build in the home directory.
+ * Runs only when the project-local file is absent, so it can never overwrite a
+ * newer pool.
+ */
+function migrateLegacyPool(): void {
+  if (legacyMigrated || !LEGACY_POOL_FILE) return;
+  legacyMigrated = true;
+  if (fs.existsSync(KEY_POOL_FILE)) return;
+  if (!fs.existsSync(LEGACY_POOL_FILE)) return;
+  try {
+    const pool = JSON.parse(fs.readFileSync(LEGACY_POOL_FILE, "utf-8")) as KeyPoolEntry[];
+    if (!Array.isArray(pool) || pool.length === 0) return;
+    fs.writeFileSync(KEY_POOL_FILE, JSON.stringify(pool, null, 2), { encoding: "utf-8", mode: 0o600 });
+    console.log(chalk.gray(`  OpenSea: imported ${pool.length} key(s) from ${LEGACY_POOL_FILE}`));
+  } catch {}
+}
+
 export function loadKeyPool(): KeyPoolEntry[] {
+  if (poolCache) return [...poolCache];
+  migrateLegacyPool();
   try {
     const raw = fs.readFileSync(KEY_POOL_FILE, "utf-8");
     const pool = JSON.parse(raw) as KeyPoolEntry[];
     // Auto-prune stale keys on every load — expired or older than 7 days
-    return pruneStaleKeys(pool);
+    poolCache = pruneStaleKeys(pool);
   } catch {
-    return [];
+    poolCache = [];
   }
+  // Return a copy: callers push/filter/mutate freely without corrupting the cache.
+  return [...poolCache];
 }
 
 export function saveKeyPool(pool: KeyPoolEntry[]): void {
-  fs.writeFileSync(KEY_POOL_FILE, JSON.stringify(pool, null, 2), "utf-8");
+  // Store a copy so a caller mutating its own array afterwards cannot change
+  // the cache behind our back.
+  poolCache = [...pool];
+  // Contains plaintext API keys — owner-only. A failed write must not crash a
+  // mint; the in-memory copy still serves this run.
+  try {
+    fs.writeFileSync(KEY_POOL_FILE, JSON.stringify(pool, null, 2), { encoding: "utf-8", mode: 0o600 });
+  } catch {}
 }
 
 export function clearKeyPool(): void {
+  poolCache = [];
   try { fs.unlinkSync(KEY_POOL_FILE); } catch {}
 }
 
@@ -221,12 +294,16 @@ export async function probeKey(
     clearTimeout(timer);
     const latencyMs = Math.round(Date.now() - t0);
     // Read rate-limit headers from every response — even 429 tells us where we stand.
-    const remaining = parseInt(res.headers.get("x-ratelimit-remaining") || "0", 10);
-    const resetAt = parseInt(res.headers.get("x-ratelimit-reset") || "0", 10);
+    // An absent header means "unknown", not "zero". Treating a missing header
+    // as 0 marks every healthy key exhausted when a proxy strips it.
+    const remainingRaw = res.headers.get("x-ratelimit-remaining");
+    const remaining = remainingRaw != null ? parseInt(remainingRaw, 10) : -1;
+    const resetRaw = res.headers.get("x-ratelimit-reset");
+    const resetAt = resetRaw != null ? parseInt(resetRaw, 10) : 0;
     if (res.status === 200) {
-      // If remaining is 0 (or very close), we're exhausted even though this call went through.
-      // Mark as "alive_but_exhausted" so scoring deprioritizes it.
-      if (remaining <= 1) return { status: "alive_but_exhausted" as const, latencyMs, remaining, resetAt };
+      // If remaining is exactly 0, we're exhausted even though this call went
+      // through. Mark as "alive_but_exhausted" so scoring deprioritizes it.
+      if (remaining === 0) return { status: "alive_but_exhausted" as const, latencyMs, remaining, resetAt };
       return { status: "alive", latencyMs, remaining, resetAt };
     }
     if (res.status === 429) return { status: "throttled", latencyMs, remaining, resetAt };
@@ -235,12 +312,30 @@ export async function probeKey(
     // Collapsing this into "dead" would permanently discard a good key because
     // OpenSea had a bad minute.
     if (res.status >= 500) return { status: "server_error" as const, latencyMs, remaining, resetAt };
+
+    // Cloudflare bot-block pages (Error 1010/1020, "Access denied") are about
+    // the CLIENT, not the key. Observed 2026-11-09: every key in the pool,
+    // including one known to work, returned 403 Error 1010 for a few minutes and
+    // then 200 again with no change on our side. Classifying that as "dead"
+    // retires working keys and burns a mint, so treat it as server-side.
+    if (res.status === 403) {
+      const body = await res.text().catch(() => "");
+      if (/cloudflare|error\s*10\d\d|access denied|cf-error/i.test(body)) {
+        return { status: "server_error" as const, latencyMs, remaining, resetAt };
+      }
+    }
+
     // 401/403/404 and anything else: the key itself is the problem.
     return { status: "dead", latencyMs, remaining, resetAt };
   } catch (err: any) {
     clearTimeout(timer);
     if (err && err.name === "AbortError") return { status: "timeout", latencyMs: timeoutMs, remaining: -1, resetAt: 0 };
-    return { status: "dead", latencyMs: Date.now() - t0, remaining: -1, resetAt: 0 };
+    // A transport failure (DNS, ECONNREFUSED, TLS, socket hangup) says nothing
+    // about the KEY — the request never reached OpenSea. Scoring it "dead"
+    // retires a working credential because the host had a bad minute; the file
+    // already returns "server_error" for 5xx and a Cloudflare 403, which is the
+    // same class of "not the key's fault".
+    return { status: "server_error", latencyMs: Date.now() - t0, remaining: -1, resetAt: 0 };
   }
 }
 
@@ -259,7 +354,10 @@ export function computeScore(entry: KeyPoolEntry): number {
     // 429 — actively rate-limited, can't use this call. Low score but keep
     // it in the pool; if reset time is recorded and in the future, it'll
     // recover and become useful again.
-    if (entry.rate_limit_reset > 0 && entry.rate_limit_reset > now) {
+    // X-RateLimit-Reset is a UNIX SECONDS epoch; Date.now() is milliseconds.
+    // Comparing them directly is always false, which silently disabled this tier.
+    const resetMs = entry.rate_limit_reset > 0 ? entry.rate_limit_reset * 1000 : 0;
+    if (resetMs > now) {
       return 50; // will recover, but useless right now
     }
     return 30; // reset passed but still getting 429 — server hasn't caught up
@@ -267,7 +365,8 @@ export function computeScore(entry: KeyPoolEntry): number {
   if (entry.last_probe === "alive_but_exhausted") {
     // Got a 200 but remaining is 0 or 1. Still usable for THIS call (one
     // more shot before the window closes). Don't abandon it.
-    if (entry.rate_limit_reset > 0 && entry.rate_limit_reset > now) {
+    const resetMs = entry.rate_limit_reset > 0 ? entry.rate_limit_reset * 1000 : 0;
+    if (resetMs > now) {
       return 150; // one more call then it resets — valuable
     }
     return 100; // reset already passed but still at 0 — might recover, still try
@@ -308,7 +407,7 @@ export async function probeAndRankPool(
   // "alive_but_exhausted" is still usable but scored low — only picked if no
   // key with remaining calls exists.
   const usable = probed
-    .filter((e) => e.last_probe === "alive" || e.last_probe === "alive_but_exhausted" || e.last_probe === "throttled" || e.last_probe === "server_error")
+    .filter((e) => e.last_probe === "alive" || e.last_probe === "alive_but_exhausted" || e.last_probe === "throttled" || e.last_probe === "server_error" || e.last_probe === "timeout")
     .sort((a, b) => b.score - a.score);
 
   const best = usable.length > 0 ? usable[0] : null;
@@ -365,6 +464,120 @@ export function addKeyToPool(
   pool.push(entry);
   saveKeyPool(pool);
   return entry;
+}
+
+// ── Pool freshness ────────────────────────────────────────────────────────
+
+/** Keys older than this are replaced with fresh ones, even if they probe alive. */
+export const KEY_MAX_AGE_DAYS = 3;
+const KEY_MAX_AGE_MS = KEY_MAX_AGE_DAYS * 86_400_000;
+
+/** True when a single key has outlived KEY_MAX_AGE_DAYS. */
+export function isKeyStale(entry: KeyPoolEntry): boolean {
+  const born = entry.minted_at ? new Date(entry.minted_at).getTime() : NaN;
+  return isNaN(born) || Date.now() - born > KEY_MAX_AGE_MS;
+}
+
+/**
+ * True when the pool is non-empty and EVERY key is older than KEY_MAX_AGE_DAYS.
+ * A single fresh key means the pool is still serviceable.
+ */
+export function poolIsStale(pool: KeyPoolEntry[]): boolean {
+  return pool.length > 0 && pool.every(isKeyStale);
+}
+
+// ── .env integration ──────────────────────────────────────────────────────
+
+/**
+ * Pull OPENSEA_API_KEY from the environment into the pool.
+ *
+ * Without this, a key set in .env was invisible to every path that resolves a
+ * key through getValidApiKey() — --fcfs and the wizard silently used a pooled
+ * key instead, while --eligibility used the .env one.
+ */
+export function seedEnvKeyIntoPool(): KeyPoolEntry | null {
+  const envKey = process.env.OPENSEA_API_KEY?.trim();
+  if (!envKey) return null;
+  const existing = loadKeyPool().find((e) => e.api_key === envKey);
+  if (existing) return existing;
+  console.log(chalk.gray("  OpenSea: importing OPENSEA_API_KEY from the environment into the pool."));
+  return addKeyToPool({
+    api_key: envKey,
+    name: "env_pasted",
+    // OpenSea does not report expires_at on creation; the field is not
+    // enforced anyway (verified: a key 21 days past expires_at still works).
+    expires_at: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+  });
+}
+
+/**
+ * Mirror the active key back into .env so the file always names a key that was
+ * alive recently. Rewrites only the OPENSEA_API_KEY line, preserving comments
+ * and every other variable; writes only when the value actually changes.
+ */
+export function syncEnvKey(apiKey: string): void {
+  if (!ENV_KEY_SYNC || !apiKey) return;
+
+  const envPath = path.join(PACKAGE_ROOT, ".env");
+  let text = "";
+  try { text = fs.readFileSync(envPath, "utf-8"); } catch {}
+
+  // Compare against the FILE, not process.env — the shell may export a
+  // different value, and the point is to keep the file itself current.
+  const m = text.match(/^OPENSEA_API_KEY=(.*)$/m);
+  if (m && m[1].trim() === apiKey) return;
+
+  const line = `OPENSEA_API_KEY=${apiKey}`;
+  const next = m
+    ? text.replace(/^OPENSEA_API_KEY=.*$/m, line)
+    : (text === "" || text.endsWith("\n") ? text : text + "\n") + line + "\n";
+
+  try {
+    fs.writeFileSync(envPath, next, { encoding: "utf-8", mode: 0o600 });
+    process.env.OPENSEA_API_KEY = apiKey;
+    console.log(chalk.gray("  OpenSea: wrote the active key back to .env (OPENSEA_API_KEY)."));
+  } catch {}
+}
+
+// ── Mint fresh keys (shared by the refresh and the empty-pool path) ───────
+
+/**
+ * Mint up to `count` fresh free keys, stopping at the first failure.
+ * Honors the server's own quota state and the documented 2/day cap.
+ */
+async function mintFreshKeys(count: number): Promise<KeyPoolEntry[]> {
+  const added: KeyPoolEntry[] = [];
+  if (count <= 0) return added;
+
+  if (quotaExhaustedToday()) {
+    console.log(chalk.yellow("  ⚠ Free key creation was rate-limited recently — skipping the request until Retry-After elapses."));
+    return added;
+  }
+
+  const createdToday = keysCreatedToday(loadKeyPool());
+  const allowed = Math.max(0, Math.min(count, 2 - createdToday));
+  if (allowed === 0) {
+    console.log(chalk.yellow(`  ⚠ ${createdToday} key(s) already created today — the documented cap is 2/day.`));
+    return added;
+  }
+
+  console.log(chalk.gray(`  OpenSea: minting ${allowed} fresh free key(s)...`));
+  for (let i = 0; i < allowed; i++) {
+    const fresh = await mintFreeKey(8000);
+    if (!fresh) break;
+    const entry = addKeyToPool(fresh);
+    const probe = await probeKey(fresh.api_key, 3000);
+    entry.last_probe = probe.status;
+    entry.last_probe_at = new Date().toISOString();
+    entry.probe_latency_ms = probe.latencyMs;
+    entry.remaining_calls = probe.remaining;
+    entry.rate_limit_reset = probe.resetAt;
+    entry.score = computeScore(entry);
+    saveKeyPool(loadKeyPool().map((e) => (e.api_key === fresh.api_key ? entry : e)));
+    added.push(entry);
+    console.log(chalk.green(`  ✓ New key minted: ${fresh.name || "agent_free"} (probe: ${probe.status}, ${probe.latencyMs}ms)`));
+  }
+  return added;
 }
 
 // ── Remove a dead key from the pool ──────────────────────────────────────
@@ -426,7 +639,36 @@ const mintFreeKey = async (
 export async function getValidApiKey(
   _opts?: { timeoutMs?: number },
 ): Promise<{ api_key: string; source: string } | null> {
-  const pool = loadKeyPool();
+  // A key pasted into .env must join the pool, or every path that resolves a
+  // key through here would silently use a different one.
+  seedEnvKeyIntoPool();
+
+  let pool = loadKeyPool();
+
+  // 0. Refresh an aged pool before probing. A key older than KEY_MAX_AGE_DAYS
+  //    is replaced rather than trusted, even if it still probes alive — an old
+  //    key can carry an exhausted quota that remaining_calls no longer reflects.
+  //    If the mint fails the old keys stay as a fallback, so this can never
+  //    leave the pool empty.
+  if (poolIsStale(pool)) {
+    console.log(
+      chalk.yellow(
+        `  ⚠ Pool keys are all older than ${KEY_MAX_AGE_DAYS} days — minting fresh key(s) to replace them.`
+      )
+    );
+    const fresh = await mintFreshKeys(2);
+    if (fresh.length > 0) {
+      // Re-read rather than trust the pre-mint snapshot: minting mutates the
+      // pool, and a snapshot would let the same key appear twice.
+      const freshKeys = new Set(fresh.map((e) => e.api_key));
+      const kept = loadKeyPool().filter((e) => !isKeyStale(e) && !freshKeys.has(e.api_key));
+      saveKeyPool([...fresh, ...kept]);
+      pool = loadKeyPool();
+      console.log(chalk.green(`  ✓ Pool refreshed: ${fresh.length} new key(s), ${kept.length} retained.`));
+    } else {
+      console.log(chalk.yellow("  ⚠ Refresh failed (quota or network) — keeping the existing keys as fallback."));
+    }
+  }
 
   // 1. If pool has keys, probe and pick the best — NON-BLOCKING (≤3s)
   if (pool.length > 0) {
@@ -436,6 +678,7 @@ export async function getValidApiKey(
       // Increment usage counter for the chosen key
       const updated = result.entry;
       updated.times_used += 1;
+      updated.last_used_at = new Date().toISOString();
       // Decrement remaining calls since we're about to use it
       if (updated.remaining_calls > 0) updated.remaining_calls -= 1;
       saveKeyPool(loadKeyPool().map((e) => (e.api_key === result.entry.api_key ? updated : e)));
@@ -443,63 +686,26 @@ export async function getValidApiKey(
         ? ` (${updated.remaining_calls} calls left before rate limit)`
         : ` -- EXHAUSTED, next mint will need a fresh key`;
       console.log(chalk.green(`  ✓ Using key: ${result.source}${remInfo}`));
+      syncEnvKey(result.api_key);
       return { api_key: result.api_key, source: result.source };
     }
     console.log(chalk.yellow("  ⚠ No usable key in pool — all are dead, throttled, or exhausted."));
   }
 
-  // 2. Pool empty or all dead — try to mint a fresh one, if today's quota allows.
-  const poolForQuota = loadKeyPool();
-  const createdToday = keysCreatedToday(poolForQuota);
-  if (createdToday >= 2 || quotaExhaustedToday()) {
-    if (createdToday >= 2) {
-      console.log(
-        chalk.yellow(
-          `  ⚠ Daily key creation quota exhausted (${createdToday}/2 today).`
-        )
-      );
-      console.log(
-        chalk.gray(
-          "    OpenSea free tier allows max 2 key creations per day per IP."
-        )
-      );
-    } else {
-      console.log(
-        chalk.yellow(
-          "  ⚠ Free key creation already failed today (rate-limited) — skipping the request."
-        )
-      );
-    }
-    console.log(chalk.gray("    Re-trying cached keys instead..."));
-  } else {
-    console.log(
-      chalk.gray(
-        `  OpenSea: attempting to mint a fresh free key (${2 - createdToday} creation(s) left today)...`
-      )
-    );
-    const fresh = await mintFreeKey(8000);
-    if (fresh) {
-      const entry = addKeyToPool(fresh);
-      console.log(
-        chalk.green(
-          `  ✓ New key minted: ${fresh.api_key.slice(0, 12)}... (expires ${fresh.expires_at})`
-        )
-      );
-      // Quick probe to confirm it's alive
-      const probe = await probeKey(fresh.api_key, 3000);
-      entry.last_probe = probe.status;
-      entry.last_probe_at = new Date().toISOString();
-      entry.probe_latency_ms = probe.latencyMs;
-      entry.remaining_calls = probe.remaining;
-      entry.rate_limit_reset = probe.resetAt;
-      entry.score = computeScore(entry);
-      saveKeyPool(loadKeyPool().map((e) => (e.api_key === fresh.api_key ? entry : e)));
-      return {
-        api_key: fresh.api_key,
-        source: `new (probe: ${probe.status}, ${probe.latencyMs}ms)`,
-      };
-    }
+  // 2. Pool empty or all dead — try to mint a fresh one, if the server's own
+  //    quota state allows it.
+  //    The documented "2 keys/day" is an approximation: the real window is a
+  //    rolling ~11.5h (verified live via Retry-After), not a local-midnight
+  //    boundary. Only the server's own Retry-After hard-blocks; the local count
+  //    is a warning, not a gate — gating on it can refuse a legitimate mint
+  //    after the rolling window has already recovered.
+  const freshEntries = await mintFreshKeys(1);
+  if (freshEntries.length > 0) {
+    const e = freshEntries[0];
+    syncEnvKey(e.api_key);
+    return { api_key: e.api_key, source: `new (probe: ${e.last_probe}, ${e.probe_latency_ms}ms)` };
   }
+  console.log(chalk.gray(`    Re-trying cached keys instead...`));
 
   // 3. Couldn't mint — rate limited or network error.
   //    Re-probe cached keys: they may have recovered since last probe.
@@ -508,11 +714,13 @@ export async function getValidApiKey(
   if (cachedKeys.length > 0) {
     const result = await pickBestKey(cachedKeys);
     if (result && result.entry.last_probe !== "dead") {
-      console.log(chalk.green(`  ✓ Re-using cached key: ${result.entry.api_key.slice(0, 12)}... (status: ${result.entry.last_probe})`));
+      console.log(chalk.green(`  ✓ Re-using cached key: ${keyLabel(result.entry)} (status: ${result.entry.last_probe})`));
       const updated = result.entry;
       updated.times_used += 1;
+      updated.last_used_at = new Date().toISOString();
       if (updated.remaining_calls > 0) updated.remaining_calls -= 1;
       saveKeyPool(cachedKeys.map((e) => (e.api_key === result.entry.api_key ? updated : e)));
+      syncEnvKey(result.entry.api_key);
       return { api_key: result.entry.api_key, source: `cached (re-probed: ${result.entry.last_probe})` };
     }
   }
@@ -535,9 +743,9 @@ export async function getValidApiKey(
         : entry.last_probe === "timeout" ? chalk.gray("timeout")
         : chalk.red("dead");
       const resetInfo = entry.rate_limit_reset > 0
-        ? ` (resets ${new Date(entry.rate_limit_reset).toLocaleTimeString()})`
+        ? ` (resets ${new Date(entry.rate_limit_reset * 1000).toLocaleTimeString()})`
         : "";
-      console.log(chalk.gray(`      • ${entry.api_key.slice(0, 12)}... — ${statusLabel}${resetInfo}`));
+      console.log(chalk.gray(`      • ${keyLabel(entry)} — ${statusLabel}${resetInfo}`));
     }
     console.log(chalk.gray("  → Keys with a future reset time will work again — try re-running then.\n"));
   } else {

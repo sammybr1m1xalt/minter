@@ -1,7 +1,5 @@
 // ── Scatter.art launchpad integration ──────────────────────────────────────
 //
-// Ported from nft-minter-bot/src/scatter.js.
-//
 // Scatter contracts use a custom mint(auth, quantity, affiliate, signature)
 // entrypoint, so generic mint-selector probing does NOT work — the ABI is not
 // discoverable from the contract alone. Instead the public API resolves the
@@ -52,9 +50,15 @@ export interface ScatterList {
  * Only slugs resolve — the API has no address lookup, so callers must pass the
  * collection's Scatter slug.
  */
-export async function getScatterCollection(slug: string): Promise<ScatterCollection | null> {
+export async function getScatterCollection(
+  slug: string,
+  timeoutMs = 15_000
+): Promise<ScatterCollection | null> {
   try {
-    const r = await fetch(`${SCATTER_API}/collection/${encodeURIComponent(slug)}`);
+    // Unbounded: a stalled API would hang the mint path indefinitely.
+    const r = await fetch(`${SCATTER_API}/collection/${encodeURIComponent(slug)}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!j?.address) return null;
@@ -80,12 +84,16 @@ export async function getScatterCollection(slug: string): Promise<ScatterCollect
  * Fetch the mint lists a wallet is eligible for. Without minterAddress the API
  * returns public lists only. Returns [] on error (treated as "no lists").
  */
-export async function getEligibleLists(slug: string, minterAddress?: string): Promise<ScatterList[]> {
+export async function getEligibleLists(
+  slug: string,
+  minterAddress?: string,
+  timeoutMs = 15_000
+): Promise<ScatterList[]> {
   const url = `${SCATTER_API}/collection/${encodeURIComponent(slug)}/eligible-invite-lists${
     minterAddress ? `?minterAddress=${minterAddress}` : ""
   }`;
   try {
-    const r = await fetch(url);
+    const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) return [];
     const j: any = await r.json();
     return Array.isArray(j) ? j : [];
@@ -133,6 +141,7 @@ export async function buildScatterMint(args: {
   minterAddress: string;
   lists: { id: string; quantity: number }[];
   affiliate?: string;
+  timeoutMs?: number;
 }): Promise<ScatterMintTx> {
   const body: any = {
     collectionAddress: args.collectionAddress,
@@ -142,10 +151,13 @@ export async function buildScatterMint(args: {
   };
   if (args.affiliate) body.affiliateAddress = args.affiliate;
 
+  // This fetch builds the actual mint transaction, so a stall here hangs the
+  // run with a wallet already funded and a stage about to open.
   const r = await fetch(`${SCATTER_API}/mint`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(args.timeoutMs ?? 20_000),
   });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");

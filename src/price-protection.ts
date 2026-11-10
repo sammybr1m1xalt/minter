@@ -1,12 +1,5 @@
 // ── Price protection ────────────────────────────────────────────────────────
 //
-// Ported from nft-minter-bot/src/price.js:
-//
-//   export function assertPriceProtection({ actualPriceWei, maxPriceWei, context }) {
-//     if (maxPriceWei == null) return;
-//     if (BigInt(actualPriceWei) > BigInt(maxPriceWei)) { throw ... }
-//   }
-//
 // The TS port had NO price protection anywhere. A drop whose price is raised
 // between the moment we read it and the moment we fire would be minted at the
 // new price with no warning — the failure mode is paying more than intended,
@@ -31,7 +24,7 @@ export interface PriceProtectionResult {
 /**
  * Parse a user-supplied max-price spec.
  *
- * Accepts the same forms as the JS original:
+ * Accepted forms:
  *   0.01 | 0.01eth | 0.05/unit | 0.05total | free | 0 | any | none | unlimited
  *
  * `amount` is the quantity being minted — a per-unit spec is multiplied up to a
@@ -79,7 +72,7 @@ export function parsePriceSpec(spec: string, amount = 1): PriceProtectionResult 
 /**
  * Extract an optional max-price spec from a command string.
  *
- * Supports the JS original's forms:
+ * Supported forms:
  *   --max-price 0.01 | --maxprice 0.01 | max:0.01 | max=0.01 | maxprice:0.01
  *   max:free | max:0 | max:0.05/unit | max:0.05total | max:any | max:unlimited
  *   p:0.01 | p=0.01

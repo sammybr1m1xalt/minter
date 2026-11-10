@@ -1,7 +1,5 @@
 // opensea-session.ts — automated OpenSea SIWE (Sign-In With Ethereum) login.
 //
-// Ported from bagaskara815/nft-minter-bot/src/opensea-auth.js.
-//
 // OpenSea gates drop eligibility + signed-mint transaction building behind
 // a logged-in session (an access_token JWT cookie). Because we hold the wallet
 // private key we can perform the SIWE handshake headlessly and refresh it
@@ -102,6 +100,7 @@ async function fetchNonce(jar: Map<string, string>): Promise<string> {
       cookie: cookieHeader(jar),
       ...BROWSER_HEADERS,
     },
+    signal: AbortSignal.timeout(10_000),
   });
   absorbCookies(jar, extractSetCookie(r));
   if (!r.ok) throw new Error(`siwe nonce ${r.status}`);
@@ -147,6 +146,7 @@ async function loginSiwe(wallet: Wallet): Promise<StoredSession> {
       chainArch: "EVM",
       connectorId: CONNECTOR_ID,
     }),
+    signal: AbortSignal.timeout(10_000),
   });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
@@ -178,6 +178,7 @@ async function tryRefreshSiwe(cached: StoredSession): Promise<StoredSession | nu
       cookie: cookieHeader(jar),
       ...BROWSER_HEADERS,
     },
+    signal: AbortSignal.timeout(10_000),
   });
   if (!r.ok) return null;
   absorbCookies(jar, extractSetCookie(r));

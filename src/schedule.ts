@@ -1,12 +1,10 @@
 // ── "When" parsing ─────────────────────────────────────────────────────────
 //
-// Ported from nft-minter-bot/src/schedule.js parseWhen().
+
+// A user could not say "in 5m" or "2h" or "18:30"; only absolute timestamps worked.
+// That is a whole scheduling interface missing, not a convenience.
 //
-// The TS port had NO equivalent — no relative-time parsing at all. A user could
-// not say "in 5m" or "2h" or "18:30"; only absolute timestamps worked. That is
-// a whole scheduling interface missing, not a convenience.
-//
-// Accepted forms (identical to the original):
+// Accepted forms:
 //   unix seconds  (10 digits)
 //   unix ms       (13 digits)   ← Bug K: the TS port never handled this
 //   ISO 8601      ("2026-11-07T18:30:00Z")
@@ -14,6 +12,10 @@
 //   wall clock    ("18:30" — next occurrence)
 //
 // Returns UNIX SECONDS, matching the rest of the codebase.
+
+// The UI announces mint times in IST (time-format.ts), so a wall-clock time
+// typed by the user must be read in that zone — not the server's local zone.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
 /** Parse a "when" spec into an absolute unix-seconds timestamp. */
 export function parseWhen(spec: string, nowMs: number = Date.now()): number {
@@ -34,12 +36,14 @@ export function parseWhen(spec: string, nowMs: number = Date.now()): number {
   // Unix seconds — 10 digits.
   if (/^\d{10}$/.test(s)) return Number(s);
 
-  // HH:MM — interpreted as the next occurrence of that local wall-clock time.
+  // HH:MM — the next occurrence of that wall-clock time in IST (UTC+5:30),
+  // matching what the wizard prints. Reading it in the server's local zone
+  // meant a user who typed the time shown on screen got a different instant.
   m = s.match(/^(\d{1,2}):(\d{2})$/);
   if (m) {
-    const d = new Date(nowMs);
-    d.setHours(Number(m[1]), Number(m[2]), 0, 0);
-    let t = Math.floor(d.getTime() / 1000);
+    const d = new Date(nowMs + IST_OFFSET_MS);
+    d.setUTCHours(Number(m[1]), Number(m[2]), 0, 0);
+    let t = Math.floor((d.getTime() - IST_OFFSET_MS) / 1000);
     if (t * 1000 <= nowMs) t += 86400; // already passed today → tomorrow
     return t;
   }

@@ -30,6 +30,7 @@ import { CHAINS, ChainProfile, resolveChain } from "./chains";
 import { parseNftLink } from "./nft-link";
 import { resolveSlug, resolveContractToSlug, isSlug } from "./slug-resolver";
 import {
+  isBenignProbeError,
   maskRpc,
   planRpcs,
   privateRpcsFromEnv,
@@ -41,7 +42,8 @@ import {
   CollectionDropsInventory,
   fetchAllActiveDrops,
   assessDropEligibility,
-  orderDropsByStartTime,
+  getPhaseEligibility,
+  sortByStartTime,
 } from "./fcfs-drops";
 import {
   fetchOnChainDrops,
@@ -55,6 +57,9 @@ import {
   promptTiming,
   confirmSnipe,
   displayBalances,
+  planSellAfterMint,
+  runSellAfterMint,
+  SellPlan,
   SnipeReadyInput,
 } from "./wizard-helpers";
 import { getValidApiKey } from "./opensea-key";
@@ -66,11 +71,7 @@ import { findUniversalMint, explainFailure, UniversalMintPlan } from "./universa
 import { getMintMechanisms } from "./seadrop-public";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
 import { blastToAll } from "./rpc-blast";
-import {
-  getDropEligibility,
-  fetchRestEligibility,
-  DropEligibilityResult,
-} from "./opensea-gql";
+import { parsePriceToWei } from "./opensea-gql";
 import {
   fetchSignedPayload,
   fetchSignedPayloadWithSession,
@@ -98,11 +99,8 @@ interface PhaseEligibility {
   // Per-wallet signed payload (if fetchable)
   signedPayload: FcfsSignedPayload | null;
   signedPayloadError: string | null;
-  // GQL DropEligibilityQuery result (authenticated per-stage isEligible)
-  dropEligibilityInfo: DropEligibilityResult | null;
-  // REST GET /api/v2/drops/{slug}/eligibility result (fallback when GQL is
-  // rate-limited or the eligibility fields come back UNAUTHORIZED)
-  restEligibility: Awaited<ReturnType<typeof fetchRestEligibility>>;
+  /** Per-wallet price OpenSea quoted for this stage, in wei. */
+  priceWei?: bigint | null;
   // Eligibility verdict
   eligible: boolean;
   reason: string;
@@ -163,10 +161,15 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         )
       );
   if (!resolveChain(chainKey)) {
-    throw new Error(`Unknown chain "${chainKey}". Use ethereum, base, polygon, arbitrum, optimism, zora-network, or robinhood.`);
+    // Derived from CHAINS so this can never list a chain the tool cannot
+    // serve — it previously advertised polygon/arbitrum/optimism and omitted
+    // arc and soneium.
+    throw new Error(
+      `Unknown chain "${chainKey}". Supported chains: ${CHAINS.map((c) => c.key).join(", ")}.`
+    );
   }
   log.field("chain", chainKey);
-  const chainProfile = resolveChain(chainKey)!;
+  let chainProfile = resolveChain(chainKey)!;
 
   // ── 3. Quantity ───────────────────────────────────────────────────────
   const quantity = opts.quantity ?? (await promptQuantity(walletKeys.length));
@@ -181,6 +184,27 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     : await promptTarget(log, chainKey);
   const nftInput = target.contract;
   chainKey = target.chainKey;
+  // The target can name a different chain than the one prompted for (a
+  // chain-bearing link, or a slug that lives on another network). The profile
+  // must follow, or promptRpc loads the old chain's endpoints and planRpcs
+  // verifies them against the old chain id — a guaranteed wrong-chain mint.
+  // The FCFS CLI branch carries the same guard (wizard-fcfs-new.ts).
+  const targetProfile = resolveChain(chainKey);
+  if (!targetProfile) {
+    throw new Error(
+      `Target "${target.label}" is on unknown chain "${chainKey}". Supported chains: ${CHAINS.map((c) => c.key).join(", ")}.`
+    );
+  }
+  if (targetProfile.key !== chainProfile.key) {
+    console.log(
+      chalk.yellow(
+        `\n  ⚠ Target resolves to ${targetProfile.name} (chain ${targetProfile.chainId}), not ${chainProfile.name}. ` +
+          `Switching chains and re-resolving endpoints.`
+      )
+    );
+    log.field("chain_override", `${chainProfile.key} -> ${targetProfile.key}`);
+  }
+  chainProfile = targetProfile;
   log.field("nft_input", nftInput);
   log.field("label", target.label);
   log.field("platform", target.resolved?.platform ?? "unknown");
@@ -207,7 +231,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
   for (const ep of parseRpcEndpoints(plan.urls)) {
     const failure = plan.failures.find((f) => f.url === ep.url);
     if (failure) {
-      const benign = /not allowed|does not exist|not supported|method not found/i.test(failure.message);
+      const benign = isBenignProbeError(failure.message);
       console.log(
         benign
           ? chalk.gray(`    • ${ep.label}  (send-only)`)
@@ -231,359 +255,446 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
   }
   const rpcUrls = plan.urls;
   const provider = new JsonRpcProvider(rpcUrls[0]);
+  try {
 
-  // ── 6. Resolve slug + API key ────────────────────────────────────────────
-  // Need the slug for OpenSea drops endpoint access. If user gave a CA, resolve it.
-  console.log(chalk.bold.white("\nOpenSea API key + slug resolution"));
-  console.log(chalk.gray("  Checking for a usable key..."));
+    // ── 6. Resolve slug + API key ────────────────────────────────────────────
+    // Need the slug for OpenSea drops endpoint access. If user gave a CA, resolve it.
+    console.log(chalk.bold.white("\nOpenSea API key + slug resolution"));
+    console.log(chalk.gray("  Checking for a usable key..."));
 
-  const keyResult = await getValidApiKey({ timeoutMs: 8000 });
-  const apiKey = keyResult?.api_key || undefined;
-  const apiKeySource = keyResult?.source || "none";
-  console.log(chalk.gray(`  Key source: ${apiKeySource}`));
+    const keyResult = await getValidApiKey({ timeoutMs: 8000 });
+    const apiKey = keyResult?.api_key || undefined;
+    const apiKeySource = keyResult?.source || "none";
+    console.log(chalk.gray(`  Key source: ${apiKeySource}`));
 
-  if (keyResult) {
-    console.log(chalk.green(`  ✓ Key ready: ${keyResult.source}`));
-  } else {
-    console.log(chalk.yellow(`  ⚠ No usable OpenSea key available.`));
-    console.log(chalk.gray(`    Phase inventory will still be fetched, but signed`));
-    console.log(chalk.gray(`    mint data may be missing. You'll need a key for`));
-    console.log(chalk.gray(`    allowlist/FCFS phases. Public mint doesn't need one.\n`));
-  }
-
-  // Resolve slug — needed for OpenSea drops endpoint
-  let slug: string | null = null;
-  if (!isSlug(nftInput)) {
-    console.log(chalk.gray(`  Resolving contract → slug for OpenSea drops endpoint...`));
-    slug = await resolveContractToSlug(nftInput, apiKey || "", 12000);
-    if (!slug) {
-      console.log(chalk.gray(`  Could not resolve slug for ${nftInput}.`));
-      console.log(chalk.gray(`  Will use contract address directly where possible.`));
+    if (keyResult) {
+      console.log(chalk.green(`  ✓ Key ready: ${keyResult.source}`));
     } else {
-      console.log(chalk.green(`  ✓ Slug: ${slug}`));
+      console.log(chalk.yellow(`  ⚠ No usable OpenSea key available.`));
+      console.log(chalk.gray(`    Phase inventory will still be fetched, but signed`));
+      console.log(chalk.gray(`    mint data may be missing. You'll need a key for`));
+      console.log(chalk.gray(`    allowlist/FCFS phases. Public mint doesn't need one.\n`));
     }
-  } else {
-    // User gave a slug directly — resolve to CA for on-chain reads
-    console.log(chalk.gray(`  Resolving slug → contract address...`));
-    try {
-      const info = await resolveSlug(nftInput, apiKey || "", chainKey);
-      log.field("resolved_contract", info.contractAddress);
-    } catch (err: any) {
-      log.warn(`Slug resolution failed: ${err.message}`);
-    }
-    slug = nftInput;
-  }
-  log.field("slug", slug || "unknown");
 
-  // ── 7. Warm SIWE sessions for ALL wallets ──────────────────────────────
-  // Each wallet needs its own OpenSea session for eligibility + signed payload
-  // fetching. The session warming is parallelizable — do it for all wallets.
-  console.log(chalk.bold.white("\nOpenSea sessions"));
-  console.log(chalk.gray(`  Warming SIWE sessions for ${wallets.length} wallet(s)...`));
-
-  const sessionResults = await warmAllSessions(wallets, apiKey);
-  log.field("sessions_ready", sessionResults.filter((s) => s.session).length);
-  log.field("sessions_failed", sessionResults.filter((s) => !s.session).length);
-
-  for (const result of sessionResults) {
-    const label = `${result.wallet.address.slice(0, 6)}…${result.wallet.address.slice(-4)}`;
-    if (result.session) {
-      console.log(chalk.green(`  ✓ [W${result.walletIndex}] ${label} session ready`));
+    // Resolve slug — needed for OpenSea drops endpoint
+    let slug: string | null = null;
+    if (!isSlug(nftInput)) {
+      console.log(chalk.gray(`  Resolving contract → slug for OpenSea drops endpoint...`));
+      slug = await resolveContractToSlug(nftInput, apiKey || "", 12000);
+      if (!slug) {
+        console.log(chalk.gray(`  Could not resolve slug for ${nftInput}.`));
+        console.log(chalk.gray(`  Will use contract address directly where possible.`));
+      } else {
+        console.log(chalk.green(`  ✓ Slug: ${slug}`));
+      }
     } else {
-      console.log(chalk.yellow(`  ⚠ [W${result.walletIndex}] ${label} session failed: ${result.error}`));
+      // User gave a slug directly — resolve to CA for on-chain reads
+      console.log(chalk.gray(`  Resolving slug → contract address...`));
+      try {
+        const info = await resolveSlug(nftInput, apiKey || "", chainKey);
+        log.field("resolved_contract", info.contractAddress);
+      } catch (err: any) {
+        log.warn(`Slug resolution failed: ${err.message}`);
+      }
+      slug = nftInput;
     }
-  }
+    log.field("slug", slug || "unknown");
 
-  // ── 8. Discover ALL phases ─────────────────────────────────────────────
-  // Fetch from OpenSea GraphQL first (primary), then REST, then on-chain SeaDrop
-  // discovery for collections not registered on OpenSea.
-  console.log(chalk.bold.white("\nPhase discovery"));
-  console.log(chalk.gray(`  Fetching all active phases for ${target.label}...`));
+    // ── 7. Warm SIWE sessions for ALL wallets ──────────────────────────────
+    // Each wallet needs its own OpenSea session for eligibility + signed payload
+    // fetching. The session warming is parallelizable — do it for all wallets.
+    console.log(chalk.bold.white("\nOpenSea sessions"));
+    console.log(chalk.gray(`  Warming SIWE sessions for ${wallets.length} wallet(s)...`));
 
-  const inventory = await discoverAllPhases(nftInput, slug, apiKey, chainKey, 12000);
-  log.field("phases_found", inventory.drops.length);
+    const sessionResults = await warmAllSessions(wallets, apiKey);
+    log.field("sessions_ready", sessionResults.filter((s) => s.session).length);
+    log.field("sessions_failed", sessionResults.filter((s) => !s.session).length);
 
-  // ── 8a. Gas (needed by both the phase path and the universal fallback) ──
-  console.log(chalk.bold.white("\nGas"));
-  const gas = await promptGasGwei(chainProfile, rpcUrls);
+    for (const result of sessionResults) {
+      const label = `${result.wallet.address.slice(0, 6)}…${result.wallet.address.slice(-4)}`;
+      if (result.session) {
+        console.log(chalk.green(`  ✓ [W${result.walletIndex}] ${label} session ready`));
+      } else {
+        console.log(chalk.yellow(`  ⚠ [W${result.walletIndex}] ${label} session failed: ${result.error}`));
+      }
+    }
 
-  // ── 8b. Universal fallback ─────────────────────────────────────────────
-  // OpenSea only knows about drops it hosts. A plain ERC721 with its own
-  // mint(), a Manifold claim, a Zora collect, or any contract using a bespoke
-  // mint function is invisible to the drops endpoint — and previously that
-  // meant "no phases found" and a dead end.
-  //
-  // Try the universal adapter before giving up. It probes SeaDrop, the generic
-  // signature registry, and the contract's own ABI, and only accepts a plan
-  // that SIMULATES — so a closed sale or a missing proof is reported as a
-  // reason, not silently minted.
-  if (inventory.drops.length === 0) {
-    console.log(chalk.bold.white("\nUniversal mint probe"));
-    console.log(
-      chalk.gray("  OpenSea reports no phases — probing the contract directly...")
-    );
+    // ── 8. Discover ALL phases ─────────────────────────────────────────────
+    // Fetch from OpenSea GraphQL first (primary), then REST, then on-chain SeaDrop
+    // discovery for collections not registered on OpenSea.
+    console.log(chalk.gray(`  Fetching all active phases for ${target.label}...`));
 
-    const universal = await findUniversalMint(nftInput, provider, wallets[0].address, BigInt(quantity), {
-      rpcUrl: rpcUrls[0],
-    });
+    const inventory = await discoverAllPhases(nftInput, slug, apiKey, chainKey, 12000);
+    log.field("phases_found", inventory.drops.length);
 
-    if (universal.plan) {
-      console.log(chalk.green(`  ✓ ${universal.plan.description}`));
-      console.log(chalk.gray(`    via ${universal.plan.adapter}`));
+    // ── 8a. Gas (needed by both the phase path and the universal fallback) ──
+   
+    const gas = await promptGasGwei(chainProfile, rpcUrls);
 
-      // A universal plan is a single-wallet, single-contract mint. Confirm and
-      // execute it directly — there is no phase matrix to pick from.
-      const didConfirm = await askYesNo(
-        `Mint ${quantity} × ${universal.plan.description}?`,
-        true
+    // ── 8b. Universal fallback ─────────────────────────────────────────────
+    // OpenSea only knows about drops it hosts. A plain ERC721 with its own
+    // mint(), a Manifold claim, a Zora collect, or any contract using a bespoke
+    // mint function is invisible to the drops endpoint — and previously that
+    // meant "no phases found" and a dead end.
+    //
+    // Try the universal adapter before giving up. It probes SeaDrop, the generic
+    // signature registry, and the contract's own ABI, and only accepts a plan
+    // that SIMULATES — so a closed sale or a missing proof is reported as a
+    // reason, not silently minted.
+    if (inventory.drops.length === 0) {
+      console.log(chalk.bold.white("\nUniversal mint probe"));
+      console.log(
+        chalk.gray("  OpenSea reports no phases — probing the contract directly...")
       );
-      if (!didConfirm) {
-        console.log(chalk.yellow("\n  Aborted — nothing was sent.\n"));
+
+      const universal = await findUniversalMint(nftInput, provider, wallets[0].address, BigInt(quantity), {
+        rpcUrl: rpcUrls[0],
+      });
+
+      if (universal.plan) {
+        console.log(chalk.green(`  ✓ ${universal.plan.description}`));
+        console.log(chalk.gray(`    via ${universal.plan.adapter}`));
+
+        // A universal plan is a single-wallet, single-contract mint. Confirm and
+        // execute it directly — there is no phase matrix to pick from.
+        const didConfirm = await askYesNo(
+          `Mint ${quantity} × ${universal.plan.description}?`,
+          true
+        );
+        if (!didConfirm) {
+          console.log(chalk.yellow("\n  Aborted — nothing was sent.\n"));
+          closePrompts();
+          return;
+        }
+
+        await executeUniversalMint(universal.plan, walletKeys, rpcUrls, chainProfile, gas, quantity);
         closePrompts();
         return;
       }
 
-      await executeUniversalMint(universal.plan, walletKeys, rpcUrls, chainProfile, gas, quantity);
+      console.log(chalk.yellow("  ✗ No mintable mechanism found on this contract."));
+      console.log(chalk.gray(explainFailure(universal)));
+
+      // Explain WHY, when the contract is a SeaDrop drop with non-public
+      // mechanisms. Reads getMintMechanisms() to warn
+      // that a public fallback does not cover the wallet's spot. Without this the
+      // user is left guessing whether the failure is a closed sale, a missing
+      // allowlist spot, or a token gate.
+      try {
+        const mech = await getMintMechanisms(rpcUrls[0], nftInput);
+        if (mech.signers.length > 0 || mech.tokenGated.length > 0) {
+          const kinds: string[] = [];
+          if (mech.signers.length > 0) kinds.push("signed (needs an OpenSea signature)");
+          if (mech.tokenGated.length > 0) kinds.push("token-gated (needs a held NFT)");
+          console.log(
+            chalk.yellow(
+              `\n  This drop uses ${kinds.join(" and ")} — a public mint will not cover your wallet.`
+            )
+          );
+          console.log(
+            chalk.gray(
+              `  You need to be on its allowlist, or hold its token, before it opens.`
+            )
+          );
+        }
+      } catch {
+        // Best-effort diagnostic — never block the refusal on it.
+      }
+
+      console.log(
+        chalk.gray(
+          "\n  This may not be a mintable contract, the sale may be closed, or it may\n" +
+            "  need an allowlist proof / signature this tool cannot obtain."
+        )
+      );
       closePrompts();
       return;
     }
 
-    console.log(chalk.yellow("  ✗ No mintable mechanism found on this contract."));
-    console.log(chalk.gray(explainFailure(universal)));
+    // ── 9. Probe eligibility for EACH wallet against EACH phase ──────────────
+    console.log(chalk.bold.white("\nEligibility probe"));
+    console.log(chalk.gray(`  Probing ${wallets.length} wallet(s) × ${inventory.drops.length} phase(s)...`));
 
-    // Explain WHY, when the contract is a SeaDrop drop with non-public
-    // mechanisms. Ported from mint.js, which read getMintMechanisms() to warn
-    // that a public fallback does not cover the wallet's spot. Without this the
-    // user is left guessing whether the failure is a closed sale, a missing
-    // allowlist spot, or a token gate.
-    try {
-      const mech = await getMintMechanisms(rpcUrls[0], nftInput);
-      if (mech.signers.length > 0 || mech.tokenGated.length > 0) {
-        const kinds: string[] = [];
-        if (mech.signers.length > 0) kinds.push("signed (needs an OpenSea signature)");
-        if (mech.tokenGated.length > 0) kinds.push("token-gated (needs a held NFT)");
-        console.log(
-          chalk.yellow(
-            `\n  This drop uses ${kinds.join(" and ")} — a public mint will not cover your wallet.`
-          )
-        );
-        console.log(
-          chalk.gray(
-            `  You need to be on its allowlist, or hold its token, before it opens.`
-          )
-        );
+    const walletEligibilities = await probeAllWallets(
+      wallets, walletKeys, inventory, sessionResults, apiKey, quantity, slug, chainKey
+    );
+
+    // ── 10. Report eligibility matrix ────────────────────────────────────────
+    printEligibilityReport(walletEligibilities, inventory);
+
+    // ── 11. Let user pick wallet + phase ────────────────────────────────────
+    const selection = await promptWalletAndPhase(walletEligibilities, walletKeys, quantity);
+    if (selection === null) {
+      console.log(chalk.yellow("\n  Aborted — nothing was sent.\n"));
+      closePrompts();
+      return;
+    }
+
+    const { walletIndex, wallet, phaseIndex } = selection;
+    const selectedDrop = inventory.drops[phaseIndex];
+    const walletEligibility = walletEligibilities[walletIndex];
+    const phaseEligibility = walletEligibility.phaseReports[phaseIndex];
+
+    log.field("selected_wallet", wallet.address);
+    log.field("selected_phase", selectedDrop.name || selectedDrop.dropId);
+    log.field("mint_mode", phaseEligibility.mode);
+
+    // ── 12. Timing ──────────────────────────────────────────────────────────
+    // --at / --when-open skip the prompt; otherwise ask.
+    //
+    // A zero startTime means "unknown", not 1970. Defaulting to `new Date(0)`
+    // made the snipe compute a negative delay and fire immediately — outside the
+    // stage window, so the signed tx reverts and costs gas.
+    const knownStart = selectedDrop.startTime > 0 ? new Date(selectedDrop.startTime * 1000) : null;
+    let targetStart: Date;
+    let timingLabel: string;
+    if (opts.at) {
+      const unix = parseWhen(opts.at);
+      targetStart = new Date(unix * 1000);
+      timingLabel = `--at ${opts.at}`;
+      console.log(chalk.gray(`  Scheduled for ${targetStart.toISOString()} (${timingLabel})`));
+    } else if (opts.whenOpen) {
+      if (!knownStart) {
+        throw new Error("Cannot use --when-open: the opening time is unknown for this phase.");
       }
-    } catch {
-      // Best-effort diagnostic — never block the refusal on it.
+      targetStart = knownStart;
+      timingLabel = "when-open (poll on-chain)";
+      console.log(chalk.gray("  Will poll the on-chain open time."));
+    } else if (knownStart) {
+      const prompted = await promptTiming(knownStart);
+      targetStart = prompted.targetStart ?? knownStart;
+      timingLabel = prompted.timingLabel;
+    } else {
+      // Unknown opening time. Never silently default to "now".
+      console.log(chalk.yellow(`\n  ⚠ The opening time for this phase is unknown.`));
+      const answer = (await askText(
+        chalk.gray(`  Fire when? (ISO, "in 5m", "30s", "HH:MM", or "now"): `)
+      )).trim();
+      if (!answer || answer.toLowerCase() === "now") {
+        targetStart = new Date();
+        timingLabel = "immediately (opening time unknown)";
+      } else {
+        targetStart = new Date(parseWhen(answer) * 1000);
+        timingLabel = `at ${targetStart.toISOString()}`;
+      }
+    }
+    // ── 12b. Price protection ───────────────────────────────────────────────
+    // --max-price sets the cap; otherwise the user is
+    // asked. Without it a drop that raised its price between planning and firing
+    // would be minted at the new price with no warning.
+    let maxPriceWei: bigint | null = null;
+    if (opts.maxPrice) {
+      const priceSpec = parsePriceSpec(opts.maxPrice, quantity);
+      if (priceSpec) {
+        maxPriceWei = priceSpec.isUnlimited ? null : priceSpec.maxPriceWei;
+        console.log(chalk.gray(`  Price protection: ${priceSpec.display}`));
+      }
     }
 
-    console.log(
-      chalk.gray(
-        "\n  This may not be a mintable contract, the sale may be closed, or it may\n" +
-          "  need an allowlist proof / signature this tool cannot obtain."
-      )
+    // ── 14. Balances + affordability ─────────────────────────────────────────
+    console.log(chalk.bold.white("\nWallets"));
+    const balances = await Promise.all(
+      wallets.map((w) => provider.getBalance(w.address).catch(() => null))
     );
-    closePrompts();
-    return;
-  }
+    const symbol = chainProfile.nativeSymbol;
+    console.log(chalk.gray(`  Native token: ${symbol}`));
 
-  if (inventory.drops.length === 0) {
-    throw new Error(
-      `No mint phases found for ${nftInput}.\n` +
-        `  Tried: OpenSea REST/GraphQL + on-chain SeaDrop probe.\n` +
-        `  This may not be a SeaDrop collection, or it may need an OpenSea API key.\n` +
-        `  Try: paste the OpenSea collection page URL directly.`
-    );
-  }
-
-  // ── 9. Probe eligibility for EACH wallet against EACH phase ──────────────
-  console.log(chalk.bold.white("\nEligibility probe"));
-  console.log(chalk.gray(`  Probing ${wallets.length} wallet(s) × ${inventory.drops.length} phase(s)...`));
-
-  const walletEligibilities = await probeAllWallets(
-    wallets, walletKeys, inventory, sessionResults, apiKey, quantity, slug, chainKey
-  );
-
-  // ── 10. Report eligibility matrix ────────────────────────────────────────
-  printEligibilityReport(walletEligibilities, inventory);
-
-  // ── 11. Let user pick wallet + phase ────────────────────────────────────
-  const selection = await promptWalletAndPhase(walletEligibilities, walletKeys, quantity);
-  if (selection === null) {
-    console.log(chalk.yellow("\n  Aborted — nothing was sent.\n"));
-    closePrompts();
-    return;
-  }
-
-  const { walletIndex, wallet, phaseIndex } = selection;
-  const selectedDrop = inventory.drops[phaseIndex];
-  const walletEligibility = walletEligibilities[walletIndex];
-  const phaseEligibility = walletEligibility.phaseReports[phaseIndex];
-
-  log.field("selected_wallet", wallet.address);
-  log.field("selected_phase", selectedDrop.name || selectedDrop.dropId);
-  log.field("mint_mode", phaseEligibility.mode);
-
-  // ── 12. Timing ──────────────────────────────────────────────────────────
-  // --at / --when-open skip the prompt; otherwise ask.
-  let targetStart: Date = new Date(selectedDrop.startTime * 1000);
-  let timingLabel: string;
-  if (opts.at) {
-    const unix = parseWhen(opts.at);
-    targetStart = new Date(unix * 1000);
-    timingLabel = `--at ${opts.at}`;
-    console.log(chalk.gray(`  Scheduled for ${targetStart.toISOString()} (${timingLabel})`));
-  } else if (opts.whenOpen) {
-    timingLabel = "when-open (poll on-chain)";
-    console.log(chalk.gray("  Will poll the on-chain open time."));
-  } else {
-    const prompted = await promptTiming(new Date(selectedDrop.startTime * 1000));
-    targetStart = prompted.targetStart ?? targetStart;
-    timingLabel = prompted.timingLabel;
-  }
-  // ── 12b. Price protection ───────────────────────────────────────────────
-  // Ported from price.js. --max-price sets the cap; otherwise the user is
-  // asked. Without it a drop that raised its price between planning and firing
-  // would be minted at the new price with no warning.
-  let maxPriceWei: bigint | null = null;
-  if (opts.maxPrice) {
-    const priceSpec = parsePriceSpec(opts.maxPrice, quantity);
-    if (priceSpec) {
-      maxPriceWei = priceSpec.isUnlimited ? null : priceSpec.maxPriceWei;
-      console.log(chalk.gray(`  Price protection: ${priceSpec.display}`));
-    }
-  }
-
-  // ── 14. Balances + affordability ─────────────────────────────────────────
-  console.log(chalk.bold.white("\nWallets"));
-  const balances = await Promise.all(
-    wallets.map((w) => provider.getBalance(w.address).catch(() => null))
-  );
-  const symbol = chainProfile.nativeSymbol;
-  console.log(chalk.gray(`  Native token: ${symbol}`));
-
-  // Determine required funds based on mint mode
-  let valuePerWallet: bigint;
-  if (phaseEligibility.mode === "public") {
-    // Public mint — price from on-chain
-    const localPlan = await buildLocalMintPlan(rpcUrls[0], nftInput, quantity);
-    if (!localPlan) throw new Error("Could not build local mint plan for public phase.");
-    valuePerWallet = localPlan.value;
-  } else {
-    // Signed/allowlist mint — price from payload
-    valuePerWallet = phaseEligibility.signedPayload?.value || selectedDrop.mintPrice * BigInt(quantity);
-  }
-
-  const required = BigInt(gas.defaultGasLimit) * gas.maxFeePerGasWei + valuePerWallet;
-
-  const input: SnipeReadyInput = {
-    chainProfile,
-    rpcUrls,
-    wallets,
-    balances,
-    nftContract: nftInput,
-    quantity,
-    valuePerWallet,
-    required,
-    gasLimit: gas.defaultGasLimit,
-    maxFeePerGas: gas.maxFeePerGasWei,
-    maxPriorityFeePerGas: gas.maxPriorityFeePerGasWei,
-    targetStart: targetStart,
-    timingLabel,
-    modeLabel: `${phaseEligibility.mode === "public" ? "PUBLIC (on-chain)" : "SIGNED (OpenSea)"} — ${selectedDrop.name || "selected phase"}`,
-    targetLabel: target.label,
-    promptForGas: false,
-  };
-
-  const { shortCount } = displayBalances(input);
-  if (shortCount === wallets.length) {
-    throw new Error("Every wallet is underfunded — nothing could be broadcast.");
-  }
-
-  // ── 15. Confirm ────────────────────────────────────────────────────────
-  const didConfirm = await confirmSnipe(input);
-  if (!didConfirm) {
-    closePrompts();
-    return;
-  }
-
-  closePrompts();
-
-  // ── 16. Execute ──────────────────────────────────────────────────────────
-  if (phaseEligibility.mode === "public") {
-    // Public phase — on-chain calldata, no OpenSea needed
-    const localPlan = await buildLocalMintPlan(rpcUrls[0], nftInput, quantity);
-    if (!localPlan) {
-      throw new Error("Could not build local mint plan for public phase.");
+    // Determine required funds based on mint mode
+    let valuePerWallet: bigint;
+    if (phaseEligibility.mode === "public") {
+      // Public mint — price from on-chain
+      const localPlan = await buildLocalMintPlan(rpcUrls[0], nftInput, quantity);
+      if (!localPlan) throw new Error("Could not build local mint plan for public phase.");
+      valuePerWallet = localPlan.value;
+    } else {
+      // Signed/allowlist mint — price from payload
+      valuePerWallet = phaseEligibility.signedPayload?.value || selectedDrop.mintPrice * BigInt(quantity);
     }
 
-    await localPublicSnipe({
+    const required = BigInt(gas.defaultGasLimit) * gas.maxFeePerGasWei + valuePerWallet;
+
+    const input: SnipeReadyInput = {
+      chainProfile,
+      rpcUrls,
+      wallets,
+      balances,
       nftContract: nftInput,
       quantity,
-      walletKeys,
-      rpcUrls,
-      maxFeePerGas: gas.maxFeePerGasWei,
-      maxPriorityFee: gas.maxPriorityFeePerGasWei,
+      valuePerWallet,
+      required,
       gasLimit: gas.defaultGasLimit,
-      targetStart: targetStart || new Date(selectedDrop.startTime * 1000),
-      plan: localPlan,
-      maxPriceWei,
-    });
-  } else {
-    // Signed/allowlist phase — needs OpenSea signed payload
-    if (!phaseEligibility.signedPayload) {
-      throw new Error(
-        `Signed payload unavailable for phase "${selectedDrop.name || "selected"}".\n` +
-          `  OpenSea did not return wallet-specific signed data.\n` +
-          `  Get an OpenSea API key and ensure your wallet is allowlisted.\n` +
-          `  Or switch to a public phase if one is available.`
+      maxFeePerGas: gas.maxFeePerGasWei,
+      maxPriorityFeePerGas: gas.maxPriorityFeePerGasWei,
+      targetStart: targetStart,
+      timingLabel,
+      modeLabel: `${phaseEligibility.mode === "public" ? "PUBLIC (on-chain)" : "SIGNED (OpenSea)"} — ${selectedDrop.name || "selected phase"}`,
+      targetLabel: target.label,
+      promptForGas: false,
+    };
+
+    const { shortCount } = displayBalances(input);
+    if (shortCount === wallets.length) {
+      throw new Error("Every wallet is underfunded — nothing could be broadcast.");
+    }
+
+    // ── 15. Confirm ────────────────────────────────────────────────────────
+    const didConfirm = await confirmSnipe(input);
+    if (!didConfirm) {
+      closePrompts();
+      return;
+    }
+
+    closePrompts();
+
+    // ── 15b. Sell-after-mint scheduling ────────────────────────────────────
+    // Scheduled BEFORE the mint, on purpose. An offer book read now is stale by
+    // T-0, so nothing is quoted from it here: only the gas cost is estimated.
+    // The offers themselves are read after the mint, per wallet, one at a time.
+    let sellPlan: SellPlan | null = null;
+    if (slug && apiKey) {
+      sellPlan = await planSellAfterMint({
+        chainKey,
+        apiKey,
+        symbol,
+        mintQuantity: quantity,
+        valuePerWallet,
+        rpcUrl: rpcUrls[0],
+      });
+    } else {
+      console.log(
+        chalk.gray(
+          slug
+            ? "\n  (no OpenSea API key — sell-after-mint is unavailable)"
+            : "\n  (no collection slug — sell-after-mint is unavailable)"
+        )
       );
     }
 
-    const payload = phaseEligibility.signedPayload;
-    const mintPlan = buildFcfsMintPlan(
-      payload, gas.defaultGasLimit, gas.maxFeePerGasWei, gas.maxPriorityFeePerGasWei, quantity
-    );
+    // ── 16. Execute ──────────────────────────────────────────────────────────
+    // Per-wallet mint outcome, kept so the sell step can act on exactly the
+    // wallets whose mint succeeded — a failed mint must not sell anything.
+    let mintOutcomes: {
+      walletIndex: number;
+      address: string;
+      txHash: string | null;
+      status: string;
+    }[] = [];
 
-    // Pre-fetch a signed payload for EVERY wallet now, while the drop is still
-    // future. mintSignature is wallet-specific, so each wallet needs its own.
-    // Passing these in keeps the T-0 path free of API calls.
-    console.log(chalk.gray(`\n  Pre-fetching signed payloads for ${walletKeys.length} wallet(s)...`));
-    const preFetched: (FcfsSignedPayload | null)[] = [];
-    for (let i = 0; i < walletKeys.length; i++) {
-      const w = new Wallet(walletKeys[i]);
-      try {
-        const p = await fetchSignedPayloadForWallet(
-          nftInput,
-          quantity,
-          w.address,
-          apiKey,
-          { timeoutMs: 15000, session: sessionResults[i]?.session ?? null, slug: slug || undefined, chainKey },
-        );
-        preFetched.push(p);
-        if (!p) console.log(chalk.yellow(`    ${w.address} — no payload (will retry at T-0)`));
-      } catch (err: any) {
-        console.log(chalk.yellow(`    ${w.address} — pre-fetch failed: ${err.message}`));
-        preFetched.push(null);
+    if (phaseEligibility.mode === "public") {
+      // Public phase — on-chain calldata, no OpenSea needed
+      const localPlan = await buildLocalMintPlan(rpcUrls[0], nftInput, quantity);
+      if (!localPlan) {
+        throw new Error("Could not build local mint plan for public phase.");
       }
+
+      mintOutcomes = (await localPublicSnipe({
+        nftContract: nftInput,
+        quantity,
+        walletKeys,
+        rpcUrls,
+        maxFeePerGas: gas.maxFeePerGasWei,
+        maxPriorityFee: gas.maxPriorityFeePerGasWei,
+        gasLimit: gas.defaultGasLimit,
+        targetStart: targetStart || new Date(selectedDrop.startTime * 1000),
+        plan: localPlan,
+        maxPriceWei,
+      }));
+    } else {
+      // Signed/allowlist phase — needs OpenSea signed payload
+      if (!phaseEligibility.signedPayload) {
+        throw new Error(
+          `Signed payload unavailable for phase "${selectedDrop.name || "selected"}".\n` +
+            `  OpenSea did not return wallet-specific signed data.\n` +
+            `  Get an OpenSea API key and ensure your wallet is allowlisted.\n` +
+            `  Or switch to a public phase if one is available.`
+        );
+      }
+
+      const payload = phaseEligibility.signedPayload;
+      const mintPlan = buildFcfsMintPlan(
+        payload, gas.defaultGasLimit, gas.maxFeePerGasWei, gas.maxPriorityFeePerGasWei, quantity
+      );
+
+      // Pre-fetch a signed payload for EVERY wallet now, while the drop is still
+      // future. mintSignature is wallet-specific, so each wallet needs its own.
+      // Passing these in keeps the T-0 path free of API calls.
+      console.log(chalk.gray(`\n  Pre-fetching signed payloads for ${walletKeys.length} wallet(s)...`));
+      const preFetched: (FcfsSignedPayload | null)[] = [];
+      for (let i = 0; i < walletKeys.length; i++) {
+        const w = new Wallet(walletKeys[i]);
+        try {
+          const p = await fetchSignedPayloadForWallet(
+            nftInput,
+            quantity,
+            w.address,
+            apiKey,
+            { timeoutMs: 15000, session: sessionResults[i]?.session ?? null, slug: slug || undefined, chainKey },
+          );
+          preFetched.push(p);
+          if (!p) console.log(chalk.yellow(`    ${w.address} — no payload (will retry at T-0)`));
+        } catch (err: any) {
+          console.log(chalk.yellow(`    ${w.address} — pre-fetch failed: ${err.message}`));
+          preFetched.push(null);
+        }
+      }
+
+      const snipeResults = await executeFcfsSnipe({
+        nftContract: nftInput,
+        quantity,
+        walletKeys,
+        rpcUrls,
+        maxFeePerGas: gas.maxFeePerGasWei,
+        maxPriorityFeePerGas: gas.maxPriorityFeePerGasWei,
+        gasLimit: gas.defaultGasLimit,
+        targetStart: targetStart || new Date(selectedDrop.startTime * 1000),
+        plan: mintPlan,
+        payloads: preFetched,
+        sessions: sessionResults.map((sr) => sr.session),
+        slug: slug || undefined,
+        chainKey,
+        maxPriceWei,
+        // OpenSea's per-wallet quote for the selected stage, so a price that
+        // rose after the eligibility check is refused before fetching a payload.
+        quotedPriceWei: phaseEligibility.priceWei ?? null,
+      });
+      mintOutcomes = snipeResults.map((r) => ({
+        walletIndex: r.walletIndex,
+        address: r.walletAddress,
+        txHash: r.txHash ?? null,
+        status:
+          // Prefer the confirmed tri-state from the snipe; fall back to the
+          // old derivation for results built before the receipt stage.
+          r.status ??
+          (r.receipt?.status === "REVERTED"
+            ? "REVERTED"
+            : r.success
+              ? "SUCCESS"
+              : "FAILED"),
+      }));
     }
 
-    await executeFcfsSnipe({
-      nftContract: nftInput,
-      quantity,
-      walletKeys,
-      rpcUrls,
-      maxFeePerGas: gas.maxFeePerGasWei,
-      maxPriorityFeePerGas: gas.maxPriorityFeePerGasWei,
-      gasLimit: gas.defaultGasLimit,
-      targetStart: targetStart || new Date(selectedDrop.startTime * 1000),
-      plan: mintPlan,
-      payloads: preFetched,
-      sessions: sessionResults.map((sr) => sr.session),
-      slug: slug || undefined,
-      chainKey,
-      maxPriceWei,
-    });
+    // ── 17. Sell after mint ──────────────────────────────────────────────────
+    if (sellPlan?.enabled) {
+      await runSellAfterMint({
+        sellPlan,
+        walletKeys,
+        contract: nftInput,
+        slug: slug!,
+        chainKey,
+        apiKey: apiKey!,
+        rpcUrl: rpcUrls[0],
+        chainId: chainProfile.chainId,
+        mintOutcomes,
+      });
+    }
+  } finally {
+    // ethers keeps a polling timer alive on every provider; without an explicit
+    // destroy the wizard finishes its work but the process never exits.
+    try {
+      provider.destroy();
+    } catch {
+      // Already destroyed.
+    }
   }
 }
 
@@ -606,6 +717,13 @@ async function executeUniversalMint(
 
   const results: { wallet: string; ok: boolean; hash?: string; error?: string }[] = [];
 
+  // A provider-less Wallet signs exactly what it is given (ethers v6
+  // BaseWallet.signTransaction does not populate), so a missing nonce or chain id
+  // defaults to 0 — and every node rejects a chainId-0 transaction with
+  // "transaction type not supported". One shared provider supplies both.
+  const nonceProvider = new JsonRpcProvider(rpcUrls[0], undefined, { staticNetwork: true });
+
+  try {
   for (const key of walletKeys) {
     const wallet = new Wallet(key);
     const txRequest = {
@@ -650,7 +768,15 @@ async function executeUniversalMint(
     }
 
     try {
-      const signed = await wallet.signTransaction(txRequest);
+      // Read the nonce here, immediately before signing: any intervening wallet
+      // activity advances it and every endpoint then rejects the tx as
+      // "nonce too low".
+      const nonce = await nonceProvider.getTransactionCount(wallet.address, "pending");
+      const signed = await wallet.signTransaction({
+        ...txRequest,
+        nonce,
+        chainId: chainProfile.chainId,
+      });
       const endpoints = parseRpcEndpoints(rpcUrls);
       const { txHash } = blastToAll(signed, endpoints);
       results.push({ wallet: wallet.address, ok: true, hash: txHash });
@@ -658,6 +784,15 @@ async function executeUniversalMint(
     } catch (err: any) {
       results.push({ wallet: wallet.address, ok: false, error: err.message });
       console.log(chalk.red(`  ✗ ${short(wallet.address)} — ${err.message}`));
+    }
+  }
+  } finally {
+    // ethers keeps a polling timer alive on every provider; without an explicit
+    // destroy the process never exits.
+    try {
+      nonceProvider.destroy();
+    } catch {
+      // Already destroyed.
     }
   }
 
@@ -779,10 +914,12 @@ async function probeAllWallets(
   chainKey: string,
 ): Promise<WalletEligibility[]> {
   const results: WalletEligibility[] = [];
-  // Soonest-starting phase first. The wizard's phase picker indexes into this
-  // array, and the pre-fetch loop walks it in order — an unsorted inventory
-  // means the sniper can target a later phase while an earlier one opens.
-  const orderedDrops = orderDropsByStartTime(inventory.drops);
+  // Soonest-starting phase first. The wizard's phase picker returns a
+  // phaseIndex that the CALLER uses to index inventory.drops, so this MUST sort
+  // the inventory in place — sorting a copy made the picker select the wrong
+  // phase whenever the inventory was not already in start-time order.
+  sortByStartTime(inventory.drops);
+  const orderedDrops = inventory.drops;
 
   for (let wIdx = 0; wIdx < wallets.length; wIdx++) {
     const wallet = wallets[wIdx];
@@ -820,177 +957,111 @@ async function probePhaseForWallet(
   // 1. Run local classification
   const { mode, fireableLocally, preFetchNeeded } = classifyMintMode(drop);
 
-  // 2. Determine eligibility
+  // 2. Determine eligibility.
+  //
+  // One provider answers the verdict. Public stages resolve locally — OpenSea
+  // leaves their per-wallet fields null and no session is needed. Every other
+  // stage is asked directly, and the whole-collection response is scoped to this
+  // phase's stage uuid, so an open public stage elsewhere in the collection
+  // cannot make a presale phase look eligible.
+  //
+  // It returns null when there is no session/slug to ask with, or when OpenSea's
+  // answer cannot be attributed to this phase. The inventory heuristic is then
+  // the fallback, and for signed stages the signed-payload fetch below is the
+  // remaining evidence.
   let eligible = false;
   let reason = "";
   let signedPayload: FcfsSignedPayload | null = null;
   let signedPayloadError: string | null = null;
-  let dropEligibilityInfo: DropEligibilityResult | null = null;
-  let restEligibility: Awaited<ReturnType<typeof fetchRestEligibility>> = null;
 
-  if (mode === "public") {
-    // Public phase — always eligible (on-chain, no allowlist)
-    eligible = true;
-    reason = "Public phase — open to all, no allowlist required.";
-  } else if (mode === "signed" || mode === "allowlist") {
-    // Non-public phase — check per-stage eligibility. Two documented paths:
-    //   1. GQL DropEligibilityQuery (richer: names the eligible wallet, quotes
-    //      a per-wallet price). Requires a wallet JWT.
-    //   2. REST GET /api/v2/drops/{slug}/eligibility (the API's own endpoint;
-    //      same JWT requirement, simpler response).
-    // Try GQL first, then REST, and use whichever answers. Both need a session.
-    if (collectionSlug && session) {
-      const cookie = sessionToStoredSessionCookie(session);
-      try {
-        dropEligibilityInfo = await getDropEligibility(
-          collectionSlug,
-          walletAddr,
-          cookie,
-          apiKey,
-          12000,
-        );
-      } catch {
-        dropEligibilityInfo = null;
-      }
+  const cookie = session ? sessionToStoredSessionCookie(session) : null;
+  const baseReport = await getPhaseEligibility({
+    drop,
+    wallet: walletAddr,
+    slug: collectionSlug,
+    cookie,
+    apiKey,
+    timeoutMs: 12000,
+  });
 
-      // REST fallback when GQL yielded nothing usable (rate-limited, or the
-      // eligibility fields came back UNAUTHORIZED).
-      if (!dropEligibilityInfo || !dropEligibilityInfo.authed) {
-        const rest = await fetchRestEligibility(collectionSlug, cookie, apiKey, 12000);
-        if (rest) {
-          restEligibility = rest;
-          console.log(
-            chalk.gray(`    REST eligibility: ${rest.stages.filter((s) => s.isEligible).length}/${rest.stages.length} stage(s) eligible`)
-          );
-        }
-      }
-    }
-
-    // Check if GQL already confirmed the wallet is NOT eligible for any stage.
-    if (dropEligibilityInfo && dropEligibilityInfo.authed) {
-      // OpenSea names the wallet each stage's eligibility belongs to. If it
-      // names a different address, this result is not about our wallet and the
-      // isEligible flags must not be trusted.
-      const foreignStage = dropEligibilityInfo.stages.find(
-        (s) => s.eligibleMinterAddress &&
-          s.eligibleMinterAddress.toLowerCase() !== walletAddr.toLowerCase()
-      );
-      if (foreignStage) {
-        eligible = false;
-        reason = `GQL DropEligibilityQuery returned eligibility for ${foreignStage.eligibleMinterAddress}, not ${walletAddr} — ignoring.`;
-      } else {
-        const anyEligible = dropEligibilityInfo.stages.some((s) => s.isEligible === true);
-        if (!anyEligible) {
-          eligible = false;
-          reason = "GQL DropEligibilityQuery: wallet is authenticated but not eligible for any stage.";
-          // Skip the signed payload fetch — wallet is confirmed not allowlisted.
-        } else {
-          eligible = true;
-          reason = "GQL DropEligibilityQuery: wallet is eligible for at least one stage.";
-        }
-      }
-    } else if (restEligibility) {
-      // GQL gave nothing usable; the REST endpoint answered. It is
-      // wallet-scoped (the JWT identifies the wallet), so a positive result
-      // is authoritative.
-      const anyEligible = restEligibility.stages.some((s) => s.isEligible);
-      if (anyEligible) {
-        eligible = true;
-        reason = "REST eligibility: wallet is eligible for at least one stage.";
-      } else {
-        eligible = false;
-        reason = "REST eligibility: wallet is not eligible for any stage.";
-      }
-    }
-
-    // If not already resolved by GQL pre-check, try to fetch signed payload
-    if (!eligible) {
-      // Non-public phase — try to fetch signed payload for this specific wallet
-      // Use the slug if available for better slug→CA resolution
-      try {
-        // Try with API key first (path A)
-        signedPayload = await fetchSignedPayload(
-          drop.nftContract,
-          quantity,
-          apiKey,
-          { timeoutMs: 12000, walletAddress: wallet.address, slug: collectionSlug || undefined, chainKey },
-        );
-
-        if (signedPayload) {
-          // OpenSea quoted a per-wallet price for this stage. A mismatch is
-          // worth surfacing, but the units of GQL `eligiblePrice.token.unit`
-          // are not documented, so we WARN rather than reject — a false
-          // rejection here would silently skip a mint we were eligible for.
-          // TODO: confirm the unit (wei vs ETH) against a live drop, then
-          // promote this to a hard check.
-          const quoted = dropEligibilityInfo?.stages.find(
-            (s) => s.isEligible === true && s.priceUnit != null
-          )?.priceUnit;
-          if (quoted != null) {
-            const expectedWei = BigInt(quoted) * BigInt(quantity);
-            if (signedPayload.value !== expectedWei) {
-              console.warn(
-                `    ⚠ Price mismatch for ${wallet.address}: payload value ${signedPayload.value} wei ` +
-                `vs OpenSea quoted ${quoted} × ${quantity} = ${expectedWei} wei. Proceeding.`
-              );
-            }
-          }
-          eligible = true;
-          reason = "Signed payload fetched successfully — wallet is allowlisted.";
-        } else {
-          // Use the per-wallet SIWE session from warmAllSessions
-          if (session) {
-            signedPayload = await fetchSignedPayloadWithSession(
-              drop.nftContract,
-              quantity,
-              session,
-              apiKey,
-              { timeoutMs: 12000, walletAddress: wallet.address, slug: collectionSlug || undefined, chainKey },
-            );
-            if (signedPayload) {
-              eligible = true;
-              reason = "Signed payload fetched with SIWE session — wallet is allowlisted.";
-            } else {
-              eligible = false;
-              reason = "No signed payload available. Wallet may not be allowlisted, or needs a live session.";
-            }
-          } else {
-            eligible = false;
-            signedPayloadError = "No SIWE session available for wallet.";
-            reason = "Signed payload requires OpenSea session (SIWE) — no session available.";
-          }
-        }
-      } catch (err: any) {
-        if (err.message?.includes("rate-limited")) {
-          signedPayloadError = err.message;
-          eligible = false;
-          reason = `OpenSea rate-limited the signed payload lookup. Retry in a few seconds.`;
-        } else {
-          signedPayloadError = err.message;
-          eligible = false;
-          reason = `Error fetching signed payload: ${err.message}`;
-        }
-      }
-    }
-  } else if (mode === "token-gated") {
-    // Token-gated — check if wallet holds the gate token
-    // On-chain phases don't have gate token info; need OpenSea metadata
-    const baseReport = assessDropEligibility(drop, walletAddr);
+  if (baseReport) {
     eligible = baseReport.ourWalletEligible ?? false;
     reason = baseReport.reason;
   } else {
-    // Unknown mode — use base eligibility
-    const baseReport = assessDropEligibility(drop, walletAddr);
-    eligible = baseReport.ourWalletEligible ?? false;
-    reason = baseReport.reason;
+    const fallback = assessDropEligibility(drop, walletAddr);
+    eligible = fallback.ourWalletEligible ?? false;
+    reason = fallback.reason;
+  }
+
+  // 3. Signed stages that are not a confirmed NO are still worth attempting:
+  //    OpenSea only issues a per-wallet payload to allowlisted wallets, so a
+  //    payload is itself evidence of eligibility. A confirmed NO skips the call.
+  const confirmedIneligible = baseReport != null && baseReport.ourWalletEligible === false;
+  if (!eligible && !confirmedIneligible && (mode === "signed" || mode === "allowlist")) {
+    try {
+      // Try with API key first (path A)
+      signedPayload = await fetchSignedPayload(
+        drop.nftContract,
+        quantity,
+        apiKey,
+        { timeoutMs: 12000, walletAddress: wallet.address, slug: collectionSlug || undefined, chainKey },
+      );
+
+      if (signedPayload) {
+        // OpenSea quoted a per-wallet price for this stage. A mismatch is worth
+        // surfacing, but the units of GQL `eligiblePrice.token.unit` are not
+        // documented, so we WARN rather than reject — a false rejection here
+        // would silently skip a mint we were eligible for.
+        if (baseReport?.priceWei != null) {
+          const expectedWei = baseReport.priceWei * BigInt(quantity);
+          if (signedPayload.value !== expectedWei) {
+            console.warn(
+              `    ⚠ Price mismatch for ${wallet.address}: payload value ${signedPayload.value} wei ` +
+              `vs OpenSea quoted ${formatEther(baseReport.priceWei)} × ${quantity} = ${expectedWei} wei. Proceeding.`
+            );
+          }
+        }
+        eligible = true;
+        reason = "Signed payload fetched successfully — wallet is allowlisted.";
+      } else if (session) {
+        // Use the per-wallet SIWE session from warmAllSessions
+        signedPayload = await fetchSignedPayloadWithSession(
+          drop.nftContract,
+          quantity,
+          session,
+          apiKey,
+          { timeoutMs: 12000, walletAddress: wallet.address, slug: collectionSlug || undefined, chainKey },
+        );
+        if (signedPayload) {
+          eligible = true;
+          reason = "Signed payload fetched with SIWE session — wallet is allowlisted.";
+        } else {
+          eligible = false;
+          reason = "No signed payload available. Wallet may not be allowlisted, or needs a live session.";
+        }
+      } else {
+        eligible = false;
+        signedPayloadError = "No SIWE session available for wallet.";
+        reason = "Signed payload requires OpenSea session (SIWE) — no session available.";
+      }
+    } catch (err: any) {
+      if (err.message?.includes("rate-limited")) {
+        signedPayloadError = err.message;
+        eligible = false;
+        reason = `OpenSea rate-limited the signed payload lookup. Retry in a few seconds.`;
+      } else {
+        signedPayloadError = err.message;
+        eligible = false;
+        reason = `Error fetching signed payload: ${err.message}`;
+      }
+    }
   }
 
   return {
     drop,
     signedPayload,
     signedPayloadError,
-    dropEligibilityInfo,
-    restEligibility,
+    priceWei: baseReport?.priceWei ?? null,
     eligible,
     reason,
     mode,
@@ -1021,16 +1092,20 @@ function printEligibilityReport(
     for (let pIdx = 0; pIdx < we.phaseReports.length; pIdx++) {
       const report = we.phaseReports[pIdx];
       const drop = report.drop;
-      const startsAt = new Date(drop.startTime * 1000);
-      const endsAt = new Date(drop.endTime * 1000);
+      // 0 means "unknown", never 1970-01-01.
+      const startMs = drop.startTime > 0 ? drop.startTime * 1000 : null;
+      const endMs = drop.endTime > 0 ? drop.endTime * 1000 : null;
       const now = Date.now();
-      const isLive = now >= drop.startTime * 1000 && now < drop.endTime * 1000;
+      const isLive = startMs != null && endMs != null && now >= startMs && now < endMs;
+      const notStarted = startMs != null && now < startMs;
 
       const liveBadge = isLive
         ? chalk.green("(LIVE)")
-        : now < drop.startTime * 1000
+        : notStarted
           ? chalk.yellow("(future)")
-          : chalk.gray("(ended)");
+          : endMs == null
+            ? chalk.gray("(unknown window)")
+            : chalk.gray("(ended)");
 
       const modeBadge =
         report.mode === "public"
@@ -1041,13 +1116,18 @@ function printEligibilityReport(
               ? chalk.magenta("[ALLOWLIST]")
               : chalk.gray(`[${report.mode?.toUpperCase() || "UNKNOWN"}]`);
 
+      // Distinguish "no" from "could not tell". A missing session or an
+      // unresolved lookup is UNKNOWN — printing "NOT ELIGIBLE" for it is a
+      // false verdict, and it is the difference between "wait" and "give up".
       const eligBadge = report.eligible
         ? chalk.green("✓ ELIGIBLE")
-        : report.signedPayloadError?.includes("rate-limit")
-          ? chalk.yellow("⚠ RATE-LIMITED")
-          : report.signedPayload
-            ? chalk.green("✓ ELIGIBLE (signed)")
-            : chalk.red("✗ NOT ELIGIBLE");
+        : report.signedPayload
+          ? chalk.green("✓ ELIGIBLE (signed)")
+          : report.signedPayloadError?.includes("rate-limit")
+            ? chalk.yellow("⚠ RATE-LIMITED")
+            : report.signedPayloadError
+              ? chalk.yellow("⚠ UNKNOWN — could not verify")
+              : chalk.red("✗ NOT ELIGIBLE");
 
       console.log(chalk.gray(`    └─ Phase ${pIdx}: ${drop.name || "unnamed"} ${modeBadge} ${liveBadge} ${eligBadge}`));
       console.log(chalk.gray(`       type: ${drop.type || "unknown"} | price: ${formatEther(drop.mintPrice)} ETH`));
@@ -1070,7 +1150,10 @@ function printEligibilityReport(
 
     for (let pIdx = 0; pIdx < we.phaseReports.length; pIdx++) {
       const report = we.phaseReports[pIdx];
-      if (report.eligible) {
+      // A signed payload is as good as an eligibility verdict — it IS the
+      // per-wallet authorisation. The old filter counted only `eligible`, so a
+      // phase the badge called "✓ ELIGIBLE (signed)" was absent from the summary.
+      if (report.eligible || report.signedPayload) {
         hasEligible = true;
         const drop = report.drop;
         const isLive = Date.now() >= drop.startTime * 1000 && Date.now() < drop.endTime * 1000;
@@ -1244,10 +1327,9 @@ async function promptKeys(log: RunLogger, spec?: string | null): Promise<string[
   return keys;
 }
 
-// ── Environment wallet loading (ported from wallets.js) ─────────────────────
-// The TS port prompted for keys interactively and had no way to load them from
-// the environment, so a headless run was impossible. Priority order matches the
-// JS original: PRIVATE_KEY, then PRIVATE_KEYS, then WALLETS_FILE.
+// ── Environment wallet loading ──────────────────────────────────────────────
+// Keys can be supplied non-interactively so a headless run is possible.
+// Priority order: PRIVATE_KEY, then PRIVATE_KEYS, then WALLETS_FILE.
 
 export interface LoadedWallet {
   address: string;
@@ -1289,7 +1371,6 @@ export function loadEnvKeys(): LoadedWallet[] {
 
 /**
  * Select a subset by spec: all | * | N | 1,3,4 (1-based).
- * Ported from wallets.js selectWallets().
  */
 export function selectFromLoaded(all: LoadedWallet[], spec: string): LoadedWallet[] {
   if (!all.length) return [];
@@ -1436,25 +1517,4 @@ function labelOf(url: string): string {
 
 function short(addr: string): string {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
-}
-
-function formatRemaining(ms: number): string {
-  const sec = Math.floor(ms / 1000);
-  if (sec < 60) return `${sec}s`;
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m ${sec % 60}s`;
-  const hr = Math.floor(min / 60);
-  return `${hr}h ${min % 60}m`;
-}
-
-function gweiToWei(gwei: number): bigint {
-  return BigInt(Math.round(gwei * 1e9));
-}
-
-async function currentBaseFeeGwei(provider: JsonRpcProvider): Promise<number | null> {
-  const block = await provider.getBlock("latest");
-  if (!block) return null;
-  const baseFee = block.baseFeePerGas;
-  if (!baseFee) return null;
-  return Number(baseFee) / 1e9;
 }

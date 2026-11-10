@@ -1,6 +1,6 @@
 // ── ABI-driven mint discovery ───────────────────────────────────────────────
 //
-// The selector registry in mint-generic.ts is a fixed list of 37 signatures.
+// The selector registry in mint-generic.ts is a fixed list of signatures.
 // That caps coverage: Milady's real mint is `mintMiladys(uint256 numberOfTokens)`
 // and appears in no registry. The ABI is the truth.
 //
@@ -27,38 +27,28 @@ export interface AbiFetchResult {
 }
 
 /** Sourcify chain-path map. Only chains Sourcify serves need entries. */
-const SOURCIFY_CHAIN_PATHS: Record<number, string> = {
-  1: "1",
-  10: "10",
-  56: "56",
-  100: "100",
-  137: "137",
-  250: "250",
-  8453: "8453",
-  42161: "42161",
-  43114: "43114",
-  59144: "59144",
-  534352: "534352",
-  11155111: "11155111",
-};
-
-/** Fetch the verified ABI from Sourcify. Returns null when not verified. */
+/**
+ * Fetch the verified ABI from Sourcify. Returns null when not verified.
+ *
+ * The chain id IS the path segment (`/server/v2/contract/{chainId}/{address}`),
+ * so there is no chain map to maintain. A hardcoded identity map silently
+ * excluded every chain added after it — arc (5042) was missing. Verified live:
+ * an unknown chain returns HTTP 400 `unsupported_chain`, surfaced below.
+ */
 export async function fetchAbiFromSourcify(
   chainId: number,
   address: string,
   timeoutMs = 15_000
 ): Promise<AbiFetchResult> {
-  const path = SOURCIFY_CHAIN_PATHS[chainId];
-  if (!path) return { abi: null, source: null, error: `chain ${chainId} not served by Sourcify` };
-
-  const url = `https://sourcify.dev/server/v2/contract/${path}/${address}?fields=abi`;
+  const url = `https://sourcify.dev/server/v2/contract/${chainId}/${address}?fields=abi`;
   try {
     const res = await fetch(url, {
       signal: AbortSignal.timeout(timeoutMs),
       headers: { accept: "application/json" },
     });
     if (!res.ok) {
-      return { abi: null, source: null, error: `sourcify HTTP ${res.status}` };
+      const body = (await res.json().catch(() => null)) as any;
+      return { abi: null, source: null, error: `sourcify: ${body?.message ?? `HTTP ${res.status}`}` };
     }
     const json = (await res.json()) as any;
     if (!Array.isArray(json.abi) || json.abi.length === 0) {
@@ -257,6 +247,19 @@ export function classifyParam(name: string, type: string): ParamRole {
 }
 
 /**
+ * A type-correct zero value for a parameter we cannot derive, or undefined when
+ * the type has no safe zero. "0x" is only valid for dynamic `bytes`; for a
+ * `bytes32` it throws at encode time and the probe then reports a real mint as
+ * "selector absent", and for a `string` it encodes the literal text "0x".
+ */
+function zeroValueFor(type: string): string | undefined {
+  if (type === "bytes") return "0x";
+  if (type === "string") return "";
+  if (/^bytes\d+$/.test(type)) return "0x" + "00".repeat(Number(type.slice(5)));
+  return undefined;
+}
+
+/**
  * Build calldata arguments from an ABI candidate and a synthesis context.
  *
  * Returns { ok: false, reason } when a parameter cannot be filled safely — the
@@ -300,9 +303,14 @@ export function synthFromAbi(
         args.push(ctx.signature);
         break;
 
-      case "data":
-        args.push("0x");
+      case "data": {
+        const zero = zeroValueFor(input.type);
+        if (zero === undefined) {
+          return { ok: false, reason: `cannot synthesize a zero value for ${input.type} (${input.name})` };
+        }
+        args.push(zero);
         break;
+      }
 
       case "unknown":
         // A parameter we cannot classify. Refuse rather than guess — a wrong
@@ -323,6 +331,12 @@ export interface ProbeResult {
   /** True when the call succeeded (would have minted, if broadcast). */
   wouldSucceed: boolean;
   error?: string;
+  /**
+   * True when the call reverted with NO data. That is ambiguous between
+   * "selector absent" and "selector exists but reverted on state", so it must
+   * not be reported as proof the selector is missing.
+   */
+  revertedWithoutData?: boolean;
 }
 
 /**
@@ -358,7 +372,16 @@ export async function probeAbiCandidate(
     if (errData && errData !== "0x") {
       return { candidate, exists: true, wouldSucceed: false, error: e?.reason ?? e?.shortMessage };
     }
-    return { candidate, exists: false, wouldSucceed: false, error: e?.reason ?? e?.shortMessage };
+    // No revert data: the selector may be absent OR the call may have reverted
+    // on state (a bare require(false)). Flag the ambiguity rather than
+    // declaring the selector missing.
+    return {
+      candidate,
+      exists: false,
+      wouldSucceed: false,
+      error: e?.reason ?? e?.shortMessage ?? "reverted with no data",
+      revertedWithoutData: true,
+    };
   }
 }
 
@@ -381,8 +404,7 @@ export async function readPriceFromAbi(
   const getters = iface.fragments.filter(
     (f) =>
       f.type === "function" &&
-      (f as any).stateMutability === "view" ||
-      (f as any).stateMutability === "pure"
+      ((f as any).stateMutability === "view" || (f as any).stateMutability === "pure")
   ) as any[];
   const viewGetters = getters.filter(
     (f) =>

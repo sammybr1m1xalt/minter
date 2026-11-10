@@ -1,8 +1,5 @@
 // ── Unified mint-target parsing and resolution ──────────────────────────────
 //
-// Ported from nft-minter-bot/src/parse.js + resolve.js, and extended to cover
-// every platform the minter can actually reach.
-//
 // The TS port had parseNftLink (OpenSea only) and resolveSlug (OpenSea only).
 // A Scatter or Manifold link was not parseable at all, and a bare slug with no
 // chain context could not be resolved. This module is the single entry point:
@@ -23,14 +20,12 @@
 import { parseNftLink } from "./nft-link";
 import { resolveSlug, isSlug } from "./slug-resolver";
 import { getScatterCollection, ScatterCollection } from "./scatter";
-import { chainKeyFromId } from "./chains";
+import { CHAINS, chainKeyFromId } from "./chains";
 
 const ADDR = "0x[a-fA-F0-9]{40}";
 
 // ── Chain aliases ───────────────────────────────────────────────────────────
-// Ported from parse.js chainSlug(). The TS port handled only a handful of
-// aliases, so "matic", "arb", "op", "avax", "bnb" all failed on the command
-// line. Unknown values pass through lowercased, matching the original.
+// Handles the common aliases. Unknown values pass through lowercased.
 
 const CHAIN_ALIASES: Record<string, string> = {
   ethereum: "ethereum", eth: "ethereum", mainnet: "ethereum",
@@ -45,11 +40,29 @@ const CHAIN_ALIASES: Record<string, string> = {
   peaq: "peaq",
   "robinhood-chain": "robinhood", robinhood: "robinhood", rhoc: "robinhood",
   "arc-network": "arc", arc: "arc", circle: "arc",
+  soneium: "soneium",
 };
 
 export function chainSlug(s: string | null | undefined): string {
   if (!s) return "ethereum";
   return CHAIN_ALIASES[s.trim().toLowerCase()] ?? s.trim().toLowerCase();
+}
+
+// The set of chains this build can actually mint on, derived from the chain
+// table so it can never drift from it. The alias table above still normalises
+// names for platforms that name chains we do not serve (OpenSea returns
+// "polygon", "arbitrum", ...); those resolve to a key resolveRpcsForChain
+// rejects, which is why every branch below is validated against this set.
+const SUPPORTED_CHAIN_KEYS = new Set(CHAINS.map((c) => c.key));
+
+/** True when this chain key is one the tool can serve. */
+export function isSupportedChainKey(key: string | null | undefined): boolean {
+  return !!key && SUPPORTED_CHAIN_KEYS.has(key.trim().toLowerCase());
+}
+
+/** The supported chain keys, for error messages. */
+export function supportedChainKeys(): string[] {
+  return CHAINS.map((c) => c.key);
 }
 
 // ── Target descriptor ───────────────────────────────────────────────────────
@@ -113,7 +126,7 @@ function stripUrls(s: string): string {
 /**
  * Parse any mint-target input into a descriptor.
  *
- * Mirrors parse.js, with one extension: a bare slug is tagged `opensea` at
+ * A bare slug is tagged `opensea` at
  * parse time (the primary platform) and re-tried as Scatter during resolution
  * if OpenSea cannot resolve it.
  */
@@ -206,7 +219,7 @@ export function parseTarget(input: string): ParsedTarget {
 
   // Bare slug, optionally followed by a chain alias and/or a quantity
   // ("de-bots matic", "de-bots on arb", "de-bots base 3"). The "on" filler is
-  // ignored, matching parse.js.
+  // ignored.
   m = s.match(/^([a-zA-Z0-9._-]+)(?:\s+on)?\s+([a-zA-Z][a-zA-Z0-9-]*)(?:\s+x?(\d+))?$/);
   if (m && CHAIN_ALIASES[m[2].toLowerCase()]) {
     return {
@@ -235,6 +248,19 @@ export function parseTarget(input: string): ParsedTarget {
  * contract, and guessing one would mean minting against an address we invented.
  */
 export async function resolveTarget(
+  target: ParsedTarget,
+  apiKey = "",
+  preferredChain?: string
+): Promise<ResolvedTarget | null> {
+  const resolved = await resolveTargetUnchecked(target, apiKey, preferredChain);
+  if (!resolved) return null;
+  // A chain key this build cannot serve would otherwise throw deep inside
+  // resolveRpcsForChain at mint time — long after the user committed to a run.
+  // Refuse here so the caller can report an unresolvable target.
+  return isSupportedChainKey(resolved.chainKey) ? resolved : null;
+}
+
+async function resolveTargetUnchecked(
   target: ParsedTarget,
   apiKey = "",
   preferredChain?: string
@@ -268,19 +294,26 @@ export async function resolveTarget(
         // Fall through to Scatter — a bare slug is ambiguous.
       }
 
-      const scatter = await getScatterCollection(target.slug);
-      if (scatter) {
-        const chainKey = chainKeyFromId(scatter.chainId);
-        if (chainKey) {
-          return {
-            platform: "scatter",
-            contract: scatter.address,
-            chainKey,
-            scatter,
-            amount: target.amount,
-            resolvedViaFallback: true,
-          };
+      // Fall through to Scatter — a bare slug is ambiguous. A Scatter outage
+      // must resolve to "unresolvable", not throw out of resolveTarget (the
+      // OpenSea branch above already swallows its own failures).
+      try {
+        const scatter = await getScatterCollection(target.slug);
+        if (scatter) {
+          const chainKey = chainKeyFromId(scatter.chainId);
+          if (chainKey) {
+            return {
+              platform: "scatter",
+              contract: scatter.address,
+              chainKey,
+              scatter,
+              amount: target.amount,
+              resolvedViaFallback: true,
+            };
+          }
         }
+      } catch {
+        // Scatter unreachable — treat as not found.
       }
       return null;
     }
@@ -350,6 +383,11 @@ export async function parseAndResolve(
   const parsed = parseTarget(input);
   const resolved = await resolveTarget(parsed, apiKey, preferredChain);
   if (!resolved) {
+    if (parsed.chain && !isSupportedChainKey(parsed.chain)) {
+      throw new Error(
+        `Chain "${parsed.chain}" is not supported by this build. Supported chains: ${supportedChainKeys().join(", ")}.`
+      );
+    }
     if (parsed.platform === "manifold") {
       throw new Error(
         `Manifold claim "${parsed.claimId}" cannot be resolved automatically — ` +

@@ -30,9 +30,11 @@
 // This is the same speed as public mint for signed phases too — the only difference
 // is that you need to have done the API round-trip BEFORE the window opens.
 
+import path from "path";
 import chalk from "chalk";
 import { Wallet, Interface, JsonRpcProvider } from "ethers";
-import { parseRpcEndpoints, prepareBlast, blastToAll, waitForReceipt } from "./rpc-blast";
+import { parseRpcEndpoints, prepareBlast, blastToAll, waitForReceipt, type PreparedBlast } from "./rpc-blast";
+import { resolveChain } from "./chains";
 import { fetchOnChainDrops } from "./seadrop-onchain";
 import type { DropPhase } from "./fcfs-drops";
 import { normalizeStageType } from "./fcfs-drops";
@@ -40,10 +42,12 @@ import { isPayloadBoundToWallet } from "./seadrop-calldata";
 export { isPayloadBoundToWallet } from "./seadrop-calldata";
 import { SEADROP_ADDRESS } from "./seadrop-public";
 import { ConfirmedTx } from "./rpc-health";
-import { buildOpenseaMint, OpenseaMintTx } from "./opensea-gql";
+import { buildOpenseaMint, OpenseaMintTx, parsePriceField, parsePriceToWei } from "./opensea-gql";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
 import { autoGasBounded } from "./auto-gas";
+import { withDeadlineOrThrow } from "./deadline";
 import { assertPriceProtection } from "./price-protection";
+import { warmConnections, pingRpcs } from "./connection-warmer";
 
 // ── OpenSea v2 shapes (read from the live response, not hardcoded magic) ──
 
@@ -131,15 +135,39 @@ export async function measureRpcLatency(urls: string[], timeoutMs = 3000): Promi
 
 // ── OpenSea session — refreshable OAuth token, stored on disk ───────────────
 
-const SESSION_DIR = process.env.OPENSEA_SESSION_DIR
-  ? process.env.OPENSEA_SESSION_DIR
-  : (() => {
-      const d = process.env.HOME ? `${process.env.HOME}/.nft-public-mint` : "";
-      try { require("fs").mkdirSync(d, { recursive: true }); } catch {}
-      return d;
-    })();
+const SESSION_DIR = (() => {
+  const explicit = process.env.OPENSEA_SESSION_DIR?.trim();
+  if (explicit) return explicit;
+  // Everything the minter stores lives inside the project, never in the user's
+  // home directory. PACKAGE_ROOT is the directory holding package.json (dist/..
+  // once compiled), so the cache follows the install rather than the machine —
+  // and clearing ~/.nft-public-mint cannot invalidate a working setup.
+  const d = path.join(path.resolve(__dirname, ".."), ".minter-session");
+  try { require("fs").mkdirSync(d, { recursive: true, mode: 0o700 }); } catch {}
+  return d;
+})();
 
 const SESSION_FILE = `${SESSION_DIR}/opensea_session.json`;
+
+// A session cached by an older build under the user's home directory. Read once,
+// on first load, so an existing login survives the move. Never written to.
+const LEGACY_SESSION_FILE = (() => {
+  const home = process.env.HOME?.trim();
+  return home ? path.join(home, ".nft-public-mint", "opensea_session.json") : "";
+})();
+
+let legacySessionMigrated = false;
+
+function migrateLegacySession(): void {
+  if (legacySessionMigrated || !LEGACY_SESSION_FILE) return;
+  legacySessionMigrated = true;
+  try {
+    const fs = require("fs");
+    if (fs.existsSync(SESSION_FILE) || !fs.existsSync(LEGACY_SESSION_FILE)) return;
+    fs.copyFileSync(LEGACY_SESSION_FILE, SESSION_FILE);
+    console.log(chalk.gray(`  OpenSea: migrated the cached session from ${LEGACY_SESSION_FILE}`));
+  } catch {}
+}
 
 export interface StoredSession {
   accessToken: string;
@@ -149,6 +177,7 @@ export interface StoredSession {
 }
 
 export async function loadStoredSession(): Promise<StoredSession | null> {
+  migrateLegacySession();
   try {
     const raw = require("fs").readFileSync(SESSION_FILE, "utf-8");
     const s = JSON.parse(raw) as StoredSession;
@@ -160,7 +189,8 @@ export async function loadStoredSession(): Promise<StoredSession | null> {
 }
 
 export async function saveStoredSession(s: StoredSession): Promise<void> {
-  require("fs").writeFileSync(SESSION_FILE, JSON.stringify(s, null, 2), "utf-8");
+  // Contains a bearer token — owner-only.
+  require("fs").writeFileSync(SESSION_FILE, JSON.stringify(s, null, 2), { encoding: "utf-8", mode: 0o600 });
 }
 
 export async function clearStoredSession(): Promise<void> {
@@ -178,8 +208,8 @@ export function sessionToStoredSessionCookie(session: StoredSession): string {
 // Best for signed-mint / allowlist phases where OpenSea's GraphQL endpoint can
 // produce a per-wallet signed mint transaction without a full SIWE session.
 //
-// PRIMARY PATH: GraphQL MintActionTimelineQuery (via buildOpenseaMint) — this is
-// what the upstream nft-minter-bot uses. The GraphQL query binds the mint tx
+// PRIMARY PATH: GraphQL MintActionTimelineQuery (via buildOpenseaMint) — the
+// GraphQL query binds the mint tx
 // to a specific wallet address server-side and returns { to, data, value } ready
 // to sign+send. REST /api/v2/drops/{slug} is a fallback when GraphQL fails.
 //
@@ -196,7 +226,7 @@ export async function fetchSignedPayload(
 
   // ── Primary: GraphQL MintActionTimelineQuery ────────────────────────────
   // Requires a slug (for dropBySlug) and optionally a chainKey.
-  // The upstream always uses the slug — REST /api/v2/drops/{CA} returns 404
+  // Always use the slug — REST /api/v2/drops/{CA} returns 404
   // for raw contract addresses, which is why the old auto-mint path was broken.
   if (slug && slug.trim() && walletAddress) {
     try {
@@ -225,7 +255,7 @@ export async function fetchSignedPayload(
   // Only reached if no slug, no walletAddress, or GraphQL failed.
   // This POST endpoint returns per-wallet signed data when the slug is known.
   if (slug && walletAddress) {
-    const restPayload = await postMintTxFallback(slug, walletAddress, quantity, apiKey, timeoutMs, chainKey || "ethereum");
+    const restPayload = await postMintTxFallback(slug, walletAddress, quantity, apiKey, timeoutMs, chainKey || "ethereum", nftContract);
     if (restPayload) return restPayload;
   }
 
@@ -252,7 +282,7 @@ export async function fetchSignedPayload(
 function openseaMintTxToSignedPayload(
   tx: OpenseaMintTx,
   nftContract: string,
-  _quantity: number,
+  quantity: number,
 ): FcfsSignedPayload | null {
   if (!tx.data || tx.data === "0x" || tx.data.length < 10) return null;
 
@@ -261,15 +291,26 @@ function openseaMintTxToSignedPayload(
   // For PUBLIC_SALE, no signature is needed.
   const isSigned = tx.selector === "0x4b61cd6f" || tx.selector === "0x4300a4e6";
 
+  // `value` is the TOTAL transaction value (mintPrice × quantity) — the spec
+  // describes it as "Native currency to send with the transaction", and
+  // postMintTxFallback divides it by quantity for the same reason. Reporting it
+  // as the per-unit mintPrice overstated the price by `quantity ×` on every
+  // multi-token mint, and made the wizard print `total × quantity = total`.
+  const totalValue = tx.value;
+  const mintPrice = quantity > 0 ? totalValue / BigInt(quantity) : totalValue;
+
   return {
     seaDropAddress: tx.to,
     nftContract,
     feeRecipient: "0x0000000000000000000000000000000000000000", // fee recipient is in calldata for seaDrop
     mintData: tx.data,
     mintSignature: isSigned ? "0x0000000000000000000000000000000000000000000000000000000000000000" : "0x", // embedded in calldata
-    value: tx.value,
+    value: totalValue,
     drop: {
-      mintPrice: tx.value,
+      mintPrice,
+      // The MintActionTimeline response carries no stage window or per-wallet
+      // cap, so these stay 0 (= unknown). Callers that have the inventory should
+      // overlay it; 0 must never be read as 1970 or "unlimited".
       startTime: 0,
       endTime: 0,
       maxTotalMintableByWallet: 0,
@@ -280,61 +321,132 @@ function openseaMintTxToSignedPayload(
   };
 }
 
-/** Fallback: REST /api/v2/drops/{slug}/mint — returns FcfsSignedPayload or null. */
-async function postMintTxFallback(
+/** ISO-8601 → UNIX seconds. The mint response's stage times are ISO strings;
+ *  0 means "unknown", never 1970. */
+function isoToUnixSeconds(value: unknown): number {
+  if (value == null || value === "") return 0;
+  const parsed = Date.parse(String(value));
+  return Number.isNaN(parsed) ? 0 : Math.floor(parsed / 1000);
+}
+
+/**
+ * Turn a POST /api/v2/drops/{slug}/mint body into a FcfsSignedPayload.
+ *
+ * The documented DropMintResponse is
+ *   { chain, data, to, value, stage_start_time, stage_end_time, stage_type, stage_uuid }
+ * — there is no mint_signature and no fee recipient. The per-wallet signature is
+ * inside `data`, and the fee recipient is inside the calldata, so both fields are
+ * informational here.
+ */
+export function mintResponseToPayload(
+  json: any,
+  nftContract: string,
+  quantity: number,
+): FcfsSignedPayload | null {
+  const mintData = json?.data || json?.mintData || null;
+  if (!mintData) return null;
+  const mintSignature = json?.mint_signature || json?.mintSignature || null;
+  const seaDropAddress = json?.to || json?.seaDropAddress || json?.contract || SEADROP_ADDRESS;
+  const value = json?.value != null ? parsePriceField(json.value) : 0n;
+  // The collection contract is NOT the SeaDrop singleton. Reporting the
+  // seadrop address here made every downstream "which NFT did I mint" check
+  // compare against the wrong address.
+  const collection = nftContract || json?.nftContract || json?.contract_address || "";
+  return {
+    seaDropAddress,
+    nftContract: collection,
+    feeRecipient: json?.fee_recipient || json?.feeRecipient || "0x0000000000000000000000000000000000000000",
+    mintData,
+    mintSignature: mintSignature || "0x",
+    value,
+    drop: {
+      // `value` is the TOTAL tx value; the unit price is what a per-wallet cap
+      // and a price check are expressed against.
+      mintPrice: quantity > 0 ? value / BigInt(quantity) : value,
+      // The docs are explicit that a presale tx "carries this stage's start and
+      // end times in its signed parameters and reverts if mined outside them",
+      // so dropping these (the previous behaviour) threw away the only window
+      // the payload itself can prove.
+      startTime: isoToUnixSeconds(json?.stage_start_time ?? json?.stageStartTime),
+      endTime: isoToUnixSeconds(json?.stage_end_time ?? json?.stageEndTime),
+      // Not present in DropMintResponse. 0 = unknown, NOT the requested
+      // quantity — the old fallback invented a cap that overstated the
+      // allowance whenever the real one was lower.
+      maxTotalMintableByWallet: Number(
+        json?.maxTotalMintableByWallet ?? json?.max_total_mintable_by_wallet ?? 0
+      ),
+      feeBps: 0,
+      restrictFeeRecipients: false,
+    },
+    gasData: undefined,
+  };
+}
+
+/** Fallback: REST /api/v2/drops/{slug}/mint — returns FcfsSignedPayload or null.
+ *
+ *  `accessToken` (the wallet JWT) is required for presale stages: the endpoint
+ *  builds a per-wallet transaction, and OpenSea answers 401/422 without it.
+ */
+export async function postMintTxFallback(
   slug: string,
   walletAddress: string,
   quantity: number,
   apiKey?: string | null,
   timeoutMs = 15000,
   _chainKey = "ethereum",
+  nftContract = "",
+  accessToken?: string | null,
 ): Promise<FcfsSignedPayload | null> {
+  const r = await postMintRequest(slug, walletAddress, quantity, apiKey, timeoutMs, accessToken);
+  // 409 is NOT_MINTING per the docs — it is a refusal, not a payload. Treating
+  // it as success here inverted the status classification.
+  if (!r || r.status !== 200) return null;
+  return mintResponseToPayload(r.json, nftContract, quantity);
+}
+
+/**
+ * POST /api/v2/drops/{slug}/mint and return the raw status + body.
+ *
+ * Shared by postMintTxFallback and the session path so the latter can tell a
+ * 401 (token expired — worth one refresh) apart from a 404/409 (retrying with
+ * a new token cannot help).
+ */
+async function postMintRequest(
+  slug: string,
+  walletAddress: string,
+  quantity: number,
+  apiKey?: string | null,
+  timeoutMs = 15000,
+  accessToken?: string | null,
+): Promise<{ status: number; json: any } | null> {
   try {
     const headers: Record<string, string> = {
       accept: "application/json",
       "content-type": "application/json",
     };
     if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
+    if (accessToken) headers["authorization"] = `Bearer ${accessToken}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const res = await fetch(
-      `https://api.opensea.io/api/v2/drops/${slug}/mint`,
-      {
-        method: "POST",
-        signal: controller.signal,
-        headers,
-        // skip_balance_check lets OpenSea build the payload for a wallet we will
-        // fund before submitting, instead of rejecting it with 422 here.
-        body: JSON.stringify({ minter: walletAddress, quantity, skip_balance_check: true }),
-      },
-    );
-    clearTimeout(timer);
-    if (res.status !== 200 && res.status !== 409) return null;
-    const json = (await res.json()) as any;
-    const mintData = json?.data || json?.mintData || null;
-    const mintSignature = json?.mint_signature || json?.mintSignature || null;
-    if (!mintData) return null;
-    const seaDropAddress = json?.to || json?.seaDropAddress || json?.contract || nftContractPlaceholder(slug);
-    const value = json?.value ? BigInt(String(json.value)) : 0n;
-    return {
-      seaDropAddress,
-      nftContract: seaDropAddress, // best-effort
-      feeRecipient: json?.fee_recipient || json?.feeRecipient || "0x0000000000000000000000000000000000000000",
-      mintData,
-      mintSignature: mintSignature || "0x",
-      value,
-      drop: { mintPrice: value, startTime: 0, endTime: 0, maxTotalMintableByWallet: quantity, feeBps: 0, restrictFeeRecipients: false },
-      gasData: undefined,
-    };
+    try {
+      const res = await fetch(
+        `https://api.opensea.io/api/v2/drops/${slug}/mint`,
+        {
+          method: "POST",
+          signal: controller.signal,
+          headers,
+          // skip_balance_check lets OpenSea build the payload for a wallet we will
+          // fund before submitting, instead of rejecting it with 422 here.
+          body: JSON.stringify({ minter: walletAddress, quantity, skip_balance_check: true }),
+        },
+      );
+      return { status: res.status, json: await res.json().catch(() => null) };
+    } finally {
+      clearTimeout(timer);
+    }
   } catch {
     return null;
   }
-}
-
-function nftContractPlaceholder(_slug: string): string {
-  // If we can't resolve the contract, use a zero address as placeholder.
-  // The caller should have the real contract in nftContract.
-  return "0x0000000000000000000000000000000000000000";
 }
 
 // ── Path B: signed payload fetch with a live OAuth session token ───────────
@@ -343,7 +455,6 @@ function nftContractPlaceholder(_slug: string): string {
 // token if it expired mid-run.
 //
 // PRIMARY PATH: GraphQL buildOpenseaMint with cookie (sessionToCookieHeader).
-// The upstream calls buildOpenseaMint({ slug, minterAddress, contract, chain, cookie }).
 
 export async function fetchSignedPayloadWithSession(
   nftContract: string,
@@ -379,55 +490,40 @@ export async function fetchSignedPayloadWithSession(
     }
   }
 
-  // ── Fallback: REST /api/v2/drops/{slug} with session auth ────────────────
+  // ── Fallback: REST POST /api/v2/drops/{slug}/mint with session auth ───────
+  // GET /api/v2/drops/{slug} returns DropDetailedResponse — stage metadata with
+  // NO mintData (the documented DropStageResponse has no such field), so the
+  // previous implementation could never produce a payload here. The signed
+  // per-wallet calldata comes from the mint endpoint.
+  //
   // The documented path parameter is a collection SLUG. Passing a contract
   // address here is not supported — it returns 404 and the caller mistakes it
-  // for "no drop". Resolve the slug first; if we cannot, skip this path.
-  if (!slug || !slug.trim()) return null;
-  const dropIdentifier = slug.trim();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const headers: Record<string, string> = {
-      accept: "application/json",
-      authorization: `Bearer ${session.accessToken}`,
-    };
-    if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
+  // for "no drop".
+  if (!slug || !slug.trim() || !walletAddress) return null;
 
-    const res = await fetch(
-      `https://api.opensea.io/api/v2/drops/${dropIdentifier}`,
-      { signal: controller.signal, headers },
-    );
-    clearTimeout(timer);
+  const r = await postMintRequest(
+    slug.trim(), walletAddress, quantity, apiKey, timeoutMs, session.accessToken,
+  );
 
-    if (res.status === 401) {
-      // Token expired mid-run — try one refresh
-      if (opts.refreshed) return null; // prevent infinite recursion
-      const renewed = session.refreshToken
-        ? await refreshSessionToken(session.refreshToken, apiKey)
-        : null;
-      if (!renewed) return null;
+  if (r && r.status === 200) {
+    const payload = mintResponseToPayload(r.json, nftContract, quantity);
+    if (payload) return payload;
+  }
+
+  // Token expired mid-run — try exactly one refresh. A 404/409 is a verdict, not
+  // an auth failure, so retrying it with a new token cannot help.
+  if (r && r.status === 401 && !opts.refreshed) {
+    const renewed = session.refreshToken
+      ? await refreshSessionToken(session.refreshToken, apiKey)
+      : null;
+    if (renewed) {
       return fetchSignedPayloadWithSession(nftContract, quantity, renewed, apiKey, { ...opts, refreshed: true });
     }
-    if (res.status === 403 || res.status === 404) return null;
-    if (res.status === 429) throw new Error("OpenSea rate-limited the signed-payload lookup — retry in a few seconds.");
-
-    const json = (await res.json()) as any;
-    const drop = extractActiveDrop(json, nftContract);
-    if (!drop) {
-      const onChainDrops = await fetchOnChainDrops(nftContract, timeoutMs, chainKey);
-      if (onChainDrops.length > 0) {
-        return extractActiveDropFromOnChain(onChainDrops, nftContract, quantity, apiKey);
-      }
-      return null;
-    }
-
-    return await buildSignedPayloadFromDrop(drop, nftContract, quantity, apiKey);
-  } catch (err: any) {
-    clearTimeout(timer);
-    if (err && err.name === "AbortError") throw new Error("OpenSea signed-payload fetch timed out");
-    throw err;
   }
+  if (r && r.status === 429) {
+    throw new Error("OpenSea rate-limited the signed-payload lookup — retry in a few seconds.");
+  }
+  return null;
 }
 
 // ── Shared: turn whatever v2 returns into a FcfsSignedPayload ────────────
@@ -439,7 +535,7 @@ export async function fetchSignedPayloadWithSession(
 // signature to a specific wallet address. For multi-wallet sniping, each wallet
 // MUST get its own payload. See fetchSignedPayloadForWallet.
 
-async function buildSignedPayloadFromDrop(
+export async function buildSignedPayloadFromDrop(
   drop: any,
   nftContract: string,
   quantity: number,
@@ -449,7 +545,7 @@ async function buildSignedPayloadFromDrop(
   const feeRecipient = drop.feeRecipient || drop.fee_recipient;
   const mintData = drop.mintData || drop.mint_data || drop.calldata;
   const mintSignature = drop.mintSignature || drop.mint_signature || drop.signature;
-  const mintPrice = BigInt(drop.mintPrice || drop.mint_price || drop.price || "0");
+  const mintPrice = parsePriceField(drop.mintPrice ?? drop.mint_price ?? drop.price ?? "0");
   const startTime = Number(drop.startTime || drop.start_time || drop.start || 0);
   const endTime = Number(drop.endTime || drop.end_time || drop.end || 0);
   const maxTotal = Number(drop.maxTotalMintableByWallet || drop.max_total_mintable_by_wallet || drop.maxPerWallet || 0);
@@ -494,29 +590,46 @@ function buildGasDataFromDrop(drop: any): FcfsGasData | undefined {
   if (!gasLimit && !maxFeePerGas) return undefined;
   return {
     gasLimit: gasLimit ? Number(gasLimit) : 250_000,
-    maxFeePerGas: maxFeePerGas ? BigInt(maxFeePerGas) : BigInt(0),
-    maxPriorityFeePerGas: maxPriorityFeePerGas ? BigInt(maxPriorityFeePerGas) : BigInt(0),
+    maxFeePerGas: maxFeePerGas ? parsePriceToWei(maxFeePerGas) : BigInt(0),
+    maxPriorityFeePerGas: maxPriorityFeePerGas ? parsePriceToWei(maxPriorityFeePerGas) : BigInt(0),
   };
 }
 
-function extractActiveDrop(json: any, nftContract: string): any | null {
-  if (!json) return null;
-  // v2 may return { drops: [...] } or { data: { drops: [...] } } or a single drop.
-  const candidates: any[] = [];
-  if (Array.isArray(json)) candidates.push(...json);
-  else if (json.drops && Array.isArray(json.drops)) candidates.push(...json.drops);
-  else if (json.data && Array.isArray(json.data)) candidates.push(...json.data);
-  else if (json.result) candidates.push(json.result);
+export function extractActiveDrop(json: any, nftContract: string): any | null {
+  if (!json || typeof json !== "object") return null;
 
-  for (const c of candidates) {
-    if (c.nftContract === nftContract || c.contractAddress === nftContract || c.address === nftContract) {
-      // Accept any active drop — fcfs, allowlist, ovr, reserved, or whatever
-      // OpenSea names the phase. The signature is embedded in the calldata, so
-      // mintData alone marks it fireable.
-      if (c.status === "active" && c.mintData) return c;
-    }
-  }
-  return null;
+  // The documented shape is DropDetailedResponse:
+  //   { active_stage, next_stage, stages: DropStageResponse[], is_minting, ... }
+  // DropStageResponse carries stage_type / start_time / end_time / price /
+  // max_per_wallet / uuid. It has NO mintData and NO status field — the previous
+  // implementation required `c.status === "active" && c.mintData`, which no real
+  // response can satisfy, and it never looked at `stages` at all (a
+  // DropDetailedResponse matches none of its candidate branches). It could
+  // therefore never return anything.
+  //
+  // Signed calldata is NOT available from this endpoint; use
+  // POST /api/v2/drops/{slug}/mint for that.
+  const now = Date.now();
+  const unixSec = (v: unknown): number => {
+    if (v == null || v === "") return 0;
+    const n = Number(v);
+    if (String(v).trim() !== "" && Number.isFinite(n)) return Math.floor(n);
+    const parsed = Date.parse(String(v));
+    return Number.isNaN(parsed) ? 0 : Math.floor(parsed / 1000);
+  };
+  // 0 means unknown: an unknown bound must not exclude the stage.
+  const isLive = (s: any): boolean => {
+    if (!s || typeof s !== "object") return false;
+    const start = unixSec(s.start_time ?? s.startTime);
+    const end = unixSec(s.end_time ?? s.endTime);
+    if (end > 0 && now >= end * 1000) return false;
+    if (start > 0 && now < start * 1000) return false;
+    return true;
+  };
+
+  if (isLive(json.active_stage)) return json.active_stage;
+  const stages = Array.isArray(json.stages) ? json.stages : [];
+  return stages.find(isLive) ?? null;
 }
 
 // ── Extract a fireable payload from on-chain SEADROP results ───────────────
@@ -608,8 +721,23 @@ export function identifyAllowlistPreFetchCandidates(
   const candidates: AllowlistPreFetchCandidate[] = [];
 
   for (const d of onChainDrops) {
-    if (d.isPublicStage) continue;
-    if (d.mintData) continue;
+    if (d.isPublicStage) continue;   // public stages are fireable locally
+    if (d.mintData) continue;        // already fireable — nothing to pre-fetch
+    // A non-empty, non-zero allowlistHash is the real signal that this phase
+    // needs an off-chain merkle proof. An all-zero root means "no allowlist".
+    const rawHash = d.allowlistHash || "";
+    const hexPart = rawHash.startsWith("0x") ? rawHash.slice(2) : rawHash;
+    const isAllowlistHashReal =
+      hexPart.length >= 2 && ![...hexPart].every((c) => c === "0");
+    if (isAllowlistHashReal || d.allowlistedAddresses.length > 0) {
+      candidates.push({
+        drop: d,
+        merkleRoot: d.allowlistHash ?? null,
+        feeRecipient: d.feeRecipient ?? null,
+        needsAllowlistData: isAllowlistHashReal,
+        needsSignature: true,
+      });
+    }
   }
 
   return candidates;
@@ -620,7 +748,24 @@ export function identifyAllowlistPreFetchCandidates(
 // refresh_token cookie "is what /api/v2/auth/session/refresh needs"). The
 // previous /api/v2/oauth/refresh is not in the documented API surface.
 
-const OPENSEA_OAUTH_REFRESH_URL = "https://api.opensea.io/api/v2/auth/session/refresh";
+// The refresh endpoint is the web app's, not the documented v2 API: it lives on
+// opensea.io/__api/auth and takes the refresh token as a COOKIE, not a JSON body.
+// Verified live 2026-11-08: POST with `cookie: refresh_token=…` returns 200 and
+// rotates the session via Set-Cookie. The rotated access_token is NOT in the JSON
+// body — reading json.access_token returned null on every successful refresh.
+const OPENSEA_SESSION_REFRESH_URL = "https://opensea.io/__api/auth/session/refresh";
+
+/** Decode a JWT's exp claim (seconds) without verifying it. Returns null if absent. */
+function jwtExpiryMs(token: string): number | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64").toString());
+    return typeof payload.exp === "number" ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
 
 export async function refreshSessionToken(
   refreshToken: string,
@@ -628,25 +773,35 @@ export async function refreshSessionToken(
 ): Promise<StoredSession | null> {
   const headers: Record<string, string> = { accept: "application/json" };
   if (apiKey) headers["x-api-key"] = apiKey.trim();
-  headers["content-type"] = "application/json";
 
   try {
-    const res = await fetch(OPENSEA_OAUTH_REFRESH_URL, {
+    const res = await fetch(OPENSEA_SESSION_REFRESH_URL, {
       method: "POST",
-      headers,
-      body: JSON.stringify({ refresh_token: refreshToken }),
+      headers: { ...headers, cookie: `refresh_token=${refreshToken}` },
+      signal: AbortSignal.timeout(10_000),
     });
-    if (res.status !== 200) return null;
-    const json = (await res.json()) as any;
-    const accessToken = json.access_token;
-    const newRefresh = json.refresh_token || refreshToken;
-    const expiresIn = Number(json.expires_in || json.expiresIn || 3600);
+    if (!res.ok) return null;
+
+    // The rotated cookies come back in Set-Cookie; the body is a user object.
+    const jar = new Map<string, string>();
+    const setCookie = typeof res.headers.getSetCookie === "function"
+      ? res.headers.getSetCookie()
+      : [];
+    for (const line of setCookie) {
+      const [pair] = line.split(";");
+      const eq = pair.indexOf("=");
+      if (eq > 0) jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    }
+    const accessToken = jar.get("access_token");
     if (!accessToken) return null;
+
+    const newRefresh = jar.get("refresh_token") || refreshToken;
+    // Fall back to a conservative lifetime only when the JWT carries no exp.
+    const expiresAt = jwtExpiryMs(accessToken) ?? Date.now() + 3_600_000;
     const s: StoredSession = {
       accessToken,
       refreshToken: newRefresh,
-      expiresAt: Date.now() + expiresIn * 1000 - 60_000, // refresh 1 min early
-      scope: json.scope,
+      expiresAt: expiresAt - 60_000, // refresh 1 min early
     };
     await saveStoredSession(s);
     return s;
@@ -673,112 +828,78 @@ export async function refreshSessionToken(
 // pick the right one without calling the API again.
 
 export interface PreFetchResult {
-  success: FcfsSignedPayload[];
-  failed: { dropId: string; reason: string }[];
+  /** Wallet-indexed payloads, in the same order as the `walletAddresses` passed
+   *  in. null = no payload for that wallet. This is exactly the shape
+   *  executeFcfsSnipe's `payloads` option consumes. */
+  payloads: (FcfsSignedPayload | null)[];
+  failed: { walletAddress: string; reason: string }[];
 }
 
+/**
+ * Pre-fetch OpenSea's signed calldata for every wallet, ahead of the window.
+ *
+ * Mint signatures are wallet-specific, so each wallet needs its own payload —
+ * and the result must stay wallet-indexed so it can be handed straight to
+ * executeFcfsSnipe. The previous shape (a single wallet address, a flat array)
+ * could not be passed to a multi-wallet snipe at all.
+ */
 export async function preFetchSignedPayloads(
   nftContract: string,
-  onChainDrops: DropPhase[],
-  _walletAddress: string,
+  drop: DropPhase,
+  walletAddresses: string[],
   quantity: number,
   apiKey?: string | null,
   session?: StoredSession | null,
-  opts: { timeoutMs?: number; slug?: string } = {},
+  opts: { timeoutMs?: number; slug?: string; chainKey?: string } = {},
 ): Promise<PreFetchResult> {
   const timeoutMs = opts.timeoutMs ?? 15000;
-  const success: FcfsSignedPayload[] = [];
-  const failed: { dropId: string; reason: string }[] = [];
+  const failed: { walletAddress: string; reason: string }[] = [];
 
-  // GET /api/v2/drops/{slug} takes a collection slug, not a contract address.
-  // Without a slug this REST path cannot work — skip it rather than firing a
-  // request that can only 404.
+  // POST /api/v2/drops/{slug}/mint takes a collection SLUG, not a contract
+  // address, and a minter address. Without either this path cannot work.
   const slug = opts.slug?.trim();
-  if (!slug) {
+  if (!slug || walletAddresses.length === 0) {
     return {
-      success: [],
-      failed: onChainDrops.map((d) => ({
-        dropId: d.dropId,
-        reason: "no collection slug — REST drop lookup needs one",
+      payloads: walletAddresses.map(() => null),
+      failed: walletAddresses.map((a) => ({
+        walletAddress: a,
+        reason: "no collection slug / minter address — the mint endpoint needs both",
       })),
     };
   }
 
-  // Two strategies for getting signed data:
-  //  (a) API-key-only: works for some drops without a session
-  //  (b) Session-based: needed when v2 requires an access token
-  //
-  // We try (a) first for each drop, then fall back to (b) if we have a session.
-
-  const dropsToFetch = onChainDrops.filter(d => {
-    // Only pre-fetch drops that are future or currently live (not stale past drops)
-    const now = Math.floor(Date.now() / 1000);
-    if (d.endTime > 0 && d.endTime < now - 86400) return false; // stale
-    // Only pre-fetch drops that need signed data.
-    // A public drop with mintData+mintSignature is fireable now (already
-    // discovered via on-chain + REST), but a public drop WITHOUT signed data
-    // doesn't need a pre-fetch — it's minted via the local public path.
-    // The isPublicStage flag tells us which is which.
-    return !d.isPublicStage;
-  });
-
-  for (const drop of dropsToFetch) {
-    try {
-      // Try API-key-only first
-      let payload: FcfsSignedPayload | null = null;
-      if (apiKey && apiKey.trim()) {
-        const res = await fetch(
-          `https://api.opensea.io/api/v2/drops/${slug}`,
-          {
-            signal: AbortSignal.timeout(timeoutMs),
-            headers: {
-              accept: "application/json",
-              ...(apiKey.trim() ? { "X-API-KEY": apiKey.trim() } : {}),
-            },
-          }
-        );
-        if (res.status === 200) {
-          const json = (await res.json()) as any;
-          const active = extractActiveDrop(json, nftContract);
-          if (active) {
-            payload = await buildSignedPayloadFromDrop(active, nftContract, quantity, apiKey);
-          }
-        }
-      }
-
-      // Fall back to session if key-only didn't work
-      if (!payload && session && session.accessToken) {
-        const res = await fetch(
-          `https://api.opensea.io/api/v2/drops/${slug}`,
-          {
-            signal: AbortSignal.timeout(timeoutMs),
-            headers: {
-              accept: "application/json",
-              authorization: `Bearer ${session.accessToken}`,
-              ...(apiKey && apiKey.trim() ? { "X-API-KEY": apiKey.trim() } : {}),
-            },
-          }
-        );
-        if (res.status === 200) {
-          const json = (await res.json()) as any;
-          const active = extractActiveDrop(json, nftContract);
-          if (active) {
-            payload = await buildSignedPayloadFromDrop(active, nftContract, quantity, apiKey);
-          }
-        }
-      }
-
-      if (payload) {
-        success.push(payload);
-      } else {
-        failed.push({ dropId: drop.dropId, reason: "Could not fetch signed data — may need allowlist tree or specific signer" });
-      }
-    } catch (err: any) {
-      failed.push({ dropId: drop.dropId, reason: err.message || "fetch error" });
-    }
+  // Public stages are minted through the local on-chain path, not OpenSea's
+  // signed-payload flow.
+  if (drop.isPublicStage) {
+    return {
+      payloads: walletAddresses.map(() => null),
+      failed: walletAddresses.map((a) => ({
+        walletAddress: a,
+        reason: "public stage — minted on-chain, no signed payload needed",
+      })),
+    };
   }
 
-  return { success, failed };
+  // The signed calldata comes from POST /drops/{slug}/mint. GET /drops/{slug}
+  // returns DropDetailedResponse — stage metadata with NO mintData — so it can
+  // never produce a payload.
+  //
+  // The wallet JWT is required for presale stages; an API key alone only works
+  // for some public drops.
+  const accessToken = session?.accessToken || null;
+
+  const payloads = await Promise.all(walletAddresses.map(async (addr) => {
+    try {
+      return await postMintTxFallback(
+        slug, addr, quantity, apiKey, timeoutMs, opts.chainKey, nftContract, accessToken,
+      );
+    } catch (err: any) {
+      failed.push({ walletAddress: addr, reason: err.message || "fetch error" });
+      return null;
+    }
+  }));
+
+  return { payloads, failed };
 }
 
 // ── Build allowlist mint calldata locally (NO OpenSea signature needed) ─────
@@ -809,19 +930,19 @@ export function encodeAllowlistMintCalldata(
   _merkleProof: string[],   // hex-encoded proof paths from the allowlist tree
   _walletAddress: string,   // the allowlisted wallet
   _mintPrice: bigint,
-): string {
+): string | null {
   // SeaDrop does NOT expose a standalone mintAllowlist function.
   // Allowlist/OVR mints go through mintSigned() — OpenSea produces a per-wallet
   // signature (mintSignature) that is passed to mintSigned along with the
   // mint params. The merkle proof from the allowlist tree is embedded inside
   // the signed payload's mintData, not passed separately.
   //
-  // This function is kept as a marker: when we have a real allowlist phase
-  // with a non-zero merkle root, the actual calldata comes from the signed
-  // payload fetched from OpenSea (buildSignedPayloadFromDrop → drop.mintData).
-  // Until we have a live allowlist phase with signed data, this returns a
-  // recognizable marker so callers can detect the gap.
-  return "0x" + "placeholder_allowlist_calldata";
+  // This previously returned the literal string "0xplaceholder_allowlist_calldata",
+  // which a caller could have broadcast as if it were real calldata. Returning
+  // null is the honest answer: there is no local allowlist mint to encode.
+  // The real calldata comes from the signed payload fetched from OpenSea
+  // (buildSignedPayloadFromDrop -> drop.mintData).
+  return null;
 }
 
 // ── Determine mint mode from on-chain data ──────────────────────────────────
@@ -933,6 +1054,14 @@ export async function fetchTokenGatedMintParams(
     };
   } catch {
     return null;
+  } finally {
+    // ethers keeps a polling timer alive on every provider; without an explicit
+    // destroy the process never exits.
+    try {
+      provider.destroy();
+    } catch {
+      // Already destroyed.
+    }
   }
 }
 
@@ -976,17 +1105,59 @@ export interface ExecuteSnipeOpts {
   payloads?: (FcfsSignedPayload | null)[];
   /** Maximum total price (wei) the user will accept. Asserted before signing. */
   maxPriceWei?: bigint | null;
+  /** Per-unit price OpenSea quoted for this wallet during the eligibility check.
+   *  When set alongside maxPriceWei, a quote that has risen above the cap is
+   *  refused before any payload is fetched or signed. */
+  quotedPriceWei?: bigint | null;
+  /** EIP-155 chain id. Derived from `chainKey` when omitted — a transaction
+   *  without one is signed with chainId 0, which no node accepts. */
+  chainId?: number | null;
 }
+
+export type SnipeStatus = "SUCCESS" | "REVERTED" | "UNKNOWN" | "FAILED";
 
 export interface SnipeResult {
   walletIndex: number;
   walletAddress: string;
+  /** True only when a receipt confirmed the mint. */
   success: boolean;
+  /**
+   * Confirmed outcome. UNKNOWN means the tx was broadcast but no receipt could
+   * be read — it may have landed, so it must be reported as neither success nor
+   * failure. Absent on results built before the receipt stage, where `success`
+   * is the only signal.
+   */
+  status?: SnipeStatus;
   txHash?: string;
   receipt?: ConfirmedTx;
   error?: string;
   /** True when the failure is timing-related and a later attempt could work. */
   retryable?: boolean;
+}
+
+/**
+ * Sleep until the target while keeping the RPC sockets alive.
+ *
+ * The first request after an idle period pays a reconnect: measured at
+ * +200-400 ms on public Base endpoints, where the socket dies roughly 3-4 s
+ * after the last request. A silent eth_blockNumber poll every 2 s keeps the
+ * session warm so T-0 does not pay that.
+ *
+ * The final second is left quiet so no ping is still in flight when the fire
+ * path wants the socket.
+ */
+async function waitWithKeepAlive(rpcUrls: string[], delayMs: number): Promise<void> {
+  const PING_INTERVAL_MS = 2_000;
+  const QUIET_MS = 1_000;
+  const deadline = Date.now() + delayMs;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return;
+    const quiet = remaining <= QUIET_MS;
+    const nap = quiet ? remaining : Math.min(PING_INTERVAL_MS, remaining - QUIET_MS);
+    await new Promise((r) => setTimeout(r, nap));
+    if (!quiet) void pingRpcs(rpcUrls);
+  }
 }
 
 export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeResult[]> {
@@ -1005,38 +1176,56 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     chainKey,
   } = opts;
 
-  if (quantity <= 0) {
-    throw new Error("Quantity must be at least 1.");
-  }
-  if (walletKeys.length === 0) {
-    throw new Error("No wallet keys provided.");
+  if (quantity <= 0) throw new Error("Quantity must be at least 1.");
+  if (walletKeys.length === 0) throw new Error("No wallet keys provided.");
+  if (rpcUrls.length === 0) throw new Error("No RPC endpoints provided.");
+
+  // Every transaction MUST carry a chain id and a nonce. A provider-less Wallet
+  // signs exactly what it is given (ethers v6 BaseWallet.signTransaction does NOT
+  // populate), so a missing chain id defaults to 0 — which every node rejects with
+  // "transaction type not supported".
+  const chainId = opts.chainId ?? (chainKey ? resolveChain(chainKey)?.chainId ?? null : null);
+  if (chainId == null) {
+    throw new Error("executeFcfsSnipe: no chain id (pass chainId or a valid chainKey)");
   }
 
-  const results: SnipeResult[] = [];
+  // Indexed by wallet so a slow wallet cannot reorder the report.
+  const results: (SnipeResult | null)[] = new Array(walletKeys.length).fill(null);
   const endpoints = parseRpcEndpoints(rpcUrls);
 
-  // Wait until target start
-  const now = Date.now();
-  const delay = targetStart.getTime() - now;
-  if (delay > 0) {
-    console.log(`  Waiting ${Math.round(delay / 1000)}s until target start...`);
-    await new Promise(r => setTimeout(r, delay));
+  // ══ PHASE 1 — everything that does not depend on the wall clock ══════════
+  //
+  // OpenSea's signed calldata is stable for the whole stage, so it is fetched
+  // now, not at T-0. This is the only slow step — an API round trip per wallet —
+  // and it is the one that used to sit inside the critical path.
+  //
+  // The transaction itself cannot be finished here, for two reasons:
+  //   • the nonce is unknowable ahead of time;
+  //   • a signed mint carries its stage window in the signed parameters and
+  //     reverts outside it, so gas estimation and simulation are meaningless
+  //     before the window opens.
+  interface ReadyTx {
+    walletIndex: number;
+    addr: string;
+    to: string;
+    data: string;
+    value: bigint;
+    gasLimit: number;
   }
+  const ready: ReadyTx[] = [];
 
-  // Pre-fetch a signed payload per wallet. mintSignature is wallet-specific —
-  // reusing one payload across wallets is a bug. Each wallet gets its own
-  // FcfsSignedPayload built from a per-wallet API fetch.
-  for (let i = 0; i < walletKeys.length; i++) {
-    const key = walletKeys[i];
+  // Establish the TCP/TLS sessions NOW, while there is time to spare. Without
+  // this the first RPC at T-0 pays the handshake, and the public path has always
+  // warmed for exactly this reason.
+  await warmConnections(rpcUrls);
+
+  await Promise.all(walletKeys.map(async (key, i) => {
     const w = new Wallet(key);
     const addr = w.address;
-
     try {
-      // Use the pre-fetched per-wallet payload when we have one. This is the
-      // whole point of the pre-fetch: no API call between T-0 and broadcast.
-      // Fall back to a live per-wallet fetch only when it is missing.
+      // Prefer the pre-fetched per-wallet payload; fall back to a live fetch NOW
+      // (still before T-0) — never at fire time.
       let payload: FcfsSignedPayload | null = opts.payloads?.[i] ?? null;
-
       if (!payload) {
         payload = await fetchSignedPayloadForWallet(
           nftContract,
@@ -1047,74 +1236,47 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         );
       }
       if (!payload) {
-        results.push({
+        results[i] = {
           walletIndex: i,
           walletAddress: addr,
           success: false,
           error: `No signed payload for ${addr} — OpenSea may not have a signed phase for this contract`,
-        });
-        continue;
+        };
+        return;
       }
 
       // Belt-and-braces: a pre-fetched payload must be bound to THIS wallet.
       // Fails open inside isPayloadBoundToWallet; the on-chain revert is the
       // backstop. This catches a payload array indexed in the wrong order.
       if (!isPayloadBoundToWallet(payload, addr)) {
-        results.push({
+        results[i] = {
           walletIndex: i,
           walletAddress: addr,
           success: false,
           error: `Pre-fetched payload for ${addr} is bound to a different wallet — refusing to broadcast.`,
-        });
-        continue;
+        };
+        return;
       }
 
-      const txRequest = {
-        to: payload.seaDropAddress,
-        data: payload.mintData,
-        value: payload.value,
-        gasLimit: gasLimit || 250_000,
-        maxFeePerGas,
-        maxPriorityFeePerGas,
-      };
-
-      // ── Gas estimation (ported from mint.js autoGas) ────────────────────
-      // The static 250k default is a guess, and a wrong guess fails silently:
-      // too low and the tx reverts on-chain with out-of-gas after broadcast;
-      // too high and the fee cap (maxFeePerGas × gasLimit) can exceed what the
-      // wallet can cover when the base fee moves, so the tx never mines.
-      // Estimate per transaction, with a 20% buffer, as the original does.
-      //
-      // A failed estimate is almost always a revert — refuse rather than send.
-      const gasProvider = new JsonRpcProvider(rpcUrls[0], undefined, {
-        staticNetwork: true,
-        pollingInterval: 1000,
-      });
-      let estimated: Awaited<ReturnType<typeof autoGasBounded>>;
-      try {
-        estimated = await autoGasBounded(
-          gasProvider,
-          { to: txRequest.to, from: addr, data: txRequest.data, value: txRequest.value },
-          8_000
-        );
-      } finally {
+      // ── Price protection (local, no RPC) ────────────────────────────────
+      // The eligibility check quoted a per-wallet price; a signed payload carries
+      // the price OpenSea quoted when it was built. Checking the quote first
+      // catches a price rise before anything is signed.
+      if (opts.quotedPriceWei != null && opts.maxPriceWei != null) {
         try {
-          gasProvider.destroy();
-        } catch {
-          // Already destroyed.
+          assertPriceProtection({
+            actualPriceWei: opts.quotedPriceWei * BigInt(quantity),
+            maxPriceWei: opts.maxPriceWei,
+            context: `OpenSea quoted price × ${quantity}`,
+          });
+        } catch (e: any) {
+          results[i] = {
+            walletIndex: i, walletAddress: addr, success: false,
+            error: e?.message || String(e), retryable: false,
+          };
+          return;
         }
       }
-      if (estimated) {
-        txRequest.gasLimit = Number(estimated.gasLimit);
-        if (estimated.maxFeePerGas) txRequest.maxFeePerGas = estimated.maxFeePerGas;
-        if (estimated.maxPriorityFeePerGas) {
-          txRequest.maxPriorityFeePerGas = estimated.maxPriorityFeePerGas;
-        }
-      }
-
-      // ── Price protection (ported from price.js) ─────────────────────────
-      // Assert before signing. A signed payload carries the price OpenSea quoted
-      // when it was fetched; if the drop's price moved since, refuse.
       if (opts.maxPriceWei != null) {
         try {
           assertPriceProtection({
@@ -1123,80 +1285,146 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
             context: `signed mint × ${quantity}`,
           });
         } catch (e: any) {
-          results.push({
-            walletIndex: i,
-            walletAddress: addr,
-            success: false,
-            error: e?.message || String(e),
-            retryable: false,
-          });
-          continue;
+          results[i] = {
+            walletIndex: i, walletAddress: addr, success: false,
+            error: e?.message || String(e), retryable: false,
+          };
+          return;
         }
       }
 
-      // ── Simulation gate ────────────────────────────────────────────────
-      // Ported from mint.js, which simulates before every broadcast. Without
-      // this a guaranteed revert (closed sale, wrong stage, a payload bound to
-      // another wallet) still costs gas to discover, and the failure surfaces
-      // as a reverted receipt instead of a refusal to send.
-      //
-      // Simulation happens AFTER the wait and BEFORE signing, so a doomed tx
-      // costs nothing. It is not a substitute for the blast — it is a filter.
-      //
-      // The provider is built with staticNetwork and a hard timeout: a dead
-      // endpoint must fail FAST, not retry for minutes. Without this the gate
-      // turns an unreachable RPC into an unbounded hang.
-      const simProvider = new JsonRpcProvider(rpcUrls[0], undefined, {
-        staticNetwork: true,
-        pollingInterval: 1000,
+      ready.push({
+        walletIndex: i,
+        addr,
+        to: payload.seaDropAddress,
+        data: payload.mintData,
+        value: payload.value,
+        gasLimit: gasLimit || 250_000,
       });
-      let sim: SimulateResult;
+    } catch (err: any) {
+      results[i] = {
+        walletIndex: i, walletAddress: addr, success: false,
+        error: err.message || String(err),
+      };
+    }
+  }));
+
+  // Nothing survived phase 1 — do not sit through the wait for a fire that
+  // cannot happen.
+  if (ready.length === 0) {
+    return results.filter((r): r is SnipeResult => r != null);
+  }
+
+  // ══ WAIT ════════════════════════════════════════════════════════════════
+  const delay = targetStart.getTime() - Date.now();
+  if (delay > 0) {
+    console.log(`  Waiting ${Math.round(delay / 1000)}s until target start...`);
+    await waitWithKeepAlive(rpcUrls, delay);
+  }
+
+  // ══ PHASE 2 — T-0: refresh only what can have moved, then blast ═════════
+  //
+  // Per wallet, ONE parallel batch: nonce + gas estimate + simulation. That is
+  // the entire fire-time RPC cost — a single round trip — followed by local
+  // signing and the blast.
+  // The chainId is passed explicitly. Without it ethers performs a network
+  // detection (eth_chainId) on the first request — an extra round trip inside
+  // the T-0 critical path, and on some endpoints it retries first.
+  const fireProvider = new JsonRpcProvider(rpcUrls[0], chainId, {
+    staticNetwork: true,
+    pollingInterval: 1000,
+  });
+  const toBlast: { walletIndex: number; addr: string; blast: PreparedBlast }[] = [];
+  try {
+    await Promise.all(ready.map(async (r) => {
+      const w = new Wallet(walletKeys[r.walletIndex]);
       try {
-        sim = await simulateTx(simProvider, {
-          to: txRequest.to,
-          from: addr,
-          data: txRequest.data,
-          value: txRequest.value,
-        });
-      } finally {
-        // ethers keeps a polling timer alive on every provider. Without an
-        // explicit destroy the process never exits — the work is done but the
-        // event loop stays busy forever.
-        try {
-          simProvider.destroy();
-        } catch {
-          // Already destroyed.
+        const [sim, est, nonce] = await Promise.all([
+          // Tightly bounded: a simulation is a nice-to-have and must never be
+          // able to eat the T-0 window. Inconclusive fails open below.
+          simulateTx(fireProvider, { to: r.to, from: r.addr, data: r.data, value: r.value }, 2_000),
+          // No .catch(() => null) here. autoGasBounded returns null ONLY on a
+          // timeout (could not tell) and RETHROWS a failed estimate, which is
+          // almost always a revert — that is do-not-send evidence and must reach
+          // the catch below, not be downgraded to "inconclusive, send anyway".
+          autoGasBounded(
+            fireProvider,
+            { to: r.to, from: r.addr, data: r.data, value: r.value },
+            2_000
+          ),
+          // Bounded like its two siblings. ethers has no timeout option and its
+          // FetchRequest defaults to 300s with 429 backoff, so an unbounded nonce
+          // read would hold the entire T-0 batch on one stalled endpoint.
+          withDeadlineOrThrow(
+            fireProvider.getTransactionCount(r.addr, "pending"),
+            2_000,
+            "nonce"
+          ),
+        ]);
+
+        // An INDETERMINATE result (timeout, network error) is not evidence the tx
+        // reverts — it means we could not tell. Fail OPEN: blocking a good mint
+        // because a public RPC had a bad moment is worse than sending a tx that
+        // might revert. A definitive revert still blocks.
+        if (!sim.ok && sim.reverted) {
+          const classified = classifyRevert(sim.reason);
+          const label = classified ? `[${classified.label}] ` : "";
+          results[r.walletIndex] = {
+            walletIndex: r.walletIndex,
+            walletAddress: r.addr,
+            success: false,
+            error: `Simulation refused to broadcast: ${label}${sim.reason ?? "unknown revert"}`,
+            retryable: classified?.retryable ?? false,
+          };
+          return;
         }
-      }
+        if (!sim.ok && sim.indeterminate) {
+          console.log(
+            chalk.yellow(`    ⚠ Simulation inconclusive (${sim.reason}) — proceeding; the tx may still revert.`)
+          );
+        }
 
-      // An INDETERMINATE result (timeout, network error) is not evidence the tx
-      // reverts — it means we could not tell. Fail OPEN in that case: blocking a
-      // good mint because a public RPC had a bad moment is worse than sending a
-      // tx that might revert. A definitive revert still blocks.
-      if (!sim.ok && sim.reverted) {
-        const classified = classifyRevert(sim.reason);
-        const label = classified ? `[${classified.label}] ` : "";
-        results.push({
-          walletIndex: i,
-          walletAddress: addr,
-          success: false,
-          error: `Simulation refused to broadcast: ${label}${sim.reason ?? "unknown revert"}`,
-          retryable: classified?.retryable ?? false,
+        const signed = await w.signTransaction({
+          to: r.to,
+          data: r.data,
+          value: r.value,
+          gasLimit: est ? Number(est.gasLimit) : r.gasLimit,
+          maxFeePerGas: est?.maxFeePerGas ?? maxFeePerGas,
+          maxPriorityFeePerGas: est?.maxPriorityFeePerGas ?? maxPriorityFeePerGas,
+          nonce,
+          chainId,
         });
-        continue;
+        toBlast.push({ walletIndex: r.walletIndex, addr: r.addr, blast: prepareBlast(signed) });
+      } catch (err: any) {
+        results[r.walletIndex] = {
+          walletIndex: r.walletIndex,
+          walletAddress: r.addr,
+          success: false,
+          error: err.message || String(err),
+        };
       }
-      if (!sim.ok && sim.indeterminate) {
-        console.log(
-          chalk.yellow(
-            `    ⚠ Simulation inconclusive (${sim.reason}) — proceeding; the tx may still revert.`
-          )
-        );
-      }
+    }));
+  } finally {
+    try {
+      fireProvider.destroy();
+    } catch {
+      // Already destroyed.
+    }
+  }
 
-      const signed = await w.signTransaction(txRequest);
-      const prepared = prepareBlast(signed);
-      const { responsePromise } = blastToAll(prepared, endpoints);
+  // ── Blast everything, then collect ──────────────────────────────────────
+  // All transactions go out within microseconds of each other, and the receipts
+  // are collected in parallel for the same reason: each wallet's poll is
+  // independent, so a serial loop puts every wallet after the first a full poll
+  // budget (60s) behind — 10 wallets is ~10 minutes before the last one is
+  // checked, which also delays the sell-after-mint step.
+  const inflight = toBlast.map((b) => ({
+    b,
+    responsePromise: blastToAll(b.blast, endpoints).responsePromise,
+  }));
 
+  const collected = await Promise.all(
+    inflight.map(async ({ b, responsePromise }) => {
       const blastResults = await responsePromise;
       // Pick the first endpoint that actually accepted this wallet's tx — poll
       // that endpoint for the receipt so we don't burn time on an endpoint that
@@ -1211,37 +1439,62 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         const receiptResult = await waitForReceipt(accepted.txHash, receiptUrl);
         if (receiptResult) {
           receipt = {
-            address: addr,
-            txHash: accepted.txHash!,
+            address: b.addr,
+            txHash: accepted.txHash,
             block: receiptResult.block,
             position: receiptResult.position,
-            status: receiptResult.status === "0x1" ? "SUCCESS" : receiptResult.status === "0x0" ? "REVERTED" : "PENDING",
+            // waitForReceipt already normalises the hex status to SUCCESS/REVERTED
+            // ("0x1" / "0x0"). Comparing against the hex values here made every
+            // receipt — including a successful mint — read back as PENDING.
+            status: receiptResult.status === "REVERTED" ? "REVERTED" : "SUCCESS",
             gasUsed: receiptResult.gasUsed,
             actualGasPrice: receiptResult.actualGasPrice || null,
             blockTimeMs: null,
           };
         }
       }
+      return { b, blastResults, accepted, receipt };
+    })
+  );
 
-      results.push({
-        walletIndex: i,
-        walletAddress: addr,
-        success: !!accepted,
-        txHash: (accepted?.txHash as string) || undefined,
-        receipt,
-        error: accepted ? undefined : (blastResults[0]?.error || "All endpoints rejected/failed"),
-      });
-    } catch (err: any) {
-      results.push({
-        walletIndex: i,
-        walletAddress: addr,
-        success: false,
-        error: err.message || String(err),
-      });
+  for (const { b, blastResults, accepted, receipt } of collected) {
+
+    // Three distinct outcomes, and they must not collapse into one boolean:
+    //   REVERTED — a receipt says the mint failed
+    //   SUCCESS  — a receipt says the mint landed
+    //   UNKNOWN  — the tx was broadcast but no receipt could be read; it may
+    //              have landed, so it is neither a success nor a failure
+    //   FAILED   — the blast never produced a tx hash
+    // `success` is true only for a confirmed SUCCESS. Reporting a missing
+    // receipt as success made the sell-after-mint step try to sell tokens that
+    // were never minted.
+    const status: SnipeStatus = !accepted
+      ? "FAILED"
+      : receipt
+        ? (receipt.status === "REVERTED" ? "REVERTED" : "SUCCESS")
+        : "UNKNOWN";
+
+    let error: string | undefined;
+    if (!accepted) {
+      error = blastResults[0]?.error || "All endpoints rejected/failed";
+    } else if (status === "REVERTED") {
+      error = "Transaction reverted on-chain.";
+    } else if (status === "UNKNOWN") {
+      error = "Receipt not available before the poll timed out — the mint may still have landed.";
     }
+
+    results[b.walletIndex] = {
+      walletIndex: b.walletIndex,
+      walletAddress: b.addr,
+      success: status === "SUCCESS",
+      status,
+      txHash: (accepted?.txHash as string) || undefined,
+      receipt,
+      error,
+    };
   }
 
-  return results;
+  return results.filter((r): r is SnipeResult => r != null);
 }
 
 // ── Fetch a wallet-specific signed payload ──────────────────────────────────

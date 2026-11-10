@@ -36,8 +36,12 @@ export const ERC1155_METADATA_URI = "0x0e89341c";
 // These are the addresses a specific adapter can handle. Checking them is
 // cheaper and more certain than probing for behaviour.
 
-export const SEADROP_V2 = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
-export const SEADROP_V1 = "0x00000000006c3852cbef3e08e8df289169ede581";
+// SeaDrop has exactly one shared singleton (v1); v2 has no singleton address —
+// see mint-generic.ts. The address previously held by SEADROP_V1 was Seaport
+// 1.1, not SeaDrop.
+export const SEADROP_V1 = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
+export const SEADROP_V2 = SEADROP_V1;
+export const SEAPORT_1_1 = "0x00000000006c3852cbef3e08e8df289169ede581";
 
 /** Well-known token addresses that frequently appear in scraped page data. */
 export const KNOWN_TOKENS: Record<string, string> = {
@@ -51,10 +55,7 @@ export const KNOWN_TOKENS: Record<string, string> = {
 
 export type ErcStandard = "erc721" | "erc1155" | "unknown";
 
-export type Platform =
-  | "seadrop-v2"
-  | "seadrop-v1"
-  | "none";
+export type Platform = "seadrop-v1" | "none";
 
 export interface VerificationResult {
   address: string;
@@ -70,15 +71,6 @@ export interface VerificationResult {
 }
 
 // ── Provider helper ─────────────────────────────────────────────────────────
-
-function providerFor(chainId: number): JsonRpcProvider {
-  const profile = resolveChain(chainId);
-  const urls = profile?.rpc?.public ?? [];
-  if (urls.length === 0) {
-    throw new Error(`No public RPC configured for chainId ${chainId}`);
-  }
-  return new JsonRpcProvider(urls[0]);
-}
 
 /**
  * Run a read against the chain's RPCs, trying each in turn.
@@ -208,33 +200,44 @@ export async function detectStandardFallback(
 ): Promise<{ standard: ErcStandard; erc165Supported: false }> {
   const addr32 = address.toLowerCase().replace(/^0x/, "").padStart(64, "0");
 
+  // Probe more than one argument. A contract that reverts on the zero address,
+  // or on tokenId 0/1, would otherwise be misreported as "unknown" — a false
+  // negative that silently discards a real candidate.
+  const probeAddrs = [addr32, "0".repeat(63) + "1"];
+  const probeIds = ["0".repeat(64), "0".repeat(63) + "1"];
+
   // ERC1155: balanceOf(address,uint256) — selector 0x00fdd58e
   // A contract that answers this is ERC1155; ERC721 has no such function.
-  try {
-    const data = "0x00fdd58e" + addr32 + "0".repeat(64);
-    await provider.call({ to: address, data });
-    return { standard: "erc1155", erc165Supported: false };
-  } catch {
-    // revert is expected for ERC721 — fall through
+  for (const a of probeAddrs) {
+    for (const id of probeIds) {
+      try {
+        await provider.call({ to: address, data: "0x00fdd58e" + a + id });
+        return { standard: "erc1155", erc165Supported: false };
+      } catch {
+        // try the next argument
+      }
+    }
   }
 
   // ERC721: balanceOf(address) — selector 0x70a08231
   // This is the most reliable ERC721 signal short of ERC165.
-  try {
-    const data = "0x70a08231" + addr32;
-    await provider.call({ to: address, data });
-    return { standard: "erc721", erc165Supported: false };
-  } catch {
-    // not ERC721 either
+  for (const a of probeAddrs) {
+    try {
+      await provider.call({ to: address, data: "0x70a08231" + a });
+      return { standard: "erc721", erc165Supported: false };
+    } catch {
+      // try the next address
+    }
   }
 
-  // ERC721: ownerOf(uint256) — selector 0x6352211e, tokenId 1
-  try {
-    const data = "0x6352211e" + "0".repeat(63) + "1";
-    await provider.call({ to: address, data });
-    return { standard: "erc721", erc165Supported: false };
-  } catch {
-    // also reverted
+  // ERC721: ownerOf(uint256) — selector 0x6352211e
+  for (const id of probeIds) {
+    try {
+      await provider.call({ to: address, data: "0x6352211e" + id });
+      return { standard: "erc721", erc165Supported: false };
+    } catch {
+      // try the next id
+    }
   }
 
   // Last resort: name() exists on both standards but not on a plain wallet.
@@ -326,10 +329,7 @@ async function verifyContractInner(
 
   // 2. Known singleton? Cheapest and most certain identification.
   const lower = address.toLowerCase();
-  if (lower === SEADROP_V2) {
-    return { address, chainId, isContract: true, standard: "unknown", erc165Supported: false, platform: "seadrop-v2" };
-  }
-  if (lower === SEADROP_V1) {
+  if (lower === SEADROP_V1 || lower === SEADROP_V2) {
     return { address, chainId, isContract: true, standard: "unknown", erc165Supported: false, platform: "seadrop-v1" };
   }
 

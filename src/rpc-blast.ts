@@ -28,6 +28,7 @@ function labelFromUrl(url: string, index: number): string {
   if (lower.includes("sequencer.base.org")) return "mainnet-sequencer.base.org";
   if (lower.includes("sequencer.mainnet.chain.robinhood.com")) return "robinhood-sequencer";
   if (lower.includes("rpc.mainnet.chain.robinhood.com")) return "robinhood-public";
+  if (lower.includes("rpc.soneium.org")) return "soneium-public";
   if (lower.includes("alchemy")) return "ALCHEMY";
   if (lower.includes("flashbots")) return "FLASHBOTS-PROTECT";
   if (lower.includes("llamarpc")) {
@@ -69,7 +70,8 @@ export function prepareBlast(rawTx: string): PreparedBlast {
 // Used by the public path (local-mint.ts).
 export function blastToAll(
   rawTxOrPrepared: string | PreparedBlast,
-  endpoints: RpcEndpoint[]
+  endpoints: RpcEndpoint[],
+  timeoutMs = 10_000
 ): { txHash: string; responsePromise: Promise<BlastResult[]> } {
   const prepared: PreparedBlast =
     typeof rawTxOrPrepared === "string"
@@ -86,6 +88,9 @@ export function blastToAll(
       headers: { "content-type": "application/json" },
       body,
       keepalive: true,
+      // A hung endpoint must not hold responsePromise open forever — both
+      // callers await it, so one stalled RPC would hang the whole mint.
+      signal: AbortSignal.timeout(timeoutMs),
     })
       .then((res) => {
         const latencyMs = Date.now() - t0;
@@ -103,7 +108,18 @@ export function blastToAll(
       const ep = endpoints[i];
       const s = settled[i];
       if (s.status === "fulfilled") {
-        const { json, latencyMs } = (s as any).value;
+        const v = (s as any).value;
+        // The per-endpoint catch returns { err } rather than throwing, so a
+        // network failure arrives as a FULFILLED result with no `json`. Reading
+        // `json.result` on it throws inside this handler and rejects
+        // responsePromise — turning one dead endpoint into a crashed mint.
+        if (v && v.err) {
+          const msg = v.err?.message || String(v.err);
+          console.log(chalk.yellow(`  [${ep.label}] FAILED ${v.latencyMs}ms — ${msg}`));
+          results.push({ label: ep.label, txHash: null, error: msg });
+          continue;
+        }
+        const { json, latencyMs } = v;
         if (json.result) {
           console.log(chalk.green(`  [${ep.label}] ACCEPTED ${latencyMs}ms — tx ${json.result}`));
           results.push({ label: ep.label, txHash: json.result, error: null });
@@ -111,6 +127,13 @@ export function blastToAll(
           const errMsg = json.error.message || JSON.stringify(json.error);
           console.log(chalk.red(`  [${ep.label}] REJECTED ${latencyMs}ms — ${errMsg}`));
           results.push({ label: ep.label, txHash: null, error: errMsg });
+        } else {
+          // Neither result nor error. Push a placeholder so `results` stays
+          // index-aligned with `endpoints` — a caller indexing by endpoint would
+          // otherwise read a neighbouring endpoint's verdict.
+          const msg = "empty JSON-RPC response (no result, no error)";
+          console.log(chalk.yellow(`  [${ep.label}] UNKNOWN ${latencyMs}ms — ${msg}`));
+          results.push({ label: ep.label, txHash: null, error: msg });
         }
       } else {
         const reason = (s as any).reason?.message || String(s);
@@ -162,7 +185,9 @@ export async function waitForReceipt(
           block: parseInt(receipt.blockNumber, 16),
           position: parseInt(receipt.transactionIndex, 16),
           gasUsed,
-          status: receipt.status === "0x1" ? "SUCCESS" : "REVERTED",
+          // A missing status is a pre-Byzantium receipt: the tx was included,
+          // so it succeeded. Only an explicit 0x0 is a revert.
+          status: receipt.status === "0x0" ? "REVERTED" : "SUCCESS",
           actualGasPrice: effectiveGasPrice,
         };
       }

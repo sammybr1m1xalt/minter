@@ -29,11 +29,16 @@ export async function sweepOnChain(
     let gasUsed: number | null = null;
     let actualGasPrice: bigint | null = null;
 
+    // Each individual request must be bounded independently of the overall
+    // sweep budget. Reusing `timeoutMs` per request meant one sweep could run
+    // ~3× longer than asked (3 receipt polls + 2 existence checks in parallel).
+    const perRequestMs = Math.min(timeoutMs, 5_000);
+
     // Poll all RPCs in parallel for the receipt
     const pollPromises = rpcUrls.slice(0, 3).map(async (url) => {
       try {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const timer = setTimeout(() => controller.abort(), perRequestMs);
         const res = await fetch(url, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -53,7 +58,9 @@ export async function sweepOnChain(
             block: parseInt(receipt.blockNumber, 16),
             position: parseInt(receipt.transactionIndex, 16),
             gasUsed: parseInt(receipt.gasUsed, 16),
-            status: receipt.status === "0x1" ? "SUCCESS" : "REVERTED",
+            // A missing status is a pre-Byzantium receipt: the tx was included,
+            // so it succeeded. Only an explicit 0x0 is a revert.
+            status: receipt.status === "0x0" ? "REVERTED" : "SUCCESS",
             effectiveGasPrice: receipt.effectiveGasPrice ? BigInt(receipt.effectiveGasPrice) : null,
           };
         }
@@ -86,6 +93,7 @@ export async function sweepOnChain(
                 params: [tx.txHash],
                 id: 1,
               }),
+              signal: AbortSignal.timeout(perRequestMs),
             });
             const json = (await res.json()) as any;
             return json.result;

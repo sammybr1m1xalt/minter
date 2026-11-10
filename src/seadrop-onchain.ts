@@ -109,6 +109,10 @@ const RPC_URLS_BY_CHAIN: Record<string, string[]> = {
   robinhood: [
     "https://rpc.mainnet.chain.robinhood.com",
   ],
+  soneium: [
+    "https://rpc.soneium.org",
+    "https://soneium-rpc.publicnode.com",
+  ],
 };
 
 // Use .env RPC first if configured (private, faster), then fall back to public
@@ -262,7 +266,13 @@ async function fetchAllowlistPhase(
     ]),
   ]);
 
-  const merkleRoot = merkleRootRaw === "0x" ? null : merkleRootRaw;
+  // The contract returns 32 ZERO bytes for a contract with no allowlist — not
+  // "0x", and not a revert. Treating that as a real root invented an allowlist
+  // phase for every collection.
+  const merkleRoot =
+    merkleRootRaw && merkleRootRaw !== "0x" && !/^0x0*$/.test(merkleRootRaw)
+      ? merkleRootRaw
+      : null;
   let feeRecipients: string[] = [];
   if (feeRecipientsRaw && feeRecipientsRaw !== "0x") {
     try {
@@ -301,7 +311,7 @@ async function fetchAllowlistPhase(
     eligibleCount: null,
     totalAllocated: null,
     allowlistedAddresses: [],
-    allowlistHash: merkleRoot ? `0x${merkleRoot.slice(2, 10)}...` : null,
+    allowlistHash: merkleRoot,
     raw: { source: "onchain_allowlist", merkleRoot, feeRecipientsCount: feeRecipients.length },
     isPublicStage: false, // allowlist needs signed mint or merkle proof
     eligiblePrice: null,
@@ -382,8 +392,11 @@ export async function fetchOnChainDrops(
   const provider = await getProvider(chainKey);
   if (!provider) return [];
 
-  const _deadline = Date.now() + timeoutMs;
-
+  // timeoutMs must bound the whole discovery. The individual eth_calls carry
+  // no signal, so race the batch against a timer; the provider is destroyed in
+  // the finally regardless of how the race ends. Previously `_deadline` was
+  // computed and never used, so a stalled RPC hung the discovery forever.
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     // Run all probes in parallel, collect whatever returns data
     const probes = [
@@ -392,7 +405,13 @@ export async function fetchOnChainDrops(
       fetchTokenGatedPhase(provider, nftContract),
     ];
 
-    const results = await Promise.allSettled(probes);
+    const results = await Promise.race([
+      Promise.allSettled(probes),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("on-chain discovery timeout")), timeoutMs);
+      }),
+    ]);
+
     const drops: DropPhase[] = [];
 
     for (const result of results) {
@@ -412,6 +431,13 @@ export async function fetchOnChainDrops(
     });
   } catch {
     return [];
+  } finally {
+    if (timer) clearTimeout(timer);
+    try {
+      provider.destroy();
+    } catch {
+      // Already destroyed.
+    }
   }
 }
 
@@ -441,5 +467,11 @@ export async function fetchSingleOnChainDrop(
     return null;
   } catch {
     return null;
+  } finally {
+    try {
+      provider.destroy();
+    } catch {
+      // Already destroyed.
+    }
   }
 }

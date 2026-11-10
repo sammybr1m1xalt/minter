@@ -26,7 +26,7 @@ export interface RunLogger {
 }
 
 export function createRunLogger(opts: { mode: string; label?: string }): RunLogger {
-  try { fs.mkdirSync(logDir(), { recursive: true }); } catch (e) {
+  try { fs.mkdirSync(logDir(), { recursive: true, mode: 0o700 }); } catch (e) {
     // fs.mkdirSync throws on failure; best-effort only
   }
 
@@ -38,7 +38,7 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
   const label = opts.label || mode;
   const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const runId = `${ts}-${process.pid}`;
-  const logFile = path.join(logDir(), `run-${runId}-${label}.log`);
+  const logFile = path.join(logDir(), `run-${runId}-${safeLogLabel(label)}.log`);
 
   const push = (level: string, msg: string) => {
     const t = new Date().toISOString();
@@ -125,7 +125,7 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
       out += "\n";
 
       try {
-        fs.writeFileSync(logFile, out, "utf-8");
+        fs.writeFileSync(logFile, out, { encoding: "utf-8", mode: 0o600 });
         const logs = fs.readdirSync(logDir())
           .filter(f => f.startsWith("run-") && f.endsWith(".log"))
           .sort()
@@ -141,16 +141,37 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
   };
 }
 
-function maskRpc(url: string): string {
-  if (!url) return "<empty>";
+export function maskRpc(value: string): string {
+  if (!value) return "<empty>";
+  let u: URL;
   try {
-    const u = new URL(url);
-    const segs = u.pathname.split("/").filter(Boolean);
-    const masked = segs.map(s => /^[0-9a-fA-F]{32,}$/.test(s) ? "••••••••" : s);
-    u.pathname = "/" + masked.join("/");
-    return u.toString();
+    u = new URL(value);
   } catch {
-    if (url.length <= 8) return "••••••••";
-    return `${url.slice(0, 4)}••••${url.slice(-4)}`;
+    // Not a URL — a bare API key read from the environment. Echo none of it.
+    return "••••••••";
   }
+  const segs = u.pathname.split("/").filter(Boolean);
+  const masked = segs.map((s) =>
+    // Provider keys are long, opaque, and not purely numeric. Short path
+    // words ("v2", "collections") and chain ids stay readable.
+    /^[0-9a-fA-F]{32,}$/.test(s) || (/^[A-Za-z0-9_-]{20,}$/.test(s) && !/^\d+$/.test(s))
+      ? "••••••••"
+      : s
+  );
+  u.pathname = "/" + masked.join("/");
+  return u.toString();
+}
+
+/**
+ * Make a run label safe to use in a log filename.
+ *
+ * The label comes from the user's mint target, which is untrusted input.
+ * Interpolating it raw let a target of "../../../tmp/x" write the run log
+ * outside .minter-logs/ (path.join normalises the traversal).
+ */
+export function safeLogLabel(label: string): string {
+  const cleaned = String(label)
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/\.+/g, "_");
+  return cleaned.slice(0, 80) || "run";
 }

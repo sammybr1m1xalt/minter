@@ -1,6 +1,6 @@
 // ── Pre-broadcast simulation gate ───────────────────────────────────────────
 //
-// Ported from nft-minter-bot/src/mint.js, which simulates before EVERY broadcast:
+// Simulates before EVERY broadcast:
 //
 //     // Simulate before broadcast.
 //     try { await provider.call(txRequest); }

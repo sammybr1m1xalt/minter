@@ -125,18 +125,13 @@ export function toRpcUrl(value: string, chainKey: string): string | null {
 }
 
 // Hide the key segment so a shoulder-surf or screenshot doesn't leak it.
-export function maskRpc(url: string): string {
-  try {
-    const u = new URL(url);
-    const segments = u.pathname.split("/").filter((s) => s.length > 0);
-    if (segments.length === 0) return u.origin;
-    const last = segments[segments.length - 1];
-    segments[segments.length - 1] = last.length > 8 ? `${last.slice(0, 4)}…${last.slice(-4)}` : "…";
-    return `${u.origin}/${segments.join("/")}`;
-  } catch {
-    return url;
-  }
-}
+//
+// This used to be a second, weaker implementation that (a) returned the input
+// verbatim when it was not a parseable URL — printing a bare API key in full —
+// and (b) revealed the first and last four characters of the key path segment.
+// logger.ts holds the hardened version; re-export it so there is exactly one
+// masker and every caller gets the safe behaviour.
+export { maskRpc } from "./logger";
 
 interface RpcPlan {
   urls: string[]; // blast list — index 0 is always query-capable when one exists
@@ -148,7 +143,23 @@ interface RpcPlan {
 
 // Probe result carrying *why* an endpoint failed, so an exhausted API key shows
 // up during setup rather than as a rejected broadcast at fire time.
-async function probe(rpcUrl: string, timeoutMs = 8000): Promise<{ chainId: number | null; error?: string }> {
+
+/**
+ * True when a probe error means "this endpoint does not serve reads" rather than
+ * "this endpoint is broken".
+ *
+ * A sequencer rejects eth_chainId with a JSON-RPC error ("method not found",
+ * "not supported") but is the fastest inclusion path, so it must stay in the
+ * blast set. An HTTP 500, a non-JSON body or a refused connection is evidence
+ * the endpoint is broken and must not be blasted at.
+ *
+ * Shared with the wizard's endpoint report so the classification cannot drift
+ * between what is displayed and what is used.
+ */
+export function isBenignProbeError(message: string | undefined): boolean {
+  return /not allowed|does not exist|not supported|method not found|not enabled|unsupported/i.test(message ?? "");
+}
+async function probe(rpcUrl: string, timeoutMs = 8000): Promise<{ chainId: number | null; error?: string; timedOut?: boolean }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -169,7 +180,14 @@ async function probe(rpcUrl: string, timeoutMs = 8000): Promise<{ chainId: numbe
     if (json.error?.message) return { chainId: null, error: json.error.message };
     return { chainId: null, error: `HTTP ${res.status}` };
   } catch (err: unknown) {
-    return { chainId: null, error: err instanceof Error ? err.message : String(err) };
+    // Distinguish "we could not tell" (aborted) from "the endpoint answered
+    // with an error". Only the second is evidence the endpoint is broken.
+    const aborted = err instanceof Error && (err.name === "AbortError" || /abort/i.test(err.message));
+    return {
+      chainId: null,
+      error: aborted ? "timed out" : err instanceof Error ? err.message : String(err),
+      timedOut: aborted,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -188,13 +206,29 @@ export async function planRpcs(urls: string[], expectedChainId: number): Promise
   );
 
   const matching = probes.filter((p) => p.chainId === expectedChainId).map((p) => p.url);
-  const sendOnly = probes.filter((p) => p.chainId === null).map((p) => p.url);
   const dropped = probes
     .filter((p) => p.chainId !== null && p.chainId !== expectedChainId)
     .map((p) => ({ url: p.url, chainId: p.chainId as number }));
   const failures = probes
     .filter((p) => p.chainId === null && p.error)
     .map((p) => ({ url: p.url, message: p.error as string }));
+
+  // "Send-only" must mean the endpoint cannot serve READS, not that it is
+  // broken. A sequencer rejects eth_chainId with a JSON-RPC error but is the
+  // fastest inclusion path, so it stays in the blast set; an HTTP 500 or a
+  // non-JSON body is evidence of a broken endpoint and is dropped — blasting at
+  // it adds a guaranteed-failing request per wallet, and when no endpoint
+  // matches the chain it would become urls[0], the provider every read (nonce,
+  // balance, eth_call) goes through. A timeout is neither: that is "we could
+  // not tell", so it stays.
+  const broken = new Set(
+    probes
+      .filter((p) => p.chainId === null && p.error && !p.timedOut && !isBenignProbeError(p.error))
+      .map((p) => p.url)
+  );
+  const sendOnly = probes
+    .filter((p) => p.chainId === null && !broken.has(p.url))
+    .map((p) => p.url);
 
   return {
     urls: [...matching, ...sendOnly],

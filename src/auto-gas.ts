@@ -1,5 +1,4 @@
 // ── Per-transaction gas estimation ───────────────────────────────────────────
-// Ported from nft-minter-bot/src/mint.js autoGas().
 //
 // The TS port never estimated gas: it used a static 250_000 everywhere. That
 // fails in both directions and both failures are silent:
@@ -11,8 +10,7 @@
 //     able to cover: a base-fee spike between signing and inclusion can make
 //     the tx unaffordable, and it never mines.
 //
-// The original estimates per transaction and adds a 20% buffer. That is the
-// behaviour restored here.
+// Estimates per transaction and adds a 20% buffer.
 
 import { JsonRpcProvider } from "ethers";
 
@@ -34,7 +32,7 @@ export interface AutoGasResult {
 /**
  * Estimate gas for a transaction and derive a competitive fee.
  *
- * The 20% buffer is the original's, and it matters: a mint that sits exactly
+ * The 20% buffer matters: a mint that sits exactly
  * at the block gas limit, or one whose cost depends on storage slots that are
  * warm in eth_call but cold on-chain, reverts without it.
  *
@@ -45,16 +43,20 @@ export async function autoGas(
   provider: JsonRpcProvider,
   txRequest: AutoGasRequest
 ): Promise<AutoGasResult> {
-  const feeData = await provider.getFeeData();
-
-  let gasLimit: bigint;
-  try {
-    gasLimit = (await provider.estimateGas(txRequest)) * 120n / 100n;
-  } catch (e: any) {
-    throw new Error(
-      `gas estimate failed (likely revert): ${e?.shortMessage ?? e?.message ?? "unknown"}`
-    );
-  }
+  // Fee data and the gas estimate are independent reads, so they run together.
+  // They used to be sequential — two round trips inside the T-0 critical path,
+  // which is exactly what a snipe cannot afford.
+  const [feeData, rawGasLimit] = await Promise.all([
+    provider.getFeeData(),
+    provider.estimateGas(txRequest).catch((e: any) => {
+      // Wrapped here so the rejection Promise.all reports is the estimate
+      // failure, not whatever getFeeData happened to reject with.
+      throw new Error(
+        `gas estimate failed (likely revert): ${e?.shortMessage ?? e?.message ?? "unknown"}`
+      );
+    }),
+  ]);
+  const gasLimit = rawGasLimit * 120n / 100n;
 
   // Legacy-fee chains (no maxFeePerGas): use gasPrice.
   if (feeData.maxFeePerGas == null) {
@@ -75,8 +77,9 @@ export async function autoGas(
  *
  * Same reasoning as simulateTx: a client library retries a dead endpoint with
  * exponential backoff and no ceiling, so an unreachable RPC would otherwise
- * turn this into an unbounded hang. Returns null when the estimate could not
- * be obtained — the caller decides whether to fall back or refuse.
+ * turn this into an unbounded hang. Returns null ONLY when the estimate could
+ * not be obtained in time; a failed estimate (almost always a revert) is
+ * rethrown so the caller refuses to send.
  */
 export async function autoGasBounded(
   provider: JsonRpcProvider,
@@ -94,8 +97,13 @@ export async function autoGasBounded(
         );
       }),
     ]);
-  } catch {
-    return null;
+  } catch (e: any) {
+    // A timeout means "could not tell" — the caller may fall back to a default.
+    // Anything else is a failed estimate, which is almost always a revert; the
+    // caller must treat that as "do not send", not as an inconclusive result.
+    // Swallowing both let a guaranteed revert through to the broadcast path.
+    if (e && /gas estimation timeout/.test(String(e.message))) return null;
+    throw e;
   } finally {
     if (timer) clearTimeout(timer);
   }
