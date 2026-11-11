@@ -1549,7 +1549,7 @@ async function promptWalletAndPhase(
 
 // ── Steps ───────────────────────────────────────────────────────────────────
 
-async function promptKeys(log: RunLogger, spec?: string | null): Promise<string[]> {
+export async function promptKeys(log: RunLogger, spec?: string | null): Promise<string[]> {
   console.log(chalk.bold.white("Private keys"));
 
   // A --wallets spec with a PRIVATE_KEY in the environment means the user has

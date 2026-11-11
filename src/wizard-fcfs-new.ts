@@ -44,7 +44,7 @@ import { resolveContractToSlug } from "./slug-resolver";
 import { parseTarget, resolveTarget } from "./target-resolver";
 import { parsePriceSpec } from "./price-protection";
 import { parseWhen } from "./schedule";
-import { loadEnvKeys, selectFromLoaded } from "./wizard";
+import { loadEnvKeys, selectFromLoaded, promptKeys } from "./wizard";
 import {
   promptGasGwei,
   promptTiming,
@@ -836,7 +836,7 @@ export async function runFcfsBranch(
 // Polls all phases for a contract, shows eligibility + gas state, exits.
 
 export async function runEligibilityCheck(
-  _log: RunLogger,
+  log: RunLogger,
   nftContract: string,
   opts: { chain?: string | null } = {},
 ): Promise<void> {
@@ -908,7 +908,17 @@ export async function runEligibilityCheck(
   // never answer the only question it exists to answer — and because
   // assessDropEligibility ignored its wallet argument, the placeholder changed
   // nothing. Load real keys and report one block per wallet.
-  const envKeys = loadEnvKeys();
+  let envKeys = loadEnvKeys();
+  // `--eligibility` is headless, so anyone who keeps their keys out of the
+  // environment — the normal way, pasting them at a prompt — got "No wallets
+  // loaded" and every phase read as unknown, which looks like a broken checker.
+  // Prompt when there is a terminal to answer on. A non-TTY still falls through
+  // to the inventory-only report rather than hanging on an answer that can
+  // never come.
+  if (envKeys.length === 0 && process.stdin.isTTY) {
+    const pasted = await promptKeys(log, null);
+    envKeys = pasted.map((pk) => ({ address: new Wallet(pk).address, privateKey: pk }));
+  }
   const allReports: any[] = [];
 
   // Eligibility is wallet-scoped, and OpenSea answers it only for a request
