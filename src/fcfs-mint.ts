@@ -1655,15 +1655,10 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
       const blastResults = await responsePromise;
       // Pick the first endpoint that actually accepted this wallet's tx — poll
       // that endpoint for the receipt so we don't burn time on an endpoint that
-      // never saw the tx. Fall back to rpcUrls[0] if no endpoint accepted
-      // (shouldn't happen, but defensive).
-      //
-      // Match by INDEX, never by label. labelFromUrl is not injective — two
-      // Alchemy endpoints both read "ALCHEMY" — so a label match could return an
-      // endpoint that never saw the tx, and a landed mint would read as TIMEOUT.
+      // never saw the tx. Fall back to rpcUrls[0] if the blast result has no
+      // accepting label (shouldn't happen, but defensive).
       const accepted = blastResults.find((r) => r.txHash != null);
-      const acceptingEndpoint =
-        accepted != null ? blastEndpoints[accepted.index] : undefined;
+      const acceptingEndpoint = accepted && blastEndpoints.find((ep) => ep.label === accepted.label);
       const receiptUrl = acceptingEndpoint ? acceptingEndpoint.url : rpcUrls[0];
 
       let receipt: ConfirmedTx | undefined;

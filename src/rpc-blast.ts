@@ -11,8 +11,6 @@ export interface RpcEndpoint {
 }
 
 export interface BlastResult {
-  /** Position in the endpoint list the blast was fired at. */
-  index: number;
   label: string;
   txHash: string | null;
   error: string | null;
@@ -124,16 +122,16 @@ export function blastToAll(
         .then(({ json, latencyMs }) => {
           if (json.result) {
             console.log(chalk.green(`  [${ep.label}] ACCEPTED ${latencyMs}ms — tx ${json.result}`));
-            results[index] = { index, label: ep.label, txHash: json.result, error: null };
+            results[index] = { label: ep.label, txHash: json.result, error: null };
           } else if (json.error) {
             const errMsg = json.error.message || JSON.stringify(json.error);
             console.log(chalk.red(`  [${ep.label}] REJECTED ${latencyMs}ms — ${errMsg}`));
-            results[index] = { index, label: ep.label, txHash: null, error: errMsg };
+            results[index] = { label: ep.label, txHash: null, error: errMsg };
           } else {
             // Neither result nor error.
             const msg = "empty JSON-RPC response (no result, no error)";
             console.log(chalk.yellow(`  [${ep.label}] UNKNOWN ${latencyMs}ms — ${msg}`));
-            results[index] = { index, label: ep.label, txHash: null, error: msg };
+            results[index] = { label: ep.label, txHash: null, error: msg };
           }
         })
         .catch((err) => {
@@ -141,7 +139,7 @@ export function blastToAll(
           // dead endpoint must not turn into a crashed mint.
           const msg = err?.message || String(err);
           console.log(chalk.yellow(`  [${ep.label}] FAILED ${Date.now() - t0}ms — ${msg}`));
-          results[index] = { index, label: ep.label, txHash: null, error: msg };
+          results[index] = { label: ep.label, txHash: null, error: msg };
         });
     });
     return Promise.all(promises).then(() => undefined);
@@ -158,7 +156,6 @@ export function blastToAll(
     for (let i = 0; i < results.length; i++) {
       if (results[i] == null) {
         results[i] = {
-          index: i,
           label: endpoints[i].label,
           txHash: null,
           error: "not fired — an earlier endpoint accepted the transaction",
