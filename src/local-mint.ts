@@ -492,8 +492,11 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
         if (firing) {
           const blastResults = await firing.responsePromise;
           const accepting = blastResults.find((r: any) => r.txHash != null);
+          // By index, not label. labelFromUrl is not injective (two Alchemy
+          // endpoints both read "ALCHEMY"), so a label match can return an
+          // endpoint that never saw the tx — and a landed mint reads as TIMEOUT.
           if (accepting) {
-            const ep = blastEndpoints.find((e) => e.label === accepting.label);
+            const ep = blastEndpoints[accepting.index];
             if (ep) url = ep.url;
           }
         }
