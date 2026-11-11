@@ -278,6 +278,9 @@ export async function fetchAllActiveDrops(
       } else {
         const json = (await res.json()) as any;
         drops = catalogueDrops(json, nftContract);
+        // REST found phases — the earlier GQL "not_found" no longer describes the
+        // result, and leaving it set made a successful run report a failure.
+        if (drops.length > 0) lastReason = undefined;
 
         for (const d of drops) {
           // Only accept a numeric chain id. A slug string ("ethereum") turned
@@ -616,13 +619,30 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
     stageObjects.push(...json);
   }
 
+  // Shape 4 (the REAL v2 REST response): GET /api/v2/drops/{slug} returns the
+  // drop at the top level — `stages: [...]`, plus `active_stage`/`next_stage`.
+  // This shape was missing, so the REST fallback produced ZERO stages whenever
+  // GraphQL was rate-limited, and the inventory fell through to on-chain
+  // discovery — which does not see every stage OpenSea lists. A drop with a
+  // future FCFS stage then reported that phase not at all.
+  if (Array.isArray(json?.stages)) {
+    for (const s of json.stages) stageObjects.push(s);
+  }
+  if (json?.active_stage && typeof json.active_stage === "object") stageObjects.push(json.active_stage);
+  if (json?.next_stage && typeof json.next_stage === "object") stageObjects.push(json.next_stage);
+
   const drops: DropPhase[] = [];
+  const seenUuids = new Set<string>();
 
   for (const c of stageObjects) {
     if (!c || typeof c !== "object") continue;
 
     // Fields: real v2 API uses snake_case; older/guessed shapes may use camelCase
     const uuid = c.uuid || c.id || c.drop_id || c.hash || "";
+    // active_stage/next_stage repeat stages already in `stages`; without this the
+    // same phase would be reported twice.
+    if (uuid && seenUuids.has(uuid)) continue;
+    if (uuid) seenUuids.add(uuid);
     const contract = (
       c.contract_address || c.nftContract || c.contractAddress || c.address || ""
     ).toLowerCase();
