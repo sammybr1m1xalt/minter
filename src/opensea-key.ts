@@ -387,6 +387,14 @@ export async function probeAndRankPool(
 ): Promise<{ pool: KeyPoolEntry[]; best: KeyPoolEntry | null }> {
   if (pool.length === 0) return { pool: [], best: null };
 
+  // The probe below OVERWRITES last_probe and remaining_calls. A timeout erases
+  // the evidence that a key was ever confirmed alive, and the fallback needs
+  // that evidence to decide whether a key that merely failed to answer is worth
+  // using. Without this snapshot one transient network fault makes every good
+  // key look unusable — and the next re-probe finds them alive, which is exactly
+  // the contradiction the run then reports.
+  const prior = new Map(pool.map((e) => [e.api_key, e]));
+
   // Probe all in parallel — each bounded by timeoutMs, but all at once, so the
   // whole pass costs one timeout rather than one per key.
   const probed = await Promise.all(
@@ -400,6 +408,13 @@ export async function probeAndRankPool(
       if (result.status === "server_error") {
         const retry = await probeKey(entry.api_key, timeoutMs);
         if (retry.status !== "server_error") result = retry;
+      }
+      // Same class of fault: a timeout means the request never completed, so it
+      // says nothing about the key either. Retrying once keeps a slow minute
+      // from retiring a working credential.
+      if (result.status === "timeout") {
+        const retry = await probeKey(entry.api_key, timeoutMs);
+        if (retry.status !== "timeout") result = retry;
       }
       // Persist the fresh quota numbers. Without this the entry keeps whatever
       // remaining_calls it had before — a stale value that can exceed the real
@@ -435,12 +450,21 @@ export async function probeAndRankPool(
     .sort((a, b) => b.score - a.score);
 
   // Only fall back to a timed-out key when nothing with a real answer exists —
-  // and even then, only if it was alive the last time we actually reached the
-  // API. A key that has never been confirmed is not worth a mint.
+  // and even then, only if it was confirmed alive the last time we actually
+  // reached the API. A key that has never been confirmed is not worth a mint.
+  //
+  // The check is against the probe result from BEFORE this pass, not against
+  // remaining_calls: a timeout reads no headers, so it stores -1 and would
+  // disqualify every key that ever timed out — including one that has been
+  // serving mints for days.
   const best = usable.length > 0
     ? usable[0]
     : probed
-        .filter((e) => e.last_probe === "timeout" && e.remaining_calls > 0)
+        .filter((e) => {
+          if (e.last_probe !== "timeout") return false;
+          const before = prior.get(e.api_key);
+          return before?.last_probe === "alive" || before?.last_probe === "alive_but_exhausted";
+        })
         .sort((a, b) => b.score - a.score)[0] ?? null;
   return { pool: probed, best };
 }
@@ -733,7 +757,18 @@ export async function getValidApiKey(
       syncEnvKey(result.api_key);
       return { api_key: result.api_key, source: result.source };
     }
-    console.log(chalk.yellow("  ⚠ No usable key in pool — all are dead, throttled, or exhausted."));
+    // pickBestKey just re-ranked and saved the pool, so these are this pass's
+    // verdicts. "Rejected by OpenSea" and "never answered" are different problems
+    // with different fixes, and the old single line reported them all as dead.
+    const ranked = loadKeyPool();
+    const allDead = ranked.length > 0 && ranked.every((e) => e.last_probe === "dead");
+    console.log(
+      chalk.yellow(
+        allDead
+          ? "  ⚠ No usable key in pool — every key was rejected by OpenSea (dead)."
+          : "  ⚠ No usable key in pool — none returned a usable verdict (timeouts or unconfirmed)."
+      )
+    );
   }
 
   // 2. Pool empty or all dead — try to mint a fresh one, if the server's own

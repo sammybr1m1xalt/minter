@@ -290,15 +290,31 @@ export async function planSellAfterMint(ctx: SellPromptContext): Promise<SellPla
   // Report the estimated gas cost in USD for all three modes at this moment.
   const usd = await fetchUsdPrice(ctx.chainKey, ctx.apiKey).catch(() => null);
   const estProvider = new JsonRpcProvider(ctx.rpcUrl, undefined, { staticNetwork: true });
-  let base = 0n;
+  let base: bigint | null = null;
   let tip = 0n;
   try {
     const latest = await estProvider.getBlock("latest").catch(() => null);
     const feeData = await estProvider.getFeeData().catch(() => null);
-    base = latest?.baseFeePerGas ?? feeData?.maxFeePerGas ?? 0n;
+    // Only the BLOCK's baseFeePerGas is the base fee. ethers' feeData.maxFeePerGas
+    // is an ESTIMATE (base*2 + tip), and using it as the base overstates the cost
+    // by ~2x. The cost floor is what a sale is guarded against, so an inflated
+    // floor silently blocks profitable sales — the number has to be right, and
+    // liveGasQuote in sell-after-mint.ts already avoids this exact mistake.
+    base = latest?.baseFeePerGas != null && latest.baseFeePerGas > 0n ? latest.baseFeePerGas : null;
     tip = feeData?.maxPriorityFeePerGas ?? 0n;
   } finally {
     try { estProvider.destroy(); } catch { /* already destroyed */ }
+  }
+
+  // Without a live base fee there is no honest quote. The previous fallback
+  // produced a zero cost, which reported "$0.00" and set a cost floor of just
+  // the mint price — a failed read presenting itself as a free sale, letting any
+  // offer through. Refuse instead.
+  if (base == null) {
+    console.log(chalk.yellow("\n  ⚠ Could not read the live base fee — no sell gas quote is available."));
+    console.log(chalk.gray("    Sell-after-mint needs a fee read to set a safe cost floor."));
+    console.log(chalk.gray("    Re-run when the RPC is reachable."));
+    return null;
   }
 
   const quotes = quoteGasModes(
@@ -342,6 +358,8 @@ export async function runSellAfterMint(params: {
   rpcUrl: string;
   chainId: number;
   mintOutcomes: MintOutcome[];
+  /** Native token symbol, for the cost-guard message. Defaults to ETH. */
+  symbol?: string;
 }): Promise<void> {
   console.log(chalk.bold.white("\nSell after mint"));
   console.log(chalk.gray(`  Offers:     ${params.slug}`));
@@ -375,6 +393,7 @@ export async function runSellAfterMint(params: {
       quantity: params.sellPlan.quantity,
       gasMode: params.sellPlan.gasMode,
       costWeiPerToken: params.sellPlan.costWeiPerToken,
+      symbol: params.symbol,
       mintTxHash: outcome.txHash,
     });
 

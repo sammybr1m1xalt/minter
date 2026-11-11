@@ -865,6 +865,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         apiKey: apiKey!,
         rpcUrl: rpcUrls[0],
         chainId: chainProfile.chainId,
+        symbol: chainProfile.nativeSymbol,
         mintOutcomes,
       });
     }

@@ -812,6 +812,7 @@ export async function runFcfsBranch(
       apiKey: apiKey!,
       rpcUrl: rpcUrls[0],
       chainId: chainProfile.chainId,
+      symbol: chainProfile.nativeSymbol,
       mintOutcomes: snipeResults.map((r) => ({
         walletIndex: r.walletIndex,
         address: r.walletAddress,

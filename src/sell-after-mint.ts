@@ -192,7 +192,7 @@ export function rankOffers(offers: SellOffer[], seller: string): SellOffer[] {
     .map((x) => x.offer);
 }
 
-import { AbiCoder, Contract, Interface, JsonRpcProvider, Wallet, id } from "ethers";
+import { AbiCoder, Contract, Interface, JsonRpcProvider, Wallet, formatEther, id } from "ethers";
 import {
   SEAPORT_1_5_ABI,
   SEAPORT_1_5_ADDRESS,
@@ -342,11 +342,13 @@ export function extractMintedTokenIds(logs: readonly any[], wallet: string): str
  * cost is in the chain's native token; on the chains this tool serves those
  * are 1:1, so the wei amounts compare directly.
  */
-export function assertSaleProfitable(netWei: bigint, costWei: bigint): void {
+export function assertSaleProfitable(netWei: bigint, costWei: bigint, symbol = "ETH"): void {
   if (netWei < costWei) {
+    // Human-readable: raw wei is ~18 digits and impossible to compare against a
+    // price at a glance, which is the whole point of the guard.
     throw new Error(
-      `Sale would lose money: net proceeds ${netWei} wei < cost ${costWei} wei ` +
-        `(mint price + gas). Refusing to sell.`
+      `Sale would lose money: net proceeds ${formatEther(netWei)} ${symbol} < ` +
+        `cost ${formatEther(costWei)} ${symbol} (mint price + gas). Refusing to sell.`
     );
   }
 }
@@ -445,13 +447,14 @@ export function netFromOrders(orders: any[], seller: string): bigint | null {
 export function chooseOffer(
   offers: SellOffer[],
   seller: string,
-  costWei: bigint
+  costWei: bigint,
+  symbol = "ETH"
 ): SaleDecision | null {
   for (const offer of rankOffers(offers, seller)) {
     const net = computeNetProceeds(offer, seller);
     if (net == null) continue;
     try {
-      assertSaleProfitable(net, costWei);
+      assertSaleProfitable(net, costWei, symbol);
     } catch {
       continue;
     }
@@ -598,6 +601,8 @@ export interface SellWalletOpts {
   gasMode: GasMode;
   /** Per-token floor: mint unit price + estimated sell gas, in wei. */
   costWeiPerToken: bigint;
+  /** Native token symbol, for the cost-guard message. Defaults to ETH. */
+  symbol?: string;
   /** The mint transaction whose receipt logs identify the minted tokens. */
   mintTxHash: string;
   gasLimit?: number;
@@ -692,7 +697,8 @@ export async function executeSellAfterMint(
         const decision = chooseOffer(
           [...tokenOffers, ...collectionOffers],
           wallet.address,
-          opts.costWeiPerToken
+          opts.costWeiPerToken,
+          opts.symbol
         );
         if (!decision) {
           result.sold.push({
@@ -723,7 +729,7 @@ export async function executeSellAfterMint(
         );
         const net = fullNet ?? decision.netWei;
         try {
-          assertSaleProfitable(net, opts.costWeiPerToken);
+          assertSaleProfitable(net, opts.costWeiPerToken, opts.symbol);
         } catch (e: any) {
           result.sold.push({
             tokenId,
@@ -984,18 +990,29 @@ export async function fetchFulfillmentData(
 /**
  * USD price of a chain's NATIVE token, used to express the gas cost.
  *
- * The zero address is OpenSea's identifier for the native token (ETH on
- * Ethereum and Base), verified live: it returns symbol ETH with a usd_price.
- * Using it avoids a per-chain address table — the API is the authority on
- * which tokens exist.
+ * The zero address is OpenSea's identifier for the native token on most EVM
+ * chains (ETH on Ethereum, Base, Robinhood and Soneium), verified live: it
+ * returns symbol ETH with a usd_price.
+ *
+ * Arc is the exception. Its gas token is native USDC at 0x3600…0000, and the
+ * zero address is NOT a contract there — verified live: eth_call against it
+ * fails to decode, and OpenSea has no token for it. Querying the zero address
+ * on Arc returned no usd_price, so the gas report silently dropped its dollar
+ * figure. Hence the small per-chain table; the API is the authority on which
+ * tokens exist, but it can only be asked about an address that does.
  */
+const NATIVE_TOKEN_ADDRESS_BY_CHAIN: Record<string, string> = {
+  arc: "0x3600000000000000000000000000000000000000",
+};
+
 export async function fetchUsdPrice(
   chain: string,
   apiKey: string,
   opts: { timeoutMs?: number } = {}
 ): Promise<number | null> {
+  const token = NATIVE_TOKEN_ADDRESS_BY_CHAIN[chain?.trim().toLowerCase() ?? ""] ?? NATIVE_TOKEN_ADDRESS;
   const json = await fetchJson(
-    `/api/v2/chain/${encodeURIComponent(chain)}/token/${NATIVE_TOKEN_ADDRESS}`,
+    `/api/v2/chain/${encodeURIComponent(chain)}/token/${token}`,
     apiKey,
     { timeoutMs: opts.timeoutMs }
   );
