@@ -13,7 +13,7 @@ import { blastToAll, parseRpcEndpoints, prepareBlast, waitForReceipt, PreparedBl
 import { warmConnections, rankRpcEndpoints, settleRanking, type RankedEndpoint } from "./connection-warmer";
 import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
-import { LocalMintPlan } from "./seadrop-public";
+import { LocalMintPlan, buildLocalMintPlan } from "./seadrop-public";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
 import { autoGasBounded } from "./auto-gas";
 import { assertPriceProtection } from "./price-protection";
@@ -341,6 +341,37 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
       console.log(chalk.bold.yellow("\n  🚀 Firing immediately..."));
     }
 
+    // ── Re-read the per-wallet cap AFTER the wait ─────────────────────────
+    // A drop's per-wallet limit can be edited in the last minutes before its
+    // stage opens. The quantity is baked into the signed calldata, so firing the
+    // originally planned quantity after a reduction would revert on-chain and
+    // burn gas. Re-read it here and re-plan if it moved.
+    //
+    // This is a read, not a transaction, so it cannot disturb the nonce.
+    let activePlan = plan;
+    try {
+      const freshPlan = await buildLocalMintPlan(rpcUrls[0], nftContract, quantity);
+      if (freshPlan) {
+        const limit = freshPlan.drop.maxTotalMintableByWallet;
+        if (limit > 0 && quantity > limit) {
+          const reduced = await buildLocalMintPlan(rpcUrls[0], nftContract, limit);
+          if (reduced) {
+            console.log(
+              chalk.yellow(
+                `  ⚠ Per-wallet limit is now ${limit} (planned ${quantity}) — minting ${limit} instead.`
+              )
+            );
+            activePlan = reduced;
+          }
+        }
+      }
+    } catch (e: any) {
+      // A failed re-read must not stop the fire — the original plan is still the
+      // best information we have, and the on-chain revert is the backstop.
+      console.log(chalk.gray(`  ⚠ Could not re-read the per-wallet limit: ${e?.message ?? e}`));
+    }
+    const planChanged = activePlan !== plan;
+
     // ── Re-read nonces AFTER the wait ─────────────────────────────────────
     // The nonce was read at planning time, which is only correct when the mint
     // is about to fire. For anything scheduled more than a few seconds out, any
@@ -354,11 +385,12 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
     const freshChecks = await resolveNonces(wallets, rpcUrls);
     let reSigned = 0;
     for (let i = 0; i < freshChecks.length; i++) {
-      if (freshChecks[i].nonce === nonces[i]) continue;
+      const nonceMoved = freshChecks[i].nonce !== nonces[i];
+      if (!planChanged && !nonceMoved) continue;
       const rawTx = await wallets[i].signTransaction({
-        to: plan.to,
-        data: plan.data,
-        value: plan.value,
+        to: activePlan.to,
+        data: activePlan.data,
+        value: activePlan.value,
         nonce: freshChecks[i].nonce,
         maxFeePerGas: estimatedMaxFee,
         maxPriorityFeePerGas: estimatedPriority,
@@ -368,10 +400,14 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
       });
       prepared[i] = { idx: i, address: wallets[i].address, blast: prepareBlast(rawTx) };
       reSigned++;
-      console.log(chalk.yellow(`    [W${i}] nonce moved ${nonces[i]} → ${freshChecks[i].nonce} — re-signed.`));
+      if (nonceMoved) {
+        console.log(chalk.yellow(`    [W${i}] nonce moved ${nonces[i]} → ${freshChecks[i].nonce} — re-signed.`));
+      } else if (planChanged) {
+        console.log(chalk.yellow(`    [W${i}] re-signed with the adjusted quantity.`));
+      }
     }
     if (reSigned > 0) {
-      console.log(chalk.gray(`  Re-signed ${reSigned} tx(s) with fresh nonces.`));
+      console.log(chalk.gray(`  Re-signed ${reSigned} tx(s).`));
     }
 
     // Zero budget: the ranking is an optimisation and must never hold up the

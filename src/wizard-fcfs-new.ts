@@ -7,6 +7,7 @@ import {
   fetchAllActiveDrops,
   printDropsInventory,
   reportInventoryEligibility,
+  getPhaseEligibility,
   fetchGasState,
   printGasState,
   recommendGasSettings,
@@ -783,6 +784,20 @@ export async function runFcfsBranch(
     // A future phase has no payload yet — phase 1 must not fetch one, phase 2
     // fetches at T-0.
     phaseOpensInFuture: futurePhaseAccepted,
+    // Re-read the per-wallet cap at T-0. The signed calldata binds the quantity,
+    // so a cap that dropped while waiting means every payload fetched so far is
+    // for the wrong quantity and must be re-fetched rather than broadcast.
+    recheckMintable: async () => {
+      const report = await getPhaseEligibility({
+        drop: selectedDrop,
+        wallet: wallets[0].address.toLowerCase(),
+        slug: effectiveSlug,
+        cookie: sessionCookies[0] || null,
+        apiKey,
+        timeoutMs: 8000,
+      });
+      return report?.walletMintable ?? null;
+    },
   });
 
   // ── Step 14: Sell after mint ─────────────────────────────────────────────

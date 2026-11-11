@@ -51,6 +51,7 @@ import {
 } from "./seadrop-onchain";
 import { buildLocalMintPlan } from "./seadrop-public";
 import { localPublicSnipe } from "./local-mint";
+import { reconcileQuantity } from "./mint-cap";
 import { askChoice, askHidden, askNumber, askText, askYesNo, closePrompts } from "./prompt";
 import {
   promptGasGwei,
@@ -112,6 +113,8 @@ interface PhaseEligibility {
   mode: "public" | "signed" | "allowlist" | "token-gated" | "unknown";
   fireableLocally: boolean;
   preFetchNeeded: boolean;
+  /** What this wallet can mint in this phase, or null when unknown. */
+  walletMintable: number | null;
 }
 
 // ── Main wizard entry point ──────────────────────────────────────────────────
@@ -192,7 +195,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
   let chainProfile = resolveChain(chainKey)!;
 
   // ── 3. Quantity ───────────────────────────────────────────────────────
-  const quantity = opts.quantity ?? (await promptQuantity(walletKeys.length));
+  let quantity = opts.quantity ?? (await promptQuantity(walletKeys.length));
   log.field("quantity", quantity);
   if (quantity <= 0) {
     throw new Error("Quantity must be at least 1. Aborting.");
@@ -539,6 +542,21 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     const walletEligibility = walletEligibilities[walletIndex];
     const phaseEligibility = walletEligibility.phaseReports[phaseIndex];
 
+    // ── 11b. Reconcile the quantity with what this phase allows ────────────
+    // The eligibility probe ran before this point, so the cap is already known.
+    // Asking here (rather than at the quantity prompt) is what makes the answer
+    // meaningful — the cap is per phase, and the phase is chosen here.
+    const reconciled = await reconcileQuantityWithCap(quantity, phaseEligibility.walletMintable);
+    if (reconciled.aborted) {
+      console.log(chalk.yellow("\n  Aborted — nothing was sent.\n"));
+      closePrompts();
+      return;
+    }
+    if (reconciled.quantity !== quantity) {
+      console.log(chalk.gray(`  Quantity: ${quantity} → ${reconciled.quantity}`));
+      quantity = reconciled.quantity;
+    }
+
     log.field("selected_wallet", wallet.address);
     log.field("selected_phase", selectedDrop.name || selectedDrop.dropId);
     log.field("mint_mode", phaseEligibility.mode);
@@ -802,6 +820,23 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         // would always come back null and drop the wallet); phase 2 fetches at
         // T-0 instead.
         phaseOpensInFuture,
+        // Re-read the per-wallet cap at T-0. A drop's limit can be edited in the
+        // last minutes before its stage opens, and the signed calldata binds the
+        // quantity — when this comes back lower, the fire path re-fetches every
+        // payload at the reduced quantity instead of broadcasting one that
+        // would revert.
+        recheckMintable: async () => {
+          const session = sessionResults[walletIndex]?.session ?? null;
+          const report = await getPhaseEligibility({
+            drop: selectedDrop,
+            wallet: wallet.address.toLowerCase(),
+            slug: slug || undefined,
+            cookie: session ? sessionToStoredSessionCookie(session) : null,
+            apiKey,
+            timeoutMs: 8000,
+          });
+          return report?.walletMintable ?? null;
+        },
       });
       mintOutcomes = snipeResults.map((r) => ({
         walletIndex: r.walletIndex,
@@ -1240,6 +1275,7 @@ async function probePhaseForWallet(
     mode,
     fireableLocally,
     preFetchNeeded,
+    walletMintable: baseReport?.walletMintable ?? null,
   };
 }
 
@@ -1310,6 +1346,13 @@ function printEligibilityReport(
 
       console.log(chalk.gray(`    └─ Phase ${pIdx}: ${drop.name || "unnamed"} ${modeBadge} ${liveBadge} ${eligBadge}`));
       console.log(chalk.gray(`       type: ${drop.type || "unknown"} | price: ${formatEther(drop.mintPrice)} ETH`));
+      console.log(
+        report.walletMintable == null
+          ? chalk.gray(`       you can mint: unknown`)
+          : report.walletMintable <= 0
+            ? chalk.red(`       you can mint: 0 — allocation used up`)
+            : chalk.gray(`       you can mint: ${report.walletMintable}`)
+      );
       console.log(chalk.gray(`       reason: ${report.reason}`));
       if (report.signedPayload && report.mode !== "public") {
         console.log(chalk.gray(`       signed: ✓ ${report.signedPayload.mintData.slice(0, 20)}…`));
@@ -1353,6 +1396,59 @@ function printEligibilityReport(
 }
 
 // ── Wallet + phase selection prompt ──────────────────────────────────────────
+
+/**
+ * Fit the requested quantity to what the selected phase actually allows.
+ *
+ * Above the cap the quantity is clamped — broadcasting it would revert on-chain
+ * and cost gas for nothing. Below the cap, raising is the user's decision, not a
+ * correction: minting fewer than allowed is a valid choice.
+ *
+ * A headless run cannot ask, so it clamps an over-cap quantity silently and
+ * leaves an under-cap one alone.
+ */
+async function reconcileQuantityWithCap(
+  quantity: number,
+  mintable: number | null,
+): Promise<{ quantity: number; aborted: boolean }> {
+  if (mintable == null) return { quantity, aborted: false };
+
+  const r = reconcileQuantity(quantity, mintable);
+
+  if (r.exhausted) {
+    console.log(chalk.red("  ✗ This wallet has already minted its whole allocation for this phase."));
+    console.log(chalk.gray("    Aborting rather than broadcasting a transaction that cannot succeed."));
+    return { quantity, aborted: true };
+  }
+
+  if (r.clamped) {
+    console.log(
+      chalk.yellow(`  ⚠ You asked for ${quantity}, but this wallet can only mint ${mintable} in this phase.`)
+    );
+    if (!process.stdin.isTTY) {
+      console.log(chalk.gray(`  → Headless run — minting ${r.quantity} instead.`));
+      return { quantity: r.quantity, aborted: false };
+    }
+    const answer = await askText(chalk.gray(`  Mint ${r.quantity} instead? (Y/n): `));
+    if (answer && answer.trim() && !/^[yz]/i.test(answer.trim())) {
+      console.log(chalk.yellow("  Kept the original quantity — it will revert on-chain if the cap holds."));
+      return { quantity, aborted: false };
+    }
+    return { quantity: r.quantity, aborted: false };
+  }
+
+  if (quantity < mintable) {
+    console.log(
+      chalk.gray(`  ℹ This wallet can mint up to ${mintable} in this phase (you asked for ${quantity}).`)
+    );
+    if (process.stdin.isTTY) {
+      const answer = await askText(chalk.gray(`  Mint ${mintable} instead? (y/N): `));
+      if (answer && /^[yz]/i.test(answer.trim())) return { quantity: mintable, aborted: false };
+    }
+  }
+
+  return { quantity, aborted: false };
+}
 
 interface Selection {
   walletIndex: number;
@@ -1402,9 +1498,11 @@ async function promptWalletAndPhase(
     const shortAddr = `${we.walletAddress.slice(0, 6)}…${we.walletAddress.slice(-4)}`;
     const drop = we.phaseReports[e.pIdx].drop;
     const liveStr = e.live ? chalk.green("LIVE") : chalk.gray("waiting");
+    const mintable = we.phaseReports[e.pIdx].walletMintable;
+    const mintableStr = mintable == null ? "" : chalk.gray(` · mint up to ${mintable}`);
     console.log(
       chalk.gray(`  [${i + 1}] Wallet ${e.wIdx} ${shortAddr} → ${drop.name || "unnamed"} ` +
-        `[${e.mode}] ${liveStr} — ${formatEther(e.price)} ETH`)
+        `[${e.mode}] ${liveStr} — ${formatEther(e.price)} ETH${mintableStr}`)
     );
   });
 

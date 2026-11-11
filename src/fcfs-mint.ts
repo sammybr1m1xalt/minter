@@ -47,6 +47,7 @@ import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
 import { autoGasBounded } from "./auto-gas";
 import { withDeadlineOrThrow } from "./deadline";
 import { assertPriceProtection } from "./price-protection";
+import { reconcileQuantity } from "./mint-cap";
 import { warmConnections, pingRpcs, rankRpcEndpoints, settleRanking, type RankedEndpoint } from "./connection-warmer";
 
 /** How many of the fastest endpoints to fire at before escalating to the rest. */
@@ -1094,6 +1095,17 @@ export interface ExecuteSnipeOpts {
   /** EIP-155 chain id. Derived from `chainKey` when omitted — a transaction
    *  without one is signed with chainId 0, which no node accepts. */
   chainId?: number | null;
+  /**
+   * Re-read the per-wallet cap at T-0 and report how many tokens the wallet can
+   * still mint, or null when it cannot be determined.
+   *
+   * A drop's per-wallet limit can be edited in the last minutes before its stage
+   * opens, and the signed calldata binds the quantity — so a reduced cap means
+   * every payload fetched so far is for the wrong quantity and must be
+   * re-fetched. Omitted by callers that cannot ask (headless runs); the fire
+   * then proceeds at the originally planned quantity.
+   */
+  recheckMintable?: (quantity: number) => Promise<number | null>;
 }
 
 export type SnipeStatus = "SUCCESS" | "REVERTED" | "UNKNOWN" | "FAILED";
@@ -1329,6 +1341,54 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   // the entire fire-time RPC cost — a single round trip — followed by local
   // signing and the blast.
   //
+  // The per-wallet cap is re-read first. The signed calldata binds the quantity,
+  // so a cap that dropped while we were waiting invalidates every payload
+  // already fetched — they must be re-fetched at the reduced quantity rather
+  // than broadcast to revert.
+  let fireQuantity = quantity;
+  let requeryPayloads = false;
+  if (opts.recheckMintable && ready.length + pendingAtT0.length > 0) {
+    try {
+      const mintable = await opts.recheckMintable(quantity);
+      if (mintable != null) {
+        const r = reconcileQuantity(quantity, mintable);
+        if (r.exhausted) {
+          console.log(chalk.red("  ✗ This wallet's allocation is used up — refusing to mint."));
+          for (const entry of [...ready, ...pendingAtT0]) {
+            results[entry.walletIndex] = {
+              walletIndex: entry.walletIndex,
+              walletAddress: entry.addr,
+              success: false,
+              error: "Per-wallet allocation was used up before T-0.",
+            };
+          }
+          return results.filter((r): r is SnipeResult => r != null);
+        }
+        if (r.clamped) {
+          console.log(
+            chalk.yellow(
+              `  ⚠ Per-wallet limit changed to ${mintable} — minting ${r.quantity} instead of ${quantity}.`
+            )
+          );
+          fireQuantity = r.quantity;
+          requeryPayloads = true;
+        }
+      }
+    } catch (e: any) {
+      // A failed re-check must not stop the fire; the original quantity is still
+      // the best information available, and the on-chain revert is the backstop.
+      console.log(chalk.gray(`  ⚠ Could not re-check the per-wallet limit: ${e?.message ?? e}`));
+    }
+  }
+
+  if (requeryPayloads) {
+    // Every payload in hand is for the wrong quantity. Re-fetch them all.
+    for (const entry of ready) {
+      pendingAtT0.push({ walletIndex: entry.walletIndex, addr: entry.addr });
+    }
+    ready.length = 0;
+  }
+
   // Wallets held back for a future phase get their payload fetched HERE, after
   // the wait. OpenSea signs a mint only for a live stage, so this is the first
   // moment the payload can exist. A short retry window covers the lag between
@@ -1350,7 +1410,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
           try {
             payload = await fetchSignedPayloadForWallet(
               nftContract,
-              quantity,
+              fireQuantity,
               addr,
               openSeaApiKey,
               {

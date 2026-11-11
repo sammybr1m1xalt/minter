@@ -19,6 +19,7 @@ import {
   type DropEligibilityStage,
 } from "./opensea-gql";
 import { resolveChain } from "./chains";
+import { mintableFromCap } from "./mint-cap";
 
 const OPENSEA_BASE = "https://api.opensea.io";
 
@@ -191,6 +192,9 @@ export interface EligibilityReport {
   cap?: number | null;
   /** What the wallet has already minted on this drop, lifetime. */
   minted?: number | null;
+  /** What the wallet can mint in THIS phase: the tighter of the phase limit and
+   *  the running-cap remainder. null = unknown, which must not read as 0. */
+  walletMintable?: number | null;
 }
 
 // ── Gas recommendation ──────────────────────────────────────────────────────
@@ -809,6 +813,11 @@ function verdictToReport(drop: DropPhase, v: PhaseEligibilityVerdict): Eligibili
     priceWei: v.priceWei,
     cap: v.cap,
     minted: v.minted,
+    walletMintable: mintableFromCap({
+      phaseLimit: drop.maxTotalMintableByWallet > 0 ? drop.maxTotalMintableByWallet : null,
+      runningCap: v.cap,
+      minted: v.minted,
+    }),
   };
 }
 
@@ -973,6 +982,23 @@ export async function getPhaseEligibility(args: {
 // is what callers use when no session or slug is available.
 
 export function assessDropEligibility(
+  drop: DropPhase,
+  ourWallet: string,
+): EligibilityReport {
+  const report = assessDropEligibilityLocal(drop, ourWallet);
+  return {
+    ...report,
+    // This path never talks to OpenSea, so the running cap and the minted count
+    // are unknown; the phase limit is the only bound in hand.
+    walletMintable: mintableFromCap({
+      phaseLimit: drop.maxTotalMintableByWallet > 0 ? drop.maxTotalMintableByWallet : null,
+      runningCap: null,
+      minted: null,
+    }),
+  };
+}
+
+function assessDropEligibilityLocal(
   drop: DropPhase,
   ourWallet: string,
 ): EligibilityReport {
@@ -1371,21 +1397,32 @@ export function printDropsInventory(
       ? `${drop.maxTotalMintableByWallet} per wallet`
       : "unlimited per wallet";
 
-    // Allocation status
+    // Allocation status — the COLLECTION's capacity. A different question from
+    // what this wallet may mint, and the two were previously printed as one
+    // number, which read as "the collection has N left" when N was actually the
+    // wallet's own remaining allocation.
     let allocLine = "";
-    if (report.allocationRemaining != null) {
-      if (drop.maxTotalMintable > 0) {
-        const total = drop.maxTotalMintable;
-        const used = drop.totalMinted ?? 0;
-        const rem = report.allocationRemaining;
-        const pct = total > 0 ? ((used / total) * 100).toFixed(1) : "?";
-        allocLine = chalk.gray(`  allocated ${pct}% (${used}/${total}, ${rem} remaining)`);
-      } else {
-        allocLine = chalk.gray(`  allocation: ${report.allocationRemaining} slots remaining (unknown capacity)`);
-      }
-    } else if (drop.maxTotalMintable > 0 && drop.totalMinted != null) {
+    const collectionRemaining = computeAllocationRemaining(drop);
+    if (drop.maxTotalMintable > 0) {
+      const total = drop.maxTotalMintable;
+      const used = drop.totalMinted ?? 0;
+      const pct = total > 0 ? ((used / total) * 100).toFixed(1) : "?";
+      allocLine = chalk.gray(
+        `  allocated ${pct}% (${used}/${total}` +
+          (collectionRemaining != null ? `, ${collectionRemaining} left` : "") +
+          ")"
+      );
+    } else if (drop.totalMinted != null) {
       allocLine = chalk.gray(`  minted: ${drop.totalMinted} (capacity unknown)`);
     }
+
+    // What THIS wallet can mint in this phase.
+    const mintableLine =
+      report.walletMintable == null
+        ? chalk.gray(`  You can mint: unknown`)
+        : report.walletMintable <= 0
+          ? chalk.red(`  You can mint: 0 — this wallet's allocation is used up`)
+          : chalk.gray(`  You can mint: ${report.walletMintable}`);
 
     // Eligibility line
     let eligLine = "";
@@ -1420,6 +1457,7 @@ export function printDropsInventory(
     console.log(chalk.gray(`    Price:      ${priceEth} ETH × ${perWallet}`));
     if (gasLine) console.log(gasLine);
     if (allocLine) console.log(allocLine);
+    console.log(mintableLine);
     console.log(eligLine);
 
     if (report.reason) {

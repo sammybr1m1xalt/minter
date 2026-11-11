@@ -83,6 +83,7 @@ nodes.
 | Key | What it does | Default |
 |---|---|---|
 | `RPC_URL_ETHEREUM` / `RPC_URL_BASE` / `RPC_URL_ROBINHOOD` / `RPC_URL_ARC` / `RPC_URL_SONEIUM` | Private RPC for that chain. Overrides the built-in public endpoints. | _(empty — public nodes)_ |
+| `RPC_URL` | A single endpoint, used when `CHAIN` matches the chain you pick. | _(empty)_ |
 | `EXTRA_RPC_URLS` | Comma-separated extra endpoints, any chain. | _(empty)_ |
 | `CHAIN` | Chain highlighted in the wizard menu, and the default for the FCFS branch. | `base` |
 | `MAX_FEE_PER_GAS` | Max-fee ceiling, in gwei. Pre-filled at the prompt. | `2` |
@@ -124,15 +125,16 @@ explicitly confirm.
 |---|---|
 | **1. Private keys** | Paste one per line, hidden as you type. Blank line to finish. Each key is confirmed back to you by its wallet address, so you can check you pasted the right one. |
 | **2. Chain** | Ethereum, Base, Robinhood Chain, Arc, or Soneium. |
-| **3. Quantity** | How many NFTs **per wallet**. |
+| **3. Quantity** | How many NFTs **per wallet**. Checked against the phase's real cap at step 11b. |
 | **4. NFT link** | An OpenSea / Scatter / Zora / Manifold link, a collection slug, or a raw `0x` contract address. Chain aliases work too: `0xabc… on base`, `slug on arc`, `slug eth`. A contract address or item link always works with no API key. |
 | **5. RPC** | Paste a full URL, or just your Alchemy key and it expands automatically. Blank uses `.env`, then public nodes. Every endpoint is checked for its chain ID — any on the wrong chain is dropped, not blasted at. |
 | **6. API key + slug** | Resolves a contract address to its OpenSea slug and obtains a working API key. |
 | **7. SIWE sessions** | Warms a session for **every** wallet in parallel, so no wallet is still authenticating at T-0. |
 | **8. Phase discovery** | Finds every active phase on the collection. If OpenSea knows nothing about the contract, the universal adapter probes the bytecode for a mint function instead. |
 | **8a. Gas** | Ceiling and tip, with the live base fee shown above the prompt. |
-| **9–10. Eligibility** | Probes every wallet against every phase and prints a matrix. |
-| **11. Wallet + phase** | Pick which wallets and which phase to fire. |
+| **9–10. Eligibility** | Probes every wallet against every phase and prints a matrix, including how many tokens each wallet can actually mint in each phase. |
+| **11. Wallet + phase** | Pick which wallets and which phase to fire. Each option shows its mintable cap. |
+| **11b. Quantity check** | Compares your quantity with the selected phase's cap. Above it, you are offered the clamp; below it, you are offered the raise. Headless runs clamp silently and never raise — minting fewer than allowed is a valid choice, not an error. |
 | **12. Timing** | Wait for the stage to open, or fire now if it's already live. |
 | **12b. Price protection** | Optional cap — see below. |
 | **14. Balances** | Shows each wallet's balance and refuses to fire if none can afford the upfront gas reservation. |
@@ -150,7 +152,7 @@ explicitly confirm.
 | `npm start` | Interactive wizard — keys, chain, quantity, NFT link, RPC, gas, timing |
 | `npm start -- --help` | Print all CLI flags |
 | `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
-| `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases and whether your wallet can target each |
+| `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases, whether your wallet can target each, and how many tokens it can mint |
 
 ### Flags
 
@@ -319,7 +321,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 
 ## Architecture
 
-39 TypeScript modules, ~23k lines. The important ones:
+40 TypeScript modules, ~24k lines. The important ones:
 
 | Module | Role |
 |---|---|
@@ -346,6 +348,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/rpc-resolver.ts`](src/rpc-resolver.ts) | Endpoint discovery, chain-ID verification, blast-set planning |
 | [`src/rpc-blast.ts`](src/rpc-blast.ts) | Latency-ranked blast — fires at the fastest endpoints first, escalates to the rest only if none accepts |
 | [`src/auto-gas.ts`](src/auto-gas.ts) | Gas estimation with a hard timeout |
+| [`src/mint-cap.ts`](src/mint-cap.ts) | Per-wallet cap arithmetic — how many tokens a wallet may mint in a phase |
 | [`src/deadline.ts`](src/deadline.ts) | `withDeadline` / `withDeadlineOrThrow` — the RPC timeout backstop |
 | [`src/simulate.ts`](src/simulate.ts) | Pre-flight eth_call simulation |
 | [`src/allowlist-onchain.ts`](src/allowlist-onchain.ts) | Reading allowlist state from chain |
@@ -386,6 +389,25 @@ a second wave is a re-send of an identical transaction, not a competing one; it
 cannot consume the nonce twice. Nonces are re-read after the wait, and only the
 wallets whose nonce actually moved are re-signed.
 
+### Per-wallet caps
+
+Every phase has a per-wallet limit, and it is not a static fact — the drop owner
+can edit a stage in the last minutes before it opens. The minter treats it as
+live information:
+
+- **The eligibility report** prints `You can mint: N` per phase, where N is the
+  tighter of the phase's own limit and the running cap left after what the wallet
+  has already minted. `unknown` means it could not be determined, never zero.
+- **The wizard** compares your quantity against the selected phase's cap. Above
+  it, you are offered the clamp; below it, you are offered the raise. A headless
+  run clamps silently and never raises — minting fewer than allowed is a valid
+  choice, not an error.
+- **Both fire paths re-read the cap at T-0.** A public mint rebuilds and re-signs
+  at the reduced quantity; a signed mint re-fetches every payload, because the
+  signature binds the quantity and the old calldata is now invalid. A failed
+  re-read never stops the fire — the original plan is still the best information
+  available, and the on-chain revert is the backstop.
+
 ---
 
 ## What it protects you from
@@ -402,7 +424,9 @@ Each of these is checked *before* anything is broadcast:
   chain is dropped rather than blasted at. A target that resolves to a different
   chain than the one you picked switches chains and re-resolves endpoints instead
   of silently minting on the wrong one.
-- **Quantity above the per-wallet cap** — warned before you fire.
+- **Quantity above the per-wallet cap** — measured against the phase's real cap
+  before you fire, and re-checked at T-0. A drop whose limit is edited down in
+  the last minutes is adjusted for rather than broadcast to revert.
 - **A stalled RPC** — every network call is bounded; ethers' own 5-minute
   `FetchRequest` default is not allowed to hold a mint hostage.
 - **A mint that never confirmed** — a missing receipt is reported as `UNKNOWN`,
