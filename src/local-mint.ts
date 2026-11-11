@@ -432,6 +432,8 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
     const fired = prepared.map(({ idx, address, blast }) => {
       const { txHash, responsePromise } = blastToAll(blast, blastEndpoints, {
         firstWave: BLAST_FIRST_WAVE,
+        // See fcfs-mint.ts: 350ms escalation, not the 600ms default.
+        escalateAfterMs: 350,
       });
       return { idx, address, txHash, responsePromise };
     });

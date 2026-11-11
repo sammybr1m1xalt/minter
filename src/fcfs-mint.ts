@@ -38,7 +38,7 @@ import { resolveChain } from "./chains";
 import { fetchOnChainDrops } from "./seadrop-onchain";
 import type { DropPhase } from "./fcfs-drops";
 import { normalizeStageType } from "./fcfs-drops";
-import { isPayloadBoundToWallet } from "./seadrop-calldata";
+import { isPayloadBoundToWallet, SIGNED_SELECTOR, MERKLE_SELECTOR } from "./seadrop-calldata";
 export { isPayloadBoundToWallet } from "./seadrop-calldata";
 import { SEADROP_ADDRESS } from "./seadrop-public";
 import { ConfirmedTx } from "./rpc-health";
@@ -52,6 +52,12 @@ import { warmConnections, pingRpcs, rankRpcEndpoints, settleRanking, type Ranked
 
 /** How many of the fastest endpoints to fire at before escalating to the rest. */
 const BLAST_FIRST_WAVE = 2;
+
+// Fallback gas limit for signed / allowlist stages when neither OpenSea nor a
+// live estimate provides one. Higher than the public-mint floor because these
+// transactions carry a mintParams struct and (for allowlist stages) a merkle
+// proof whose length varies with the tree.
+const SIGNED_GAS_FLOOR = 400_000;
 
 // ── OpenSea v2 shapes (read from the live response, not hardcoded magic) ──
 
@@ -260,7 +266,9 @@ function openseaMintTxToSignedPayload(
   // The selector tells us the stage type (PUBLIC_SALE, SIGNED_PRESALE, MERKLE_PRESALE)
   // For SIGNED_PRESALE and MERKLE_PRESALE, the signature is embedded in the calldata.
   // For PUBLIC_SALE, no signature is needed.
-  const isSigned = tx.selector === "0x4b61cd6f" || tx.selector === "0x4300a4e6";
+  // Named constants, not literal hex — seadrop-calldata.ts owns these values and
+  // hardcoding them here was a second source of truth for the same selectors.
+  const isSigned = tx.selector === SIGNED_SELECTOR || tx.selector === MERKLE_SELECTOR;
 
   // `value` is the TOTAL transaction value (mintPrice × quantity) — the spec
   // describes it as "Native currency to send with the transaction", and
@@ -533,13 +541,21 @@ export async function buildSignedPayloadFromDrop(
   let gasData = buildGasDataFromDrop(drop);
   if (!gasData) {
     // OpenSea did not return any gas recommendation (no gasLimit, no maxFeePerGas).
-    // The exact gas cost of mintSigned/mintAllowlist varies by drop and by chain;
-    // 250k is a conservative floor but may be low for complex allowlist proofs.
-    console.log(chalk.yellow(`    ⚠ No gas recommendation from OpenSea — using default 250,000 gas limit.`));
-    gasData = { gasLimit: 250_000, maxFeePerGas: BigInt(0), maxPriorityFeePerGas: BigInt(0) };
-  } else if (gasData.gasLimit === 250_000 && !drop.gasLimit && !drop.gas_limit) {
-    // OpenSea returned maxFeePerGas but no gasLimit — the 250k default is silent.
-    console.log(chalk.yellow(`    ⚠ OpenSea recommended maxFeePerGas but no gas limit — using default 250,000 gas limit.`));
+    //
+    // 400k, not 250k. A signed mint (mintSigned) or merkle allowlist mint
+    // (mintAllowList) carries a mintParams struct and, for allowlist stages, a
+    // merkle proof whose length varies with the tree — both cost materially more
+    // than a plain publicMint. 250k is a comfortable floor for public mints and
+    // a genuine under-estimate for proof-bearing stages, which then revert on
+    // out-of-gas at T-0 with no way to recover.
+    //
+    // The T-0 path still runs autoGasBounded for a real estimate; this is only
+    // the fallback when that estimate cannot be obtained.
+    console.log(chalk.yellow(`    ⚠ No gas recommendation from OpenSea — using default 400,000 gas limit.`));
+    gasData = { gasLimit: SIGNED_GAS_FLOOR, maxFeePerGas: BigInt(0), maxPriorityFeePerGas: BigInt(0) };
+  } else if (gasData.gasLimit === SIGNED_GAS_FLOOR && !drop.gasLimit && !drop.gas_limit) {
+    // OpenSea returned maxFeePerGas but no gasLimit — the default is silent.
+    console.log(chalk.yellow(`    ⚠ OpenSea recommended maxFeePerGas but no gas limit — using default ${SIGNED_GAS_FLOOR.toLocaleString()} gas limit.`));
   }
 
   return {
@@ -560,7 +576,7 @@ function buildGasDataFromDrop(drop: any): FcfsGasData | undefined {
   const maxPriorityFeePerGas = drop.maxPriorityFeePerGas || drop.max_priority_fee_per_gas;
   if (!gasLimit && !maxFeePerGas) return undefined;
   return {
-    gasLimit: gasLimit ? Number(gasLimit) : 250_000,
+    gasLimit: gasLimit ? Number(gasLimit) : SIGNED_GAS_FLOOR,
     maxFeePerGas: maxFeePerGas ? parsePriceToWei(maxFeePerGas) : BigInt(0),
     maxPriorityFeePerGas: maxPriorityFeePerGas ? parsePriceToWei(maxPriorityFeePerGas) : BigInt(0),
   };
@@ -1051,7 +1067,7 @@ export function buildFcfsMintPlan(
   return {
     payload,
     quantity,
-    gasLimit: gasLimit || 250_000,
+    gasLimit: gasLimit || SIGNED_GAS_FLOOR,
     maxFeePerGas,
     maxPriorityFeePerGas,
   };
@@ -1221,6 +1237,44 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   // warmed for exactly this reason.
   await warmConnections(rpcUrls);
 
+  // ── Pre-read nonces while there is time ────────────────────────────────────
+  //
+  // The nonce is not "unknowable ahead of time" — a wallet that has not sent a
+  // transaction during the wait has a stable pending nonce, and reading it now
+  // removes one RPC round trip from the T-0 critical path. It is still re-read
+  // at T-0 (see phase 2): a wallet that sent something while we waited must use
+  // the newer value, and broadcasting with a stale nonce produces a stuck tx.
+  //
+  // This is a pure latency optimisation — the T-0 read remains authoritative.
+  const prewarmedNonces = new Map<number, number>();
+  try {
+    const nonceProvider = new JsonRpcProvider(rpcUrls[0], chainId, {
+      staticNetwork: true,
+      pollingInterval: 4000,
+    });
+    await Promise.all(
+      walletKeys.map(async (key, i) => {
+        try {
+          const addr = new Wallet(key).address;
+          const n = await withDeadlineOrThrow(
+            nonceProvider.getTransactionCount(addr, "pending"),
+            3_000,
+            `prewarm nonce for ${addr}`
+          );
+          prewarmedNonces.set(i, n);
+        } catch {
+          // Non-fatal: phase 2 reads it again with a full budget.
+        }
+      })
+    );
+    nonceProvider.destroy();
+  } catch {
+    // Provider setup failed — phase 2 reads nonces itself.
+  }
+  if (prewarmedNonces.size > 0) {
+    console.log(chalk.gray(`  Pre-read nonces for ${prewarmedNonces.size}/${walletKeys.length} wallet(s).`));
+  }
+
   await Promise.all(walletKeys.map(async (key, i) => {
     const w = new Wallet(key);
     const addr = w.address;
@@ -1311,7 +1365,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         to: payload.seaDropAddress,
         data: payload.mintData,
         value: payload.value,
-        gasLimit: gasLimit || 250_000,
+        gasLimit: gasLimit || SIGNED_GAS_FLOOR,
       });
     } catch (err: any) {
       results[i] = {
@@ -1459,7 +1513,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         to: entry.payload.seaDropAddress,
         data: entry.payload.mintData,
         value: entry.payload.value,
-        gasLimit: gasLimit || 250_000,
+        gasLimit: gasLimit || SIGNED_GAS_FLOOR,
       });
     }
   }
@@ -1482,7 +1536,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     await Promise.all(ready.map(async (r) => {
       const w = new Wallet(walletKeys[r.walletIndex]);
       try {
-        const [sim, est, nonce] = await Promise.all([
+        const [sim, est, nonceResult] = await Promise.all([
           // Tightly bounded: a simulation is a nice-to-have and must never be
           // able to eat the T-0 window. Inconclusive fails open below.
           simulateTx(fireProvider, { to: r.to, from: r.addr, data: r.data, value: r.value }, 2_000),
@@ -1498,12 +1552,21 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
           // Bounded like its two siblings. ethers has no timeout option and its
           // FetchRequest defaults to 300s with 429 backoff, so an unbounded nonce
           // read would hold the entire T-0 batch on one stalled endpoint.
+          //
+          // The prewarmed nonce is used as the fallback: if this read times out
+          // but we read the nonce before the wait, the tx can still go out with
+          // a known-good value instead of being dropped.
           withDeadlineOrThrow(
             fireProvider.getTransactionCount(r.addr, "pending"),
             2_000,
             "nonce"
-          ),
+          ).catch(() => prewarmedNonces.get(r.walletIndex) ?? null),
         ]);
+        const nonce = nonceResult;
+        if (nonce == null) {
+          // No nonce from either read — without one the tx cannot be built.
+          throw new Error("Could not read a nonce at T-0 (RPC timed out and no prewarmed value).");
+        }
 
         // An INDETERMINATE result (timeout, network error) is not evidence the tx
         // reverts — it means we could not tell. Fail OPEN: blocking a good mint
@@ -1579,6 +1642,11 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     b,
     responsePromise: blastToAll(b.blast, blastEndpoints, {
       firstWave: BLAST_FIRST_WAVE,
+      // 350ms, not the 600ms default. The first wave is 1-2 of the fastest
+      // endpoints measured by the pre-sort; if neither accepts within 350ms
+      // something is wrong with the route, and waiting longer only delays the
+      // escalation that will actually land the tx.
+      escalateAfterMs: 350,
     }).responsePromise,
   }));
 

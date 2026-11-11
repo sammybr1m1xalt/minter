@@ -775,28 +775,33 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       } else {
         console.log(chalk.gray(`\n  Pre-fetching signed payloads for ${walletKeys.length} wallet(s)...`));
       }
-      const preFetched: (FcfsSignedPayload | null)[] = [];
-      for (let i = 0; i < walletKeys.length; i++) {
-        if (phaseOpensInFuture) {
-          preFetched.push(null);
-          continue;
-        }
-        const w = new Wallet(walletKeys[i]);
-        try {
-          const p = await fetchSignedPayloadForWallet(
-            nftInput,
-            quantity,
-            w.address,
-            apiKey,
-            { timeoutMs: 15000, session: sessionResults[i]?.session ?? null, slug: slug || undefined, chainKey },
-          );
-          preFetched.push(p);
-          if (!p) console.log(chalk.yellow(`    ${w.address} — no payload (will retry at T-0)`));
-        } catch (err: any) {
-          console.log(chalk.yellow(`    ${w.address} — pre-fetch failed: ${err.message}`));
-          preFetched.push(null);
-        }
-      }
+      // Fetch all payloads CONCURRENTLY. A sequential loop here adds one
+      // round-trip per wallet before the timer even starts — 8 wallets at ~1s
+      // each is 8 seconds of avoidable delay, and the whole point of the
+      // pre-fetch is to have the payload in hand well before T-0.
+      //
+      // Each fetch is independently guarded so one failure cannot reject the
+      // batch (Promise.all would reject on the first throw).
+      const preFetched: (FcfsSignedPayload | null)[] = await Promise.all(
+        walletKeys.map(async (_, i) => {
+          if (phaseOpensInFuture) return null;
+          const w = new Wallet(walletKeys[i]);
+          try {
+            const p = await fetchSignedPayloadForWallet(
+              nftInput,
+              quantity,
+              w.address,
+              apiKey,
+              { timeoutMs: 15000, session: sessionResults[i]?.session ?? null, slug: slug || undefined, chainKey },
+            );
+            if (!p) console.log(chalk.yellow(`    ${w.address} — no payload (will retry at T-0)`));
+            return p;
+          } catch (err: any) {
+            console.log(chalk.yellow(`    ${w.address} — pre-fetch failed: ${err.message}`));
+            return null;
+          }
+        })
+      );
 
       const snipeResults = await executeFcfsSnipe({
         nftContract: nftInput,

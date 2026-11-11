@@ -1464,13 +1464,12 @@ export function printDropsInventory(
       console.log(chalk.gray(`    Note:       ${report.reason}`));
     }
 
-    // Show mint data availability.
-    // The second branch must test mintSignature ALONE: the first branch already
-    // caught mintData, so `else if (drop.mintData || ...)` was unreachable and a
-    // signature-only payload silently reported "No signed mint data".
-    if (drop.mintData && drop.mintSignature) {
-      console.log(chalk.green(`    ✓ Signed mint data available — targetable`));
-    } else if (drop.mintData) {
+    // Show mint data availability. mintData alone is the fireability test —
+    // a signature without calldata cannot fire, so it gets its own line. The
+    // previous first branch (`mintData && mintSignature`) printed exactly what
+    // the mintData-only branch below it printed, so the mintSignature test
+    // there was unreachable-in-effect and added noise.
+    if (drop.mintData) {
       console.log(chalk.green(`    ✓ Signed mint data available — targetable`));
     } else if (drop.mintSignature) {
       console.log(chalk.yellow(`    ⚠ Partial signed data (signature only, no calldata) — may need session`));
