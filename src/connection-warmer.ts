@@ -2,6 +2,68 @@
 // for a handshake. Warms only the RPC endpoints — OpenSea is handled separately
 // by the FCFS path because it may need an API key in the request.
 import chalk from "chalk";
+import { parseRpcEndpoints, type RpcEndpoint } from "./rpc-blast";
+
+export interface RankedEndpoint extends RpcEndpoint {
+  latencyMs: number | null; // null = unmeasured (timed out or errored)
+}
+
+/**
+ * Measure every endpoint in parallel and return them fastest-first.
+ *
+ * Unmeasured endpoints sort last rather than being dropped: a timed-out probe
+ * is "we could not tell", not "this endpoint is broken", and dropping it would
+ * remove a working inclusion path. Callers decide how many of the front of the
+ * list to fire at before escalating to the rest.
+ *
+ * Parallel, not sequential — a sequential loop costs N round trips, which is
+ * the entire T-0 budget on a slow endpoint.
+ */
+export async function rankRpcEndpoints(
+  rpcUrls: string[],
+  timeoutMs = 1500
+): Promise<RankedEndpoint[]> {
+  const endpoints = parseRpcEndpoints(rpcUrls);
+  const results = await Promise.all(
+    endpoints.map(async (ep) => {
+      const t0 = performance.now();
+      try {
+        const res = await fetch(ep.url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "eth_chainId", params: [], id: 1 }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        const json = (await res.json()) as any;
+        if (json.result) {
+          return { ...ep, latencyMs: Math.round(performance.now() - t0) };
+        }
+        return { ...ep, latencyMs: null };
+      } catch {
+        return { ...ep, latencyMs: null };
+      }
+    })
+  );
+  return results.sort((a, b) => (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity));
+}
+
+/**
+ * Resolve a ranking that is already in flight, waiting at most `budgetMs`.
+ *
+ * The ranking only orders the blast — it must never delay a mint, so a ranking
+ * that has not finished in time yields null and the caller fires against its
+ * original endpoint order instead. Callers should start the ranking well before
+ * T-0 (during the wait, or during signing) so this budget is only a safety net.
+ */
+export async function settleRanking(
+  ranking: Promise<RankedEndpoint[]>,
+  budgetMs = 250
+): Promise<RankedEndpoint[] | null> {
+  return Promise.race([
+    ranking,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), budgetMs)),
+  ]);
+}
 
 // Minimal liveness check: eth_chainId + eth_blockNumber on each RPC.
 // This is cheaper than the full probeEndpoints() (no chainId verification,

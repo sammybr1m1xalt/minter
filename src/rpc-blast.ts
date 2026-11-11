@@ -66,13 +66,28 @@ export function prepareBlast(rawTx: string): PreparedBlast {
   };
 }
 
+export interface BlastOptions {
+  /** Per-request timeout. Default 10s. */
+  timeoutMs?: number;
+  /**
+   * Fire at only the first N endpoints, then escalate to the rest only if none
+   * of them accepts. Pass a latency-ranked list so the fastest go first.
+   * 0 (default) fires at every endpoint at once — the original behaviour.
+   */
+  firstWave?: number;
+  /** How long to wait for the first wave before firing the rest. Default 600ms. */
+  escalateAfterMs?: number;
+}
+
 // Fire-and-forget blast to all endpoints, returns immediately.
 // Used by the public path (local-mint.ts).
 export function blastToAll(
   rawTxOrPrepared: string | PreparedBlast,
   endpoints: RpcEndpoint[],
-  timeoutMs = 10_000
+  opts: BlastOptions = {}
 ): { txHash: string; responsePromise: Promise<BlastResult[]> } {
+  const { timeoutMs = 10_000, firstWave = 0, escalateAfterMs = 600 } = opts;
+
   const prepared: PreparedBlast =
     typeof rawTxOrPrepared === "string"
       ? prepareBlast(rawTxOrPrepared)
@@ -80,70 +95,105 @@ export function blastToAll(
 
   const { txHash, body } = prepared;
 
-  // Fire all requests and time each one individually
-  const firePromises = endpoints.map((ep) => {
-    const t0 = Date.now();
-    return fetch(ep.url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-      keepalive: true,
-      // A hung endpoint must not hold responsePromise open forever — both
-      // callers await it, so one stalled RPC would hang the whole mint.
-      signal: AbortSignal.timeout(timeoutMs),
-    })
-      .then((res) => {
-        const latencyMs = Date.now() - t0;
-        return res.json().then((json) => ({ json, latencyMs }));
-      })
-      .catch((err) => {
-        const latencyMs = Date.now() - t0;
-        return { err, latencyMs };
-      });
-  });
+  // Pre-sized so results stay index-aligned with `endpoints` no matter which
+  // wave fills them — a caller indexing by endpoint must never read a
+  // neighbouring endpoint's verdict.
+  const results: BlastResult[] = new Array(endpoints.length);
 
-  const responsePromise = Promise.allSettled(firePromises).then(async (settled) => {
-    const results: BlastResult[] = [];
-    for (let i = 0; i < settled.length; i++) {
-      const ep = endpoints[i];
-      const s = settled[i];
-      if (s.status === "fulfilled") {
-        const v = (s as any).value;
-        // The per-endpoint catch returns { err } rather than throwing, so a
-        // network failure arrives as a FULFILLED result with no `json`. Reading
-        // `json.result` on it throws inside this handler and rejects
-        // responsePromise — turning one dead endpoint into a crashed mint.
-        if (v && v.err) {
-          const msg = v.err?.message || String(v.err);
-          console.log(chalk.yellow(`  [${ep.label}] FAILED ${v.latencyMs}ms — ${msg}`));
-          results.push({ label: ep.label, txHash: null, error: msg });
-          continue;
-        }
-        const { json, latencyMs } = v;
-        if (json.result) {
-          console.log(chalk.green(`  [${ep.label}] ACCEPTED ${latencyMs}ms — tx ${json.result}`));
-          results.push({ label: ep.label, txHash: json.result, error: null });
-        } else if (json.error) {
-          const errMsg = json.error.message || JSON.stringify(json.error);
-          console.log(chalk.red(`  [${ep.label}] REJECTED ${latencyMs}ms — ${errMsg}`));
-          results.push({ label: ep.label, txHash: null, error: errMsg });
-        } else {
-          // Neither result nor error. Push a placeholder so `results` stays
-          // index-aligned with `endpoints` — a caller indexing by endpoint would
-          // otherwise read a neighbouring endpoint's verdict.
-          const msg = "empty JSON-RPC response (no result, no error)";
-          console.log(chalk.yellow(`  [${ep.label}] UNKNOWN ${latencyMs}ms — ${msg}`));
-          results.push({ label: ep.label, txHash: null, error: msg });
-        }
-      } else {
-        const reason = (s as any).reason?.message || String(s);
-        const latencyMs = (s as any).value?.latencyMs ?? 0;
-        console.log(chalk.yellow(`  [${ep.label}] FAILED ${latencyMs}ms — ${reason}`));
-        results.push({ label: ep.label, txHash: null, error: reason });
+  const fire = (
+    targets: Array<{ index: number; ep: RpcEndpoint }>
+  ): Promise<void> => {
+    const promises = targets.map(({ index, ep }) => {
+      const t0 = Date.now();
+      return fetch(ep.url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        keepalive: true,
+        // A hung endpoint must not hold responsePromise open forever — both
+        // callers await it, so one stalled RPC would hang the whole mint.
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+        .then(async (res) => {
+          const latencyMs = Date.now() - t0;
+          const json = (await res.json()) as any;
+          return { json, latencyMs };
+        })
+        .then(({ json, latencyMs }) => {
+          if (json.result) {
+            console.log(chalk.green(`  [${ep.label}] ACCEPTED ${latencyMs}ms — tx ${json.result}`));
+            results[index] = { label: ep.label, txHash: json.result, error: null };
+          } else if (json.error) {
+            const errMsg = json.error.message || JSON.stringify(json.error);
+            console.log(chalk.red(`  [${ep.label}] REJECTED ${latencyMs}ms — ${errMsg}`));
+            results[index] = { label: ep.label, txHash: null, error: errMsg };
+          } else {
+            // Neither result nor error.
+            const msg = "empty JSON-RPC response (no result, no error)";
+            console.log(chalk.yellow(`  [${ep.label}] UNKNOWN ${latencyMs}ms — ${msg}`));
+            results[index] = { label: ep.label, txHash: null, error: msg };
+          }
+        })
+        .catch((err) => {
+          // A network failure lands here rather than rejecting the wave: one
+          // dead endpoint must not turn into a crashed mint.
+          const msg = err?.message || String(err);
+          console.log(chalk.yellow(`  [${ep.label}] FAILED ${Date.now() - t0}ms — ${msg}`));
+          results[index] = { label: ep.label, txHash: null, error: msg };
+        });
+    });
+    return Promise.all(promises).then(() => undefined);
+  };
+
+  const indexed = endpoints.map((ep, index) => ({ index, ep }));
+  const wave1 = firstWave > 0 ? indexed.slice(0, firstWave) : indexed;
+  const wave2 = firstWave > 0 ? indexed.slice(firstWave) : [];
+
+  // Endpoints the escalation never reached must still occupy their slot: the
+  // array is documented as index-aligned with `endpoints`, and a hole would read
+  // as `undefined` to any caller indexing by position.
+  const finalize = (): BlastResult[] => {
+    for (let i = 0; i < results.length; i++) {
+      if (results[i] == null) {
+        results[i] = {
+          label: endpoints[i].label,
+          txHash: null,
+          error: "not fired — an earlier endpoint accepted the transaction",
+        };
       }
     }
     return results;
-  });
+  };
+
+  const responsePromise = (async () => {
+    if (wave2.length === 0) {
+      await fire(wave1);
+      return finalize();
+    }
+
+    // First wave goes out now; the rest only if it produces no acceptance
+    // within escalateAfterMs. A slow tail must not delay the endpoints most
+    // likely to include the transaction.
+    const first = fire(wave1);
+    const timer = new Promise<"timeout">((resolve) =>
+      setTimeout(() => resolve("timeout"), escalateAfterMs)
+    );
+    const outcome = await Promise.race([
+      first.then(() => "settled" as const),
+      timer,
+    ]);
+
+    if (outcome === "settled") {
+      if (results.some((r) => r != null && r.txHash != null)) return finalize();
+      await fire(wave2);
+      return finalize();
+    }
+
+    // The timer won while the first wave is still in flight. Fire the rest now
+    // rather than waiting for it — waiting is exactly the delay this avoids.
+    await Promise.all([first, fire(wave2)]);
+    return finalize();
+  })();
 
   return { txHash, responsePromise };
 }

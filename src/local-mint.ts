@@ -10,13 +10,16 @@ import chalk from "chalk";
 import { performance } from "perf_hooks";
 import { JsonRpcProvider, Wallet, formatEther } from "ethers";
 import { blastToAll, parseRpcEndpoints, prepareBlast, waitForReceipt, PreparedBlast } from "./rpc-blast";
-import { warmConnections } from "./connection-warmer";
+import { warmConnections, rankRpcEndpoints, settleRanking, type RankedEndpoint } from "./connection-warmer";
 import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
 import { LocalMintPlan } from "./seadrop-public";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
 import { autoGasBounded } from "./auto-gas";
 import { assertPriceProtection } from "./price-protection";
+
+/** How many of the fastest endpoints to fire at before escalating to the rest. */
+const BLAST_FIRST_WAVE = 2;
 
 export interface LocalSnipeOpts {
   nftContract: string;
@@ -255,6 +258,12 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
       console.log(chalk.green(`  ✓ Simulation passed — the mint transaction will succeed.`));
     }
 
+    // Rank the endpoints concurrently with gas estimation and signing below, so
+    // the ordering is in hand well before T-0. Started here rather than at fire
+    // time on purpose: measuring at T-0 would delay the fire by the measurement
+    // itself. The fire path never waits for this (see settleRanking).
+    const ranking = rankRpcEndpoints(rpcUrls);
+
     // ── Sign everything now, well before the stage opens ──
     const signStart = performance.now();
     const prepared: { idx: number; address: string; blast: PreparedBlast }[] = [];
@@ -339,6 +348,9 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
     // every endpoint then rejects the signed tx as "nonce too low". The nonce is
     // the one value that cannot be precomputed — re-derive it here and re-sign
     // only the wallets whose nonce actually moved.
+    //
+    // This runs concurrently with the ranking above; neither sends a
+    // transaction, so neither can advance the nonce.
     const freshChecks = await resolveNonces(wallets, rpcUrls);
     let reSigned = 0;
     for (let i = 0; i < freshChecks.length; i++) {
@@ -362,11 +374,29 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
       console.log(chalk.gray(`  Re-signed ${reSigned} tx(s) with fresh nonces.`));
     }
 
+    // Zero budget: the ranking is an optimisation and must never hold up the
+    // fire. If it is not already finished, fire against the original order.
+    const ranked = await settleRanking(ranking, 0);
+    const blastEndpoints: RankedEndpoint[] =
+      ranked && ranked.length > 0 ? ranked : endpoints.map((e) => ({ ...e, latencyMs: null }));
+    if (blastEndpoints.length > 1) {
+      console.log(
+        chalk.gray(
+          `  Fastest endpoints: ${blastEndpoints
+            .slice(0, BLAST_FIRST_WAVE)
+            .map((e) => `${e.label}${e.latencyMs != null ? ` ${e.latencyMs}ms` : ""}`)
+            .join(", ")} — escalating to the rest if none accepts`
+        )
+      );
+    }
+
     const stageStartMs = targetStart ? targetStart.getTime() : Date.now();
     const dispatchStart = performance.now();
 
     const fired = prepared.map(({ idx, address, blast }) => {
-      const { txHash, responsePromise } = blastToAll(blast, endpoints);
+      const { txHash, responsePromise } = blastToAll(blast, blastEndpoints, {
+        firstWave: BLAST_FIRST_WAVE,
+      });
       return { idx, address, txHash, responsePromise };
     });
 
@@ -425,7 +455,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
           const blastResults = await firing.responsePromise;
           const accepting = blastResults.find((r: any) => r.txHash != null);
           if (accepting) {
-            const ep = endpoints.find((e) => e.label === accepting.label);
+            const ep = blastEndpoints.find((e) => e.label === accepting.label);
             if (ep) url = ep.url;
           }
         }

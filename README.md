@@ -343,7 +343,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/opensea-session.ts`](src/opensea-session.ts) | SIWE session cookies per wallet |
 | [`src/opensea-gql.ts`](src/opensea-gql.ts) | GraphQL queries and response parsing |
 | [`src/rpc-resolver.ts`](src/rpc-resolver.ts) | Endpoint discovery, chain-ID verification, blast-set planning |
-| [`src/rpc-blast.ts`](src/rpc-blast.ts) | Broadcasting a signed tx to many endpoints at once |
+| [`src/rpc-blast.ts`](src/rpc-blast.ts) | Latency-ranked blast — fires at the fastest endpoints first, escalates to the rest only if none accepts |
 | [`src/auto-gas.ts`](src/auto-gas.ts) | Gas estimation with a hard timeout |
 | [`src/deadline.ts`](src/deadline.ts) | `withDeadline` / `withDeadlineOrThrow` — the RPC timeout backstop |
 | [`src/simulate.ts`](src/simulate.ts) | Pre-flight eth_call simulation |

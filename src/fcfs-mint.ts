@@ -47,7 +47,10 @@ import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
 import { autoGasBounded } from "./auto-gas";
 import { withDeadlineOrThrow } from "./deadline";
 import { assertPriceProtection } from "./price-protection";
-import { warmConnections, pingRpcs } from "./connection-warmer";
+import { warmConnections, pingRpcs, rankRpcEndpoints, settleRanking, type RankedEndpoint } from "./connection-warmer";
+
+/** How many of the fastest endpoints to fire at before escalating to the rest. */
+const BLAST_FIRST_WAVE = 2;
 
 // ── OpenSea v2 shapes (read from the live response, not hardcoded magic) ──
 
@@ -99,39 +102,6 @@ export {
   printGasRecommendation,
   gasChoiceAssessment,
 } from "./fcfs-drops";
-
-// ── Latency-sorted RPC list (built during setup, used at fire) ─────────
-
-export interface RpcEndpointLatency {
-  url: string;
-  label: string;
-  latencyMs: number | null; // null = unmeasured
-}
-
-export async function measureRpcLatency(urls: string[], timeoutMs = 3000): Promise<RpcEndpointLatency[]> {
-  const endpoints = parseRpcEndpoints(urls);
-  const results: RpcEndpointLatency[] = [];
-
-  for (const ep of endpoints) {
-    const t0 = performance.now();
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      await fetch(ep.url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", method: "eth_chainId", params: [], id: 1 }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      results.push({ url: ep.url, label: ep.label, latencyMs: Math.round(performance.now() - t0) });
-    } catch {
-      results.push({ url: ep.url, label: ep.label, latencyMs: null });
-    }
-  }
-  results.sort((a, b) => (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity));
-  return results;
-}
 
 // ── OpenSea session — refreshable OAuth token, stored on disk ───────────────
 
@@ -1205,6 +1175,11 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   const results: (SnipeResult | null)[] = new Array(walletKeys.length).fill(null);
   const endpoints = parseRpcEndpoints(rpcUrls);
 
+  // Rank the endpoints concurrently with phase 1 (payload fetching, which can
+  // take seconds), so the ordering is in hand by T-0. The fire path never waits
+  // for this — see settleRanking.
+  const ranking = rankRpcEndpoints(rpcUrls);
+
   // ══ PHASE 1 — everything that does not depend on the wall clock ══════════
   //
   // OpenSea's signed calldata is stable for the whole stage, so it is fetched
@@ -1526,9 +1501,25 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   // independent, so a serial loop puts every wallet after the first a full poll
   // budget (60s) behind — 10 wallets is ~10 minutes before the last one is
   // checked, which also delays the sell-after-mint step.
+  // Zero budget: the ranking is an optimisation and must never hold up the
+  // fire. If it is not already finished, fire against the original order.
+  const ranked = await settleRanking(ranking, 0);
+  const blastEndpoints: RankedEndpoint[] =
+    ranked && ranked.length > 0 ? ranked : endpoints.map((e) => ({ ...e, latencyMs: null }));
+  if (blastEndpoints.length > 1) {
+    console.log(
+      `  Fastest endpoints: ${blastEndpoints
+        .slice(0, BLAST_FIRST_WAVE)
+        .map((e) => `${e.label}${e.latencyMs != null ? ` ${e.latencyMs}ms` : ""}`)
+        .join(", ")} — escalating to the rest if none accepts`
+    );
+  }
+
   const inflight = toBlast.map((b) => ({
     b,
-    responsePromise: blastToAll(b.blast, endpoints).responsePromise,
+    responsePromise: blastToAll(b.blast, blastEndpoints, {
+      firstWave: BLAST_FIRST_WAVE,
+    }).responsePromise,
   }));
 
   const collected = await Promise.all(
@@ -1539,7 +1530,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
       // never saw the tx. Fall back to rpcUrls[0] if the blast result has no
       // accepting label (shouldn't happen, but defensive).
       const accepted = blastResults.find((r) => r.txHash != null);
-      const acceptingEndpoint = accepted && endpoints.find((ep) => ep.label === accepted.label);
+      const acceptingEndpoint = accepted && blastEndpoints.find((ep) => ep.label === accepted.label);
       const receiptUrl = acceptingEndpoint ? acceptingEndpoint.url : rpcUrls[0];
 
       let receipt: ConfirmedTx | undefined;
