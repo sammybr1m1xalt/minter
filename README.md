@@ -319,7 +319,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 
 ## Architecture
 
-39 TypeScript modules, ~22k lines. The important ones:
+39 TypeScript modules, ~23k lines. The important ones:
 
 | Module | Role |
 |---|---|
@@ -342,6 +342,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/opensea-key.ts`](src/opensea-key.ts) | API key pool — auto-mint, probe, rank, 7-day refresh |
 | [`src/opensea-session.ts`](src/opensea-session.ts) | SIWE session cookies per wallet |
 | [`src/opensea-gql.ts`](src/opensea-gql.ts) | GraphQL queries and response parsing |
+| [`src/connection-warmer.ts`](src/connection-warmer.ts) | Parallel RPC latency ranking — orders endpoints fastest-first for the blast |
 | [`src/rpc-resolver.ts`](src/rpc-resolver.ts) | Endpoint discovery, chain-ID verification, blast-set planning |
 | [`src/rpc-blast.ts`](src/rpc-blast.ts) | Latency-ranked blast — fires at the fastest endpoints first, escalates to the rest only if none accepts |
 | [`src/auto-gas.ts`](src/auto-gas.ts) | Gas estimation with a hard timeout |
@@ -366,6 +367,24 @@ locally. A free API key is auto-minted if you don't supply one.
 nothing about the contract, the bytecode is probed for a known mint selector
 (ERC721/ERC1155, Manifold, Zora, Scatter, bespoke) and calldata is built from the
 verified ABI.
+
+### How the fire reaches the chain
+
+Every endpoint is measured in parallel with a plain `eth_chainId` and ordered
+fastest-first; one that does not answer in time is sorted last, not dropped. The
+fire then sends the signed transaction to the **two quickest** endpoints first,
+and escalates to the rest only if neither accepts within 600 ms.
+
+The measurement runs during signing (public phase) or while the OpenSea payload
+is fetched (signed phase), and the fire path **never waits for it**. If the
+ranking has not finished — typically because one endpoint is dead and holding
+the probe — every endpoint fires at once, which is the old behaviour. A slow
+endpoint costs you the ordering, never the mint.
+
+The same signed transaction goes to every endpoint. Only one can include it, so
+a second wave is a re-send of an identical transaction, not a competing one; it
+cannot consume the nonce twice. Nonces are re-read after the wait, and only the
+wallets whose nonce actually moved are re-signed.
 
 ---
 
@@ -424,10 +443,7 @@ None of these block a mint.
 3. **Sell-after-mint broadcast is unverified.** See above.
 4. **Soneium ABI lookups depend on Sourcify alone** — Etherscan V2 rejects chain
    ID 1868.
-5. **Stale audit documents.** `AUDIT.txt`, `AUDIT_FINDINGS.txt` and
-   `OPENSEA_API_LAYOUT.txt` are git-tracked and describe an older tree.
-   `AUDIT_FINDINGS.txt` is the current one.
-6. **No test suite is committed.** The test harness and fixtures were removed;
+5. **No test suite is committed.** The test harness and fixtures were removed;
    `npm test` is no longer defined in `package.json`. Typecheck
    (`npm run typecheck`) and build (`npm run build`) are the remaining gates.
 
