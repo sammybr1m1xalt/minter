@@ -59,10 +59,20 @@ export async function settleRanking(
   ranking: Promise<RankedEndpoint[]>,
   budgetMs = 250
 ): Promise<RankedEndpoint[] | null> {
-  return Promise.race([
-    ranking,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), budgetMs)),
-  ]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      ranking,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), budgetMs);
+      }),
+    ]);
+  } finally {
+    // Whichever side wins the race, the other side's timer must not stay live.
+    // Both fire paths call this with a zero budget, where the timer is the
+    // winning side — an un-cleared handle holds the event loop open.
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 // Minimal liveness check: eth_chainId + eth_blockNumber on each RPC.

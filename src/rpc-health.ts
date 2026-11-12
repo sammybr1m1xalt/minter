@@ -1,6 +1,8 @@
 // On-chain confirmation sweep — polls RPC endpoints for tx receipts
 // and summarizes results. Used by fcfs-mint.ts:executeFcfsSnipe.
 
+import { parseHexQuantity } from "./rpc-blast";
+
 // ── On-chain confirmation sweep ───────────────────────────────────────────────
 
 export interface ConfirmedTx {
@@ -34,8 +36,10 @@ export async function sweepOnChain(
     // ~3× longer than asked (3 receipt polls + 2 existence checks in parallel).
     const perRequestMs = Math.min(timeoutMs, 5_000);
 
-    // Poll all RPCs in parallel for the receipt
-    const pollPromises = rpcUrls.slice(0, 3).map(async (url) => {
+    // Poll EVERY RPC in parallel for the receipt. Polling only the first three
+    // meant a tx landed while those three were slow or dead was reported as not
+    // found, even though the caller had working endpoints beyond them.
+    const pollPromises = rpcUrls.map(async (url) => {
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), perRequestMs);
@@ -55,9 +59,9 @@ export async function sweepOnChain(
         const receipt = json.result;
         if (receipt) {
           return {
-            block: parseInt(receipt.blockNumber, 16),
-            position: parseInt(receipt.transactionIndex, 16),
-            gasUsed: parseInt(receipt.gasUsed, 16),
+            block: parseHexQuantity(receipt.blockNumber),
+            position: parseHexQuantity(receipt.transactionIndex),
+            gasUsed: parseHexQuantity(receipt.gasUsed),
             // A missing status is a pre-Byzantium receipt: the tx was included,
             // so it succeeded. Only an explicit 0x0 is a revert.
             status: receipt.status === "0x0" ? "REVERTED" : "SUCCESS",
@@ -82,7 +86,7 @@ export async function sweepOnChain(
     } else {
       // No receipt found — check if the TX exists at all
       const existenceChecks = await Promise.all(
-        rpcUrls.slice(0, 2).map(async (url) => {
+        rpcUrls.map(async (url) => {
           try {
             const res = await fetch(url, {
               method: "POST",
@@ -107,7 +111,7 @@ export async function sweepOnChain(
         status = "PENDING";
       } else if (txExists && txExists.blockNumber !== null) {
         // Exists but in a block we didn't see a receipt for — odd, report what we have
-        block = parseInt(txExists.blockNumber, 16);
+        block = parseHexQuantity(txExists.blockNumber);
         status = "NOT_FOUND";
       } else {
         status = "NOT_FOUND";

@@ -16,8 +16,9 @@ export const SEADROP_ADDRESS = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
 
 // OpenSea's standard fee collector — the usual allowed recipient on their drops.
 // Only used when a drop leaves the recipient list empty and unrestricted, since
-// SeaDrop rejects the zero address outright.
-const OPENSEA_FEE_RECIPIENT = "0x0000a26b00c1F0DF003000390027140000fAa719";
+// SeaDrop rejects the zero address outright. Exported: this address was copied
+// into three modules, and a copy silently edited would diverge from the others.
+export const OPENSEA_FEE_RECIPIENT = "0x0000a26b00c1F0DF003000390027140000fAa719";
 
 const PUBLIC_ABI = [
   "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",

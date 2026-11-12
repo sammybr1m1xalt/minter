@@ -434,7 +434,13 @@ export function netFromOrders(orders: any[], seller: string): bigint | null {
   }
 
   if (!found) return null;
-  return quantity > 0n ? total / quantity : total;
+  // Without the seller's own order there is no quantity to divide by, and
+  // returning the undivided total would present a whole-order figure as a
+  // per-token one — overstating the proceeds by the order size, which is the
+  // direction the cost guard must never err in. Refuse, the same way
+  // orderQuantity() does.
+  if (quantity <= 0n) return null;
+  return total / quantity;
 }
 
 /**
@@ -643,10 +649,16 @@ export interface SellWalletResult {
 export async function executeSellAfterMint(
   opts: SellWalletOpts
 ): Promise<SellWalletResult> {
-  const wallet = new Wallet(opts.walletKey);
   // A caller-supplied provider is not ours to destroy.
   const ownedProvider = !opts.provider;
   const provider: any = opts.provider ?? new JsonRpcProvider(opts.rpcUrl, opts.chainId, { staticNetwork: true });
+  // The wallet must be CONNECTED to the provider. `Wallet.sendTransaction`
+  // broadcasts through `wallet.provider`; a bare Wallet throws
+  // "missing provider (operation=\"sendTransaction\", code=UNSUPPORTED_OPERATION)"
+  // on ethers 6, which made every approval and every sale in this module
+  // impossible. Signing locally and broadcasting through `provider` would also
+  // work, but connecting the wallet keeps the call sites unchanged.
+  const wallet = new Wallet(opts.walletKey, provider);
 
   const result: SellWalletResult = {
     walletAddress: wallet.address,

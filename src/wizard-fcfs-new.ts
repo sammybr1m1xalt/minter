@@ -787,10 +787,10 @@ export async function runFcfsBranch(
     // Re-read the per-wallet cap at T-0. The signed calldata binds the quantity,
     // so a cap that dropped while waiting means every payload fetched so far is
     // for the wrong quantity and must be re-fetched rather than broadcast.
-    recheckMintable: async () => {
+    recheckMintable: async (walletAddress: string) => {
       const report = await getPhaseEligibility({
         drop: selectedDrop,
-        wallet: wallets[0].address.toLowerCase(),
+        wallet: walletAddress.toLowerCase(),
         slug: effectiveSlug,
         cookie: sessionCookies[0] || null,
         apiKey,

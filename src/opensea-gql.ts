@@ -27,15 +27,22 @@ export const decodeStageIndex = decodeStageIndexImpl;
 
 const OPENSEA_GQL_URL = "https://gql.opensea.io/graphql";
 
+// Only ONE pinned hash is ever used — MintActionTimelineQuery. The four that
+// used to live here (mintModule, dropEligibility, mintQuery, collectionDrops)
+// were referenced by nothing; they were deleted rather than left to rot.
+// This value is exactly sha256 of our own MintActionTimelineQuery text, not a
+// frontend secret, so a server-side rotation can only retire it — and the APQ
+// fallback below re-registers and executes in the same call.
 export const GQL_HASHES = {
-  mintModule: process.env.OS_HASH_MINT_MODULE || "bb4a5cd4809b2214c900a91d066158a5fc27a82fcb8cbcc13db34053a88fa05c",
   mintTimeline: process.env.OS_HASH_MINT_TIMELINE || "1a786dd183540c6143038435ebb7d48c6e2007150210585e45137c8e1d779801",
-  dropEligibility: process.env.OS_HASH_DROP_ELIGIBILITY || "e1b54354df0d26d39c6b81429bd5e5d37749eaa4bdc027f987128f8c1e7d2308",
-  mintQuery: process.env.OS_HASH_MINT_QUERY || "15d500b9dab94cd28b158ebc43ac446c3c71250178c22cdbdf152bc302154310",
-  // Computed sha256 of the CollectionDropsQuery text below — used for initial
-  // hash-only GET (faster). Falls back to APQ registration on PERSISTED_QUERY_NOT_FOUND.
-  collectionDrops: process.env.OS_HASH_COLLECTION_DROPS || "c9c322e2f709d3533ee09e496f6dbda9048387d18e194d53c1f7ba6433613b56",
 };
+
+// A hash that a successful APQ registration proved to work. Without this the
+// recovered hash was discarded and every later call in the run retried the dead
+// pinned hash first, paying the APQ penalty again for the rest of the run.
+// In-process only: a persisted hash would outlive the query text it was
+// computed from, and the text is the source of truth.
+const recoveredHashes = new Map<string, string>();
 
 // GraphQL query texts for APQ registration when pinned hashes are retired.
 // These match the exact queries the OpenSea frontend uses, so the server
@@ -44,11 +51,13 @@ export const GQL_QUERY_TEXTS: Record<string, string> = {
   MintActionTimelineQuery: `query MintActionTimelineQuery($address: Address! $fromAssets: [AssetQuantityInput!]! $toAssets: [AssetQuantityInput!]! $recipient: Address) { swap(address: $address fromAssets: $fromAssets toAssets: $toAssets recipient: $recipient action: MINT) { actions { __typename ... on TransactionAction { transactionSubmissionData { to data value chain { networkId identifier } } } } errors { __typename } } }`,
   MintModuleQuery: `query MintModuleQuery($collectionSlug: String!) { dropBySlug(slug: $collectionSlug) { __typename stages { __typename stageType stageIndex startTime endTime maxTotalMintableByWallet allowlistMemberCount price { token { unit symbol contractAddress chain { identifier } } } label } } }`,
   DropEligibilityQuery: `query DropEligibilityQuery($collectionSlug: String!, $address: Address!) { dropBySlug(slug: $collectionSlug) { __typename ... on Erc721SeaDropV1 { minterQuantityMinted(minter: $address) } accountStageEligibility { walletCount allowlistedWalletCount wallets { address quantityMinted stages { dropStageUuid isEligible maxTotalMintableByWallet } } } stages { uuid stageType stageIndex startTime endTime isEligible eligibleMinterAddress maxTotalMintableByWallet allowlistMemberCount eligibleMaxTotalMintableByWallet eligiblePrice { token { unit symbol } } } } }`,
-  // Verified against the live schema (collectr, 2026-11-05). The previous
-  // version queried collectionBySlug, whose result type (CollectionResult)
-  // exposes NONE of slug/name/address/chain/stages — every field was rejected
-  // with "Cannot query field", and the inline fragment type CollectionDropStage
-  // does not exist. dropBySlug is the working root.
+  // Verified against the live schema (collectr, 2026-11-05; re-checked
+  // 2026-11-08). collectionBySlug DOES answer collection metadata
+  // (`... on Collection { slug address chain { identifier networkId } }`) — that
+  // is what slug-resolver.ts uses — but it does not expose drop stages, and the
+  // older `CollectionDropStage` inline fragment does not exist. dropBySlug is the
+  // working root for stages; see the CollectionDropsQuery entry in this map
+  // for the field-by-field verification.
   //
   // Live-verified fields on Erc721SeaDropV1Stage:
   //   uuid, stageType, stageIndex, label, startTime, endTime,
@@ -107,6 +116,33 @@ export function isWholeWei(value: unknown): boolean {
   if (typeof value === "number") return Number.isInteger(value);
   if (typeof value === "string") return /^-?\d+$/.test(value.trim());
   return false;
+}
+
+/**
+ * Convert a GQL `token.unit` price to wei.
+ *
+ * The GQL surface is ETH by contract — a float, or a JSON integer when the
+ * amount is a whole number (0.0056 arrives as 0.0056, but 1 ETH arrives as 1).
+ * `parsePriceToWei` cannot tell the surfaces apart and treats an integer as
+ * wei, so a 1 ETH drop read as 1 wei and the price-protection floor was
+ * satisfied trivially. This function is explicit: everything from GQL is ETH.
+ * The REST `price` field is wei and must go through `parsePriceToWei`.
+ */
+export function parseGqlPriceToWei(value: unknown): bigint {
+  if (value == null) return 0n;
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return 0n;
+    return BigInt(Math.round(value * 1e18));
+  }
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return 0n;
+    if (/^-?\d+$/.test(s)) return BigInt(s) * 1000000000000000000n;
+    if (/^-?\d*\.\d+$/.test(s)) return parsePriceToWei(s);
+    return 0n;
+  }
+  return 0n;
 }
 
 /**
@@ -234,7 +270,8 @@ export async function gqlPersistedQuery(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  const ext = JSON.stringify({ persistedQuery: { sha256Hash: hash, version: 1 } });
+  const effectiveHash = recoveredHashes.get(operationName) ?? hash;
+  const ext = JSON.stringify({ persistedQuery: { sha256Hash: effectiveHash, version: 1 } });
   const url =
     `${OPENSEA_GQL_URL}?app_id=os2-web&operationName=${operationName}` +
     `&variables=${encodeURIComponent(JSON.stringify(variables))}` +
@@ -270,7 +307,10 @@ export async function gqlPersistedQuery(
     });
     clearTimeout(timer);
     if (!pr.ok) throw new Error(`opensea gql ${operationName} APQ ${pr.status}`);
-    return await pr.json();
+    const parsed = (await pr.json()) as any;
+    if (parsed?.errors?.length) throw new Error(`opensea gql ${operationName} APQ returned errors`);
+    recoveredHashes.set(operationName, computed);
+    return parsed;
   } catch (err: any) {
     clearTimeout(timer);
     if (err && err.name === "AbortError") throw new Error("OpenSea GraphQL query timed out");
@@ -605,73 +645,6 @@ export async function buildOpenseaMint(args: {
   };
 }
 
-/**
- * Documented REST eligibility check: GET /api/v2/drops/{slug}/eligibility.
- *
- * This is the API's own eligibility endpoint — it needs only the slug and a
- * wallet JWT, and returns per-stage is_eligible / stage_uuid / price. The code
- * previously re-derived all of this from GraphQL (which returns UNAUTHORIZED
- * for the eligibility fields without a JWT) and from POST /mint status codes.
- *
- * Returns null when the endpoint is unavailable (no session, 401/403/404) so
- * callers can fall back to the GQL path.
- */
-export async function fetchRestEligibility(
-  slug: string,
-  cookie?: string | null,
-  apiKey?: string | null,
-  timeoutMs = 10000,
-): Promise<{
-  stages: {
-    stageUuid: string | null;
-    /** null = the endpoint could not tell (usually no JWT) — UNKNOWN, not false. */
-    isEligible: boolean | null;
-    price: bigint | null;
-    maxTotalMintableByWallet: number | null;
-  }[];
-} | null> {
-  if (!slug || !slug.trim()) return null;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const headers: Record<string, string> = { accept: "application/json" };
-    if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
-    if (cookie) headers["cookie"] = cookie;
-    // This endpoint is wallet-scoped: it needs the wallet JWT as a Bearer token
-    // (the cookie alone is for PAT management and is not accepted here).
-    const bearer = bearerFromSessionCookie(cookie);
-    if (bearer) headers["authorization"] = `Bearer ${bearer}`;
-
-    const res = await fetch(
-      `https://api.opensea.io/api/v2/drops/${slug.trim()}/eligibility`,
-      { signal: controller.signal, headers },
-    );
-    if (res.status !== 200) return null;
-    const json = (await res.json()) as any;
-    const stages = json?.stages;
-    if (!Array.isArray(stages)) return null;
-
-    return {
-      stages: stages.map((s: any) => ({
-        stageUuid: s.stage_uuid ?? null,
-        // `null` means the endpoint could not tell (usually no JWT). It is
-        // UNKNOWN, not a negative verdict — Boolean(null) turned every
-        // unauthenticated response into "wallet is not eligible for any stage".
-        isEligible: s.is_eligible == null ? null : Boolean(s.is_eligible),
-        // Documented as a wei decimal string.
-        price: s.price != null ? parsePriceField(s.price) : null,
-        maxTotalMintableByWallet:
-          s.max_total_mintable_by_wallet != null
-            ? Number(s.max_total_mintable_by_wallet)
-            : null,
-      })),
-    };
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 /**
  * Probe whether a wallet can mint a drop RIGHT NOW by attempting to build the
@@ -724,6 +697,22 @@ export interface DropEligibilityResult {
   walletCount: number | null;
   allowlistedWalletCount: number | null;
   otherEligibleByStage: Record<number, number> | null;
+  /**
+   * The queried wallet's RUNNING cap per stage uuid, from
+   * accountStageEligibility.wallets[].stages[].maxTotalMintableByWallet.
+   *
+   * This is the number the docs describe: "the limits of every stage up to and
+   * including this one that the wallet is listed on, added together, clamped to
+   * supply", with the public stage's own limit added only on the public stage's
+   * result. `stages[].maxPerWallet` is the STAGE's own cap and is NOT this —
+   * for a wallet that is not listed they differ by the whole stage limit.
+   *
+   * null  = the account block was not returned (unauthorized / not queried).
+   * Map   = the wallet's own entries. A uuid ABSENT from the map means the
+   *         wallet is not listed on that stage; a present entry with null means
+   *         OpenSea reported no cap for it.
+   */
+  walletRunningCapByUuid: Map<string, number | null> | null;
 }
 
 export async function getDropEligibility(
@@ -763,11 +752,30 @@ export async function getDropEligibility(
   const ase = drop.accountStageEligibility || null;
   const authed = stages.some((s) => s.isEligible !== null);
   let otherEligibleByStage: Record<number, number> | null = null;
+  // The queried wallet's own running cap per stage. Built from the same block as
+  // otherEligibleByStage, but keyed by dropStageUuid and kept per wallet: the
+  // docs define this field as the wallet's running cap, which is what SeaDrop
+  // actually enforces against the lifetime minted count.
+  let walletRunningCapByUuid: Map<string, number | null> | null = null;
   if (ase?.wallets?.length) {
     const byUuid = new Map(stages.filter((s) => s.uuid).map((s) => [s.uuid as string, s.stageIndex]));
     otherEligibleByStage = {};
     for (const wl of ase.wallets) {
-      if (!wl.address || wl.address.toLowerCase() === minterAddress.toLowerCase()) continue;
+      if (!wl.address) continue;
+      if (wl.address.toLowerCase() === minterAddress.toLowerCase()) {
+        if (walletRunningCapByUuid == null) {
+          walletRunningCapByUuid = new Map();
+          for (const st of wl.stages || []) {
+            if (st.dropStageUuid == null) continue;
+            const raw = st.maxTotalMintableByWallet;
+            walletRunningCapByUuid.set(
+              st.dropStageUuid,
+              raw == null || raw === "" ? null : parseInt(raw, 10)
+            );
+          }
+        }
+        continue;
+      }
       for (const st of wl.stages || []) {
         if (!st.isEligible) continue;
         const idx = byUuid.get(st.dropStageUuid);
@@ -785,5 +793,6 @@ export async function getDropEligibility(
     walletCount: ase?.walletCount ?? null,
     allowlistedWalletCount: ase?.allowlistedWalletCount ?? null,
     otherEligibleByStage,
+    walletRunningCapByUuid,
   };
 }

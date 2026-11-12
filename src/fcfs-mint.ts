@@ -40,7 +40,7 @@ import type { DropPhase } from "./fcfs-drops";
 import { normalizeStageType } from "./fcfs-drops";
 import { isPayloadBoundToWallet, SIGNED_SELECTOR, MERKLE_SELECTOR } from "./seadrop-calldata";
 export { isPayloadBoundToWallet } from "./seadrop-calldata";
-import { SEADROP_ADDRESS } from "./seadrop-public";
+import { SEADROP_ADDRESS, OPENSEA_FEE_RECIPIENT } from "./seadrop-public";
 import { ConfirmedTx } from "./rpc-health";
 import { buildOpenseaMint, OpenseaMintTx, parsePriceField, parsePriceToWei } from "./opensea-gql";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
@@ -48,6 +48,7 @@ import { autoGasBounded } from "./auto-gas";
 import { withDeadlineOrThrow } from "./deadline";
 import { assertPriceProtection } from "./price-protection";
 import { reconcileQuantity } from "./mint-cap";
+import { sessionDir, legacySessionFile, legacyHomeSessionFile } from "./session-store";
 import { warmConnections, pingRpcs, rankRpcEndpoints, settleRanking, type RankedEndpoint } from "./connection-warmer";
 
 /** How many of the fastest endpoints to fire at before escalating to the rest. */
@@ -112,26 +113,12 @@ export {
 
 // ── OpenSea session — refreshable OAuth token, stored on disk ───────────────
 
-const SESSION_DIR = (() => {
-  const explicit = process.env.OPENSEA_SESSION_DIR?.trim();
-  if (explicit) return explicit;
-  // Everything the minter stores lives inside the project, never in the user's
-  // home directory. PACKAGE_ROOT is the directory holding package.json (dist/..
-  // once compiled), so the cache follows the install rather than the machine —
-  // and clearing ~/.nft-public-mint cannot invalidate a working setup.
-  const d = path.join(path.resolve(__dirname, ".."), ".minter-session");
-  try { require("fs").mkdirSync(d, { recursive: true, mode: 0o700 }); } catch {}
-  return d;
-})();
-
-const SESSION_FILE = `${SESSION_DIR}/opensea_session.json`;
+const SESSION_DIR = sessionDir();
+const SESSION_FILE = legacySessionFile();
 
 // A session cached by an older build under the user's home directory. Read once,
 // on first load, so an existing login survives the move. Never written to.
-const LEGACY_SESSION_FILE = (() => {
-  const home = process.env.HOME?.trim();
-  return home ? path.join(home, ".nft-public-mint", "opensea_session.json") : "";
-})();
+const LEGACY_SESSION_FILE = legacyHomeSessionFile();
 
 let legacySessionMigrated = false;
 
@@ -561,7 +548,7 @@ export async function buildSignedPayloadFromDrop(
   return {
     seaDropAddress,
     nftContract,
-    feeRecipient: feeRecipient || "0x0000a26b00c1F0DF003000390027140000fAa719",
+    feeRecipient: feeRecipient || OPENSEA_FEE_RECIPIENT,
     mintData,
     mintSignature,
     value,
@@ -1121,7 +1108,7 @@ export interface ExecuteSnipeOpts {
    * re-fetched. Omitted by callers that cannot ask (headless runs); the fire
    * then proceeds at the originally planned quantity.
    */
-  recheckMintable?: (quantity: number) => Promise<number | null>;
+  recheckMintable?: (walletAddress: string, quantity: number) => Promise<number | null>;
 }
 
 export type SnipeStatus = "SUCCESS" | "REVERTED" | "UNKNOWN" | "FAILED";
@@ -1399,48 +1386,74 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   // so a cap that dropped while we were waiting invalidates every payload
   // already fetched — they must be re-fetched at the reduced quantity rather
   // than broadcast to revert.
-  let fireQuantity = quantity;
-  let requeryPayloads = false;
+  // The re-check is PER WALLET. A drop's per-wallet caps are independent, so
+  // one recheck applied to every entry gave wallets with different remaining
+  // allocations the same number — quoting an exhausted wallet a fresh
+  // allowance and clipping one that had not yet minted.
+  const fireQuantities = new Map<number, number>();
   if (opts.recheckMintable && ready.length + pendingAtT0.length > 0) {
-    try {
-      const mintable = await opts.recheckMintable(quantity);
-      if (mintable != null) {
-        const r = reconcileQuantity(quantity, mintable);
-        if (r.exhausted) {
-          console.log(chalk.red("  ✗ This wallet's allocation is used up — refusing to mint."));
-          for (const entry of [...ready, ...pendingAtT0]) {
-            results[entry.walletIndex] = {
-              walletIndex: entry.walletIndex,
-              walletAddress: entry.addr,
-              success: false,
-              error: "Per-wallet allocation was used up before T-0.",
-            };
-          }
-          return results.filter((r): r is SnipeResult => r != null);
-        }
-        if (r.clamped) {
+    const entries = [...ready, ...pendingAtT0];
+    const rechecked = await Promise.all(
+      entries.map(async (entry) => {
+        try {
+          return { entry, mintable: await opts.recheckMintable!(entry.addr, quantity) };
+        } catch (e: any) {
+          // A failed re-check must not stop the fire; the original quantity is
+          // still the best information available, and the on-chain revert is
+          // the backstop.
           console.log(
-            chalk.yellow(
-              `  ⚠ Per-wallet limit changed to ${mintable} — minting ${r.quantity} instead of ${quantity}.`
-            )
+            chalk.gray(`  ⚠ Could not re-check the per-wallet limit for ${entry.addr}: ${e?.message ?? e}`)
           );
-          fireQuantity = r.quantity;
-          requeryPayloads = true;
+          return { entry, mintable: null };
         }
+      })
+    );
+
+    const exhausted = new Set<number>();
+    const clamped = new Set<number>();
+    for (const { entry, mintable } of rechecked) {
+      if (mintable == null) continue;
+      const r = reconcileQuantity(quantity, mintable);
+      if (r.exhausted) {
+        console.log(chalk.red(`  ✗ ${entry.addr} allocation is used up — refusing to mint.`));
+        results[entry.walletIndex] = {
+          walletIndex: entry.walletIndex,
+          walletAddress: entry.addr,
+          success: false,
+          error: "Per-wallet allocation was used up before T-0.",
+        };
+        exhausted.add(entry.walletIndex);
+        continue;
       }
-    } catch (e: any) {
-      // A failed re-check must not stop the fire; the original quantity is still
-      // the best information available, and the on-chain revert is the backstop.
-      console.log(chalk.gray(`  ⚠ Could not re-check the per-wallet limit: ${e?.message ?? e}`));
+      if (r.clamped) {
+        console.log(
+          chalk.yellow(
+            `  ⚠ ${entry.addr} limit changed to ${mintable} — minting ${r.quantity} instead of ${quantity}.`
+          )
+        );
+        fireQuantities.set(entry.walletIndex, r.quantity);
+        clamped.add(entry.walletIndex);
+      }
+    }
+
+    // Exhausted wallets must not be broadcast at all; clamped wallets keep
+    // their slot but lose the payload fetched for the old quantity, so it is
+    // re-fetched at T-0 (below) at the reduced quantity.
+    for (const list of [ready, pendingAtT0]) {
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (exhausted.has(list[i].walletIndex)) list.splice(i, 1);
+      }
+    }
+    for (let i = ready.length - 1; i >= 0; i--) {
+      if (clamped.has(ready[i].walletIndex)) {
+        pendingAtT0.push({ walletIndex: ready[i].walletIndex, addr: ready[i].addr });
+        ready.splice(i, 1);
+      }
     }
   }
 
-  if (requeryPayloads) {
-    // Every payload in hand is for the wrong quantity. Re-fetch them all.
-    for (const entry of ready) {
-      pendingAtT0.push({ walletIndex: entry.walletIndex, addr: entry.addr });
-    }
-    ready.length = 0;
+  if (ready.length === 0 && pendingAtT0.length === 0) {
+    return results.filter((r): r is SnipeResult => r != null);
   }
 
   // Wallets held back for a future phase get their payload fetched HERE, after
@@ -1464,7 +1477,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
           try {
             payload = await fetchSignedPayloadForWallet(
               nftContract,
-              fireQuantity,
+              fireQuantities.get(walletIndex) ?? quantity,
               addr,
               openSeaApiKey,
               {
@@ -1653,12 +1666,18 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   const collected = await Promise.all(
     inflight.map(async ({ b, responsePromise }) => {
       const blastResults = await responsePromise;
-      // Pick the first endpoint that actually accepted this wallet's tx — poll
-      // that endpoint for the receipt so we don't burn time on an endpoint that
-      // never saw the tx. Fall back to rpcUrls[0] if the blast result has no
-      // accepting label (shouldn't happen, but defensive).
+      // Pick the endpoint that actually accepted this wallet's tx — poll THAT
+      // endpoint for the receipt so we don't burn time on one that never saw
+      // the tx. Resolve by INDEX, never by label: labelFromUrl maps every URL
+      // containing "alchemy" to "ALCHEMY" (likewise quicknode/infura/ankr), so a
+      // label lookup returns the first match, which may not be the endpoint
+      // that accepted — and a receipt polled on the wrong endpoint comes back
+      // null, reporting a landed mint as UNKNOWN.
       const accepted = blastResults.find((r) => r.txHash != null);
-      const acceptingEndpoint = accepted && blastEndpoints.find((ep) => ep.label === accepted.label);
+      const acceptingEndpoint =
+        accepted && accepted.index < blastEndpoints.length
+          ? blastEndpoints[accepted.index]
+          : undefined;
       const receiptUrl = acceptingEndpoint ? acceptingEndpoint.url : rpcUrls[0];
 
       let receipt: ConfirmedTx | undefined;

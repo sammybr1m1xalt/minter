@@ -383,7 +383,7 @@ export function computeScore(entry: KeyPoolEntry): number {
 
 export async function probeAndRankPool(
   pool: KeyPoolEntry[],
-  timeoutMs = 5000
+  budget: () => number = () => 5000
 ): Promise<{ pool: KeyPoolEntry[]; best: KeyPoolEntry | null }> {
   if (pool.length === 0) return { pool: [], best: null };
 
@@ -399,22 +399,31 @@ export async function probeAndRankPool(
   // whole pass costs one timeout rather than one per key.
   const probed = await Promise.all(
     pool.map(async (entry) => {
-      let result = await probeKey(entry.api_key, timeoutMs);
+      // Every attempt draws on the SAME remaining budget. Retries used to get a
+      // fresh full timeout each, so a key that hit server_error and then timeout
+      // could spend 3x the caller's whole budget on its own and the caller's
+      // deadline became meaningless.
+      const attempt = async () => {
+        const remaining = budget();
+        if (remaining < 500) return null;
+        return probeKey(entry.api_key, Math.min(remaining, 5000));
+      };
+      let result = (await attempt()) ?? ({ status: "timeout", latencyMs: 0, remaining: -1, resetAt: 0 } as const);
       // A server_error means the API was unreachable or erroring — nothing about
       // the key. Observed live: the same key returned server_error at 1112ms and
       // alive at 860ms seconds later. One retry separates a transient hiccup
       // from a key that genuinely cannot be validated, without paying for it on
       // every probe.
       if (result.status === "server_error") {
-        const retry = await probeKey(entry.api_key, timeoutMs);
-        if (retry.status !== "server_error") result = retry;
+        const retry = await attempt();
+        if (retry && retry.status !== "server_error") result = retry;
       }
       // Same class of fault: a timeout means the request never completed, so it
       // says nothing about the key either. Retrying once keeps a slow minute
       // from retiring a working credential.
       if (result.status === "timeout") {
-        const retry = await probeKey(entry.api_key, timeoutMs);
-        if (retry.status !== "timeout") result = retry;
+        const retry = await attempt();
+        if (retry && retry.status !== "timeout") result = retry;
       }
       // Persist the fresh quota numbers. Without this the entry keeps whatever
       // remaining_calls it had before — a stale value that can exceed the real
@@ -473,9 +482,9 @@ export async function probeAndRankPool(
 
 export async function pickBestKey(
   pool: KeyPoolEntry[],
-  timeoutMs?: number
+  budget?: () => number
 ): Promise<{ api_key: string; source: string; entry: KeyPoolEntry } | null> {
-  const { pool: ranked, best } = await probeAndRankPool(pool, timeoutMs);
+  const { pool: ranked, best } = await probeAndRankPool(pool, budget);
   saveKeyPool(ranked); // persist scores
 
   if (!best) return null;
@@ -741,7 +750,7 @@ export async function getValidApiKey(
   // 1. If pool has keys, probe and pick the best — NON-BLOCKING (≤3s)
   if (pool.length > 0) {
     console.log(chalk.gray(`  OpenSea: probing ${pool.length} key(s) in pool...`));
-    const result = await pickBestKey(pool, probeTimeout());
+    const result = await pickBestKey(pool, probeTimeout);
     if (result) {
       // Increment usage counter for the chosen key
       const updated = result.entry;
@@ -791,7 +800,7 @@ export async function getValidApiKey(
   console.log(chalk.gray("  OpenSea: can't mint new key — re-probing cached keys to check recovery..."));
   const cachedKeys = loadKeyPool();
   if (cachedKeys.length > 0) {
-    const result = await pickBestKey(cachedKeys, probeTimeout());
+    const result = await pickBestKey(cachedKeys, probeTimeout);
     if (result && result.entry.last_probe !== "dead") {
       console.log(chalk.green(`  ✓ Re-using cached key: ${keyLabel(result.entry)} (status: ${result.entry.last_probe})`));
       const updated = result.entry;

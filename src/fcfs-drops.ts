@@ -13,8 +13,8 @@ import { formatEther } from "ethers";
 import { fetchOnChainDrops } from "./seadrop-onchain";
 import {
   parsePriceToWei,
+  parseGqlPriceToWei,
   getDropEligibility,
-  fetchRestEligibility,
   type DropEligibilityResult,
   type DropEligibilityStage,
 } from "./opensea-gql";
@@ -170,7 +170,7 @@ export interface CollectionDropsInventory {
   fetchedAt: number;
   apiKeyUsed: boolean;
   /** Why no drops were found, if applicable. */
-  notFoundReason?: "not_found" | "rate_limited" | "key_required" | "no_phases" | "network_error";
+  notFoundReason?: "not_found" | "rate_limited" | "server_error" | "key_required" | "no_phases" | "network_error";
 }
 
 // ── Eligibility report (per drop, per wallet) ───────────────────────────────
@@ -252,6 +252,9 @@ export async function fetchAllActiveDrops(
   } catch (err: any) {
     if (err && (err.message === "rate_limited" || err.name === "AbortError" || err.name === "TimeoutError")) {
       lastReason = "rate_limited";
+    } else if (err && err.message === "server_error") {
+      // Not "not found" — the API was unreachable. The REST step below still runs.
+      lastReason = "server_error";
     }
   }
 
@@ -340,6 +343,12 @@ export async function fetchAllActiveDrops(
   // printDropsInventory paired each phase with another phase's report.
   sortByStartTime(drops);
 
+  // The deadline belongs to the FETCH, not to the process. Without this the
+  // timer stays live for the rest of the budget after a successful run and
+  // holds the event loop open — the REST branch and Step 3 already clear it,
+  // but the GraphQL-success path returned without doing so.
+  clearTimeout(timer);
+
   return {
     nftContract,
     chainId,
@@ -352,8 +361,8 @@ export async function fetchAllActiveDrops(
 
 // ── GraphQL drops query (PRIMARY) ──────────────────────────────────────────────
 // OpenSea v2 GraphQL: gql.opensea.io/graphql
-// Collection drops are exposed via collectionBySlug → stages connection.
-// We query both stages.list and the active/next stage shortcuts.
+// Stages are exposed on dropBySlug → stages (see GQL_QUERY_TEXTS.CollectionDropsQuery
+// in opensea-gql.ts for the field-by-field verification).
 //
 // NOTE: The GQL API is aggressively rate-limited (429) as of late 2026.
 // We use it as the PRIMARY source (per user requirement: GraphQL first),
@@ -426,6 +435,11 @@ async function fetchGraphqlDrops(
     });
 
     if (res.status === 429) throw new Error("rate_limited");
+    // A 5xx is a server fault, not an empty inventory. Returning [] here made
+    // "OpenSea is down" indistinguishable from "this collection has no drop" —
+    // the same conflation the 429 handling above exists to avoid.
+    if (res.status >= 500) throw new Error("server_error");
+    // Any other non-200 (404 and friends) means there is genuinely no such drop.
     if (!res.ok) return [];
 
     const json = (await res.json()) as any;
@@ -479,9 +493,12 @@ async function fetchGraphqlDrops(
       const mintPrice = parsePriceToWei(
         c.price?.token?.unit ?? c.price ?? c.mintPrice ?? c.mint_price ?? c.mintPriceWei ?? 0
       );
+      // `max_total` is the COLLECTION's capacity, not a per-wallet limit. It
+      // used to be the last fallback here, which quoted a wallet an allowance
+      // as large as the whole drop.
       const maxPerWallet = Number(
         c.max_per_wallet || c.maxPerWallet || c.maxTotalMintableByWallet ||
-        c.max_total_mintable_by_wallet || c.max_total || 0
+        c.max_total_mintable_by_wallet || 0
       );
       const maxTotal = Number(
         c.maxTotalMintable || c.max_total_mintable || c.maxTotal || c.max_total ||
@@ -540,7 +557,7 @@ async function fetchGraphqlDrops(
         eligibleCount,
         totalAllocated,
         eligiblePrice: c.eligiblePrice != null
-        ? parsePriceToWei(c.eligiblePrice?.token?.unit ?? c.eligiblePrice)
+        ? parseGqlPriceToWei(c.eligiblePrice?.token?.unit ?? c.eligiblePrice)
         : null,
         allowlistedAddresses,
         allowlistHash,
@@ -563,7 +580,13 @@ async function fetchGraphqlDrops(
     // but only if this catch does not swallow it first. AbortSignal.timeout
     // rejects with a DOMException named TimeoutError, not a message of
     // "rate_limited", so the old single-condition check never let it through.
-    if (err && (err.message === "rate_limited" || err.name === "TimeoutError" || err.name === "AbortError")) {
+    if (
+      err &&
+      (err.message === "rate_limited" ||
+        err.message === "server_error" ||
+        err.name === "TimeoutError" ||
+        err.name === "AbortError")
+    ) {
       throw err;
     }
     return [];
@@ -659,9 +682,12 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
     const mintPrice = parsePriceToWei(
       c.price?.token?.unit ?? c.price ?? c.mintPrice ?? c.mint_price ?? c.mintPriceWei ?? 0
     );
+    // `max_total` is the COLLECTION's capacity, not a per-wallet limit. It
+    // used to be the last fallback here, which quoted a wallet an allowance
+    // as large as the whole drop.
     const maxPerWallet = Number(
       c.max_per_wallet || c.maxPerWallet || c.maxTotalMintableByWallet ||
-      c.max_total_mintable_by_wallet || c.max_total || 0
+      c.max_total_mintable_by_wallet || 0
     );
     const maxTotal = Number(
       c.maxTotalMintable || c.max_total_mintable || c.maxTotal || c.max_total ||
@@ -720,7 +746,7 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
       eligibleCount,
       totalAllocated,
       eligiblePrice: c.eligiblePrice != null
-        ? parsePriceToWei(c.eligiblePrice?.token?.unit ?? c.eligiblePrice)
+        ? parseGqlPriceToWei(c.eligiblePrice?.token?.unit ?? c.eligiblePrice)
         : null,
       allowlistedAddresses,
       allowlistHash,
@@ -789,15 +815,29 @@ function capRemaining(cap: number | null, minted: number | null): number | null 
  * public stage elsewhere in the same collection — which is exactly the mistake
  * that made every presale phase look eligible.
  */
+/**
+ * OpenSea returns the same stage uuid in two formats — dashed
+ * (f3de2b08-f40c-45ed-9a0a-80b27c02558e) and undashed
+ * (b88e9d0564cd46c3bb8b59c408dfcc7b) — depending on the surface. Comparing the
+ * raw strings makes a good verdict silently disappear, so every uuid join goes
+ * through this.
+ */
+function normalizeUuid(u: string | null | undefined): string | null {
+  if (u == null) return null;
+  const s = String(u).trim().toLowerCase();
+  return s.length > 0 ? s.replace(/-/g, "") : null;
+}
+
 function scopeStages<T>(
   stages: T[],
   matchUuid: string | null,
   getUuid: (s: T) => string | null | undefined,
 ): T[] | null {
-  if (matchUuid) {
+  const wanted = normalizeUuid(matchUuid);
+  if (wanted) {
     const scoped = stages.filter((s) => {
-      const u = getUuid(s);
-      return u != null && String(u).toLowerCase() === matchUuid;
+      const u = normalizeUuid(getUuid(s));
+      return u != null && u === wanted;
     });
     return scoped.length > 0 ? scoped : null;
   }
@@ -833,11 +873,21 @@ function verdictToReport(drop: DropPhase, v: PhaseEligibilityVerdict): Eligibili
     priceWei: v.priceWei,
     cap: v.cap,
     minted: v.minted,
-    walletMintable: mintableFromCap({
-      phaseLimit: drop.maxTotalMintableByWallet > 0 ? drop.maxTotalMintableByWallet : null,
-      runningCap: v.cap,
-      minted: v.minted,
-    }),
+    // A wallet that is not eligible has no allowance, whatever the stage's own
+    // limit says; an unknown verdict is not a licence to quote the phase limit
+    // either. mintableFromCap ignores an unknown runningCap and falls back to
+    // phaseLimit, which is how a non-eligible wallet used to be quoted a
+    // six-figure allowance.
+    walletMintable:
+      v.eligible === true
+        ? mintableFromCap({
+            phaseLimit: drop.maxTotalMintableByWallet > 0 ? drop.maxTotalMintableByWallet : null,
+            runningCap: v.cap,
+            minted: v.minted,
+          })
+        : v.eligible === false
+          ? 0
+          : null,
   };
 }
 
@@ -906,20 +956,48 @@ export async function getPhaseEligibility(args: {
           (s) => !s.eligibleMinterAddress ||
             s.eligibleMinterAddress.toLowerCase() === wallet,
         );
-        const cap = trustworthy.find((s) => s.maxPerWallet != null)?.maxPerWallet ?? null;
+        // The wallet's RUNNING cap comes from the account block, not from the
+        // stage's own limit. `stages[].maxPerWallet` is the stage cap, which for
+        // a wallet that is not listed overstates the allowance by the whole
+        // stage limit — that is how a non-eligible wallet was quoted "you can
+        // mint 100". Fall back to the stage cap only when the account block was
+        // not returned at all.
+        const stageCap = trustworthy.find((s) => s.maxPerWallet != null)?.maxPerWallet ?? null;
+        const wantedCap = normalizeUuid(matchUuid);
+        const normalizedRunning =
+          gql.walletRunningCapByUuid == null
+            ? null
+            : new Map<string, number | null>(
+                [...gql.walletRunningCapByUuid].map(([k, v]) => [normalizeUuid(k) ?? "", v])
+              );
+        let cap: number | null;
+        if (normalizedRunning == null || wantedCap == null) {
+          // No account block, or no stage uuid to key on: fall back to the
+          // stage's own limit rather than inventing a running cap.
+          cap = stageCap;
+        } else if (normalizedRunning.has(wantedCap)) {
+          // The wallet has an entry for this stage; null means OpenSea reported
+          // no cap for it.
+          cap = normalizedRunning.get(wantedCap) ?? null;
+        } else {
+          // An account entry exists, but none for this stage: not listed.
+          cap = null;
+        }
         const quoted = trustworthy.find((s) => s.priceUnit != null);
 
-        let eligible: boolean;
+        let eligible: boolean | null;
         let reason: string;
         if (trustworthy.length === 0) {
-          eligible = false;
-          reason = `OpenSea returned eligibility only for ${[...foreign].join(", ")}, not ${wallet} — ignoring.`;
+          // OpenSea answered, but every scoped stage named a different wallet.
+          // That is not a verdict about this wallet — it is silence.
+          eligible = null;
+          reason = `OpenSea returned eligibility only for ${[...foreign].join(", ") || "other wallets"}, not ${wallet} — no verdict for this wallet.`;
         } else if (trustworthy.some((s) => s.isEligible === true)) {
           eligible = true;
           reason = foreign.size > 0
             ? `OpenSea: eligible for this stage (${foreign.size} stage(s) in the response belonged to other wallets).`
             : "OpenSea: wallet is eligible for this stage.";
-        } else {
+        } else if (trustworthy.every((s) => s.isEligible === false)) {
           eligible = false;
           reason = foreign.size > 0
             ? `Not eligible for this stage (${foreign.size} stage(s) belonged to other wallets).`
@@ -934,6 +1012,12 @@ export async function getPhaseEligibility(args: {
           if (otherEligible > 0) {
             reason += ` ${otherEligible} other wallet(s) hold eligibility across this drop's stages.`;
           }
+        } else {
+          // Some scoped stage came back with isEligible === null: OpenSea could
+          // not tell. Collapsing that to "not eligible" is how a wallet reads as
+          // banned from a phase it is actually on the list for.
+          eligible = null;
+          reason = "OpenSea returned this stage but no per-wallet verdict (isEligible was null).";
         }
 
         return verdictToReport(drop, {
@@ -941,7 +1025,7 @@ export async function getPhaseEligibility(args: {
           eligible,
           reason,
           source: "gql",
-          priceWei: quoted?.priceUnit != null ? parsePriceToWei(quoted.priceUnit) : null,
+          priceWei: quoted?.priceUnit != null ? parseGqlPriceToWei(quoted.priceUnit) : null,
           cap,
           minted: gql.minted,
           capRemaining: capRemaining(cap, gql.minted),
@@ -950,47 +1034,14 @@ export async function getPhaseEligibility(args: {
       }
     }
 
-    // REST fallback when GQL yielded nothing usable (rate-limited, or the
-    // eligibility fields came back UNAUTHORIZED).
-    let rest: Awaited<ReturnType<typeof fetchRestEligibility>> = null;
-    try {
-      rest = await fetchRestEligibility(slug, cookie, apiKey, timeoutMs);
-    } catch {
-      rest = null;
-    }
-    if (rest) {
-      const scoped = scopeStages(rest.stages, matchUuid, (s) => s.stageUuid);
-      if (scoped) {
-        const anyEligible = scoped.some((s) => s.isEligible === true);
-        const anyUnknown = scoped.some((s) => s.isEligible === null);
-        const cap = scoped.find((s) => s.maxTotalMintableByWallet != null)
-          ?.maxTotalMintableByWallet ?? null;
-        let eligible: boolean | null;
-        let reason: string;
-        if (anyEligible) {
-          eligible = true;
-          reason = "REST eligibility: wallet is eligible for this stage.";
-        } else if (anyUnknown) {
-          // Not a negative verdict — the endpoint could not tell.
-          eligible = null;
-          reason = "REST eligibility: unknown (no per-wallet verdict).";
-        } else {
-          eligible = false;
-          reason = "REST eligibility: wallet is not eligible for this stage.";
-        }
-        return verdictToReport(drop, {
-          stageUuid: matchUuid,
-          eligible,
-          reason,
-          source: "rest",
-          priceWei: scoped.find((s) => s.price != null)?.price ?? null,
-          cap,
-          minted: null,
-          capRemaining: capRemaining(cap, null),
-          stages: [],
-        });
-      }
-    }
+    // There is deliberately no REST fallback here. GET
+    // /api/v2/drops/{slug}/eligibility is wallet-scoped and requires a WALLET
+    // JWT with the read:eligibility scope; the credential this code holds is a
+    // PAT (X-API-KEY) plus the SIWE cookie, which the docs restrict to PAT
+    // management. Probed live, the exchange that would mint such a JWT answers
+    // 403 "Token exchange is not available". A fallback built on it would only
+    // burn a request on every phase where GQL is rate-limited, and report a
+    // transport failure as a verdict.
   }
 
   return null;
@@ -1361,6 +1412,16 @@ export function printDropsInventory(
     return;
   }
 
+  // Pair each phase with its report by IDENTITY, not by position. The inventory
+  // and the reports are produced by independent sorts; pairing by index
+  // silently attributes one phase's verdict to another whenever the orders
+  // diverge, and the printed report then contradicts the mint decision.
+  const reportsByDropId = new Map<string, EligibilityReport>();
+  for (const r of eligibility) {
+    const id = normalizeUuid(r.drop?.dropId);
+    if (id != null) reportsByDropId.set(id, r);
+  }
+
   // Group by recommendation
   const targetable = eligibility.filter((e) => e.recommendation === "target");
   const checkManual = eligibility.filter((e) => e.recommendation === "check-manually");
@@ -1368,7 +1429,9 @@ export function printDropsInventory(
 
   for (let i = 0; i < inventory.drops.length; i++) {
     const drop = inventory.drops[i];
-    const report = eligibility[i];
+    const byId = normalizeUuid(drop.dropId);
+    const report =
+      (byId != null ? reportsByDropId.get(byId) : undefined) ?? eligibility[i] ?? null;
 
     // A 0 timestamp means "unknown" (GQL omits times it does not know), never
     // 1970-01-01. A phase with an unknown end is still treated as active; a
@@ -1438,7 +1501,7 @@ export function printDropsInventory(
 
     // What THIS wallet can mint in this phase.
     const mintableLine =
-      report.walletMintable == null
+      report == null || report.walletMintable == null
         ? chalk.gray(`  You can mint: unknown`)
         : report.walletMintable <= 0
           ? chalk.red(`  You can mint: 0 — this wallet's allocation is used up`)
@@ -1446,7 +1509,9 @@ export function printDropsInventory(
 
     // Eligibility line
     let eligLine = "";
-    if (report.ourWalletEligible === true) {
+    if (report == null) {
+      eligLine = chalk.gray(`  ? eligibility not reported by OpenSea`);
+    } else if (report.ourWalletEligible === true) {
       eligLine = chalk.green(`  ✓ wallet eligible`);
     } else if (report.ourWalletEligible === false) {
       eligLine = chalk.red(`  ✗ wallet NOT eligible`);
@@ -1564,78 +1629,86 @@ export async function fetchGasState(
 ): Promise<GasState | null> {
   if (rpcUrls.length === 0) return null;
 
-  // Try the first RPC
-  const url = rpcUrls[0];
+  // Every endpoint gets a turn. Trying only rpcUrls[0] meant one dead URL lost
+  // the whole gas state even when the caller had several working ones, and the
+  // run then fell back to manually configured gas without saying why.
+  const deadline = Date.now() + timeoutMs;
+  for (const url of rpcUrls) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remaining);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "eth_getBlockByNumber",
+          params: ["latest", true],
+          id: 1,
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) continue;
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "eth_getBlockByNumber",
-        params: ["latest", true],
-        id: 1,
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
+      const json = (await res.json()) as any;
+      if (json.error || !json.result) continue;
 
-    if (!res.ok) return null;
-
-    const json = (await res.json()) as any;
-    if (json.error) return null;
-    if (!json.result) return null;
-
-    const result = json.result as Record<string, any>;
-    const baseFeePerGas = BigInt(result.baseFeePerGas || "0");
-    const gasUsed = BigInt(result.gasUsed || "0");
-    const gasLimit = BigInt(result.gasLimit || "0");
-    const latestBlock = BigInt(result.number || "0");
-
-    // Priority fee suggestion: based on recent blocks, suggest a tip
-    // For now: 1-2 gwei for low congestion, 5-10 for moderate, 20+ for high
-    const gasUsedPct = gasLimit > 0n ? Number(gasUsed * 100n / gasLimit) : 0;
-
-    let urgency: "low" | "normal" | "high" | "extreme" = "normal";
-    let priorityGwei = 2;
-
-    if (gasUsedPct > 95) {
-      urgency = "extreme";
-      priorityGwei = 50;
-    } else if (gasUsedPct > 85) {
-      urgency = "high";
-      priorityGwei = 20;
-    } else if (gasUsedPct > 70) {
-      urgency = "normal";
-      priorityGwei = 5;
-    } else {
-      urgency = "low";
-      priorityGwei = 1;
+      const gas = parseGasBlock(json.result as Record<string, any>, chainId);
+      if (gas) return gas;
+    } catch {
+      // This endpoint could not answer — try the next one.
+    } finally {
+      clearTimeout(timer);
     }
-
-    // maxFeePerGas = baseFee × 1.5 + priority (EIP-1559 safe margin)
-    const baseFeeGwei = Number(baseFeePerGas) / 1e9;
-    const suggestedMaxFee = BigInt(Math.ceil(baseFeeGwei * 1.5 * 1e9 + priorityGwei * 1e9));
-    const suggestedPriority = BigInt(priorityGwei * 1e9);
-
-    return {
-      chainId,
-      baseFeePerGas,
-      suggestedMaxFeePerGas: suggestedMaxFee,
-      suggestedMaxPriorityFeePerGas: suggestedPriority,
-      latestBlockNumber: Number(latestBlock),
-      gasUsedPercentage: gasUsedPct,
-      timestamp: Date.now(),
-      urgency,
-    };
-  } catch {
-    clearTimeout(timer);
-    return null;
   }
+  return null;
+}
+
+function parseGasBlock(result: Record<string, any>, chainId: number): GasState | null {
+  const baseFeePerGas = BigInt(result.baseFeePerGas || "0");
+  const gasUsed = BigInt(result.gasUsed || "0");
+  const gasLimit = BigInt(result.gasLimit || "0");
+  const latestBlock = BigInt(result.number || "0");
+
+  // Priority fee suggestion: based on recent blocks, suggest a tip
+  // For now: 1-2 gwei for low congestion, 5-10 for moderate, 20+ for high
+  const gasUsedPct = gasLimit > 0n ? Number(gasUsed * 100n / gasLimit) : 0;
+
+  let urgency: "low" | "normal" | "high" | "extreme" = "normal";
+  let priorityGwei = 2;
+
+  if (gasUsedPct > 95) {
+    urgency = "extreme";
+    priorityGwei = 50;
+  } else if (gasUsedPct > 85) {
+    urgency = "high";
+    priorityGwei = 20;
+  } else if (gasUsedPct > 70) {
+    urgency = "normal";
+    priorityGwei = 5;
+  } else {
+    urgency = "low";
+    priorityGwei = 1;
+  }
+
+  // maxFeePerGas = baseFee × 1.5 + priority (EIP-1559 safe margin)
+  const baseFeeGwei = Number(baseFeePerGas) / 1e9;
+  const suggestedMaxFee = BigInt(Math.ceil(baseFeeGwei * 1.5 * 1e9 + priorityGwei * 1e9));
+  const suggestedPriority = BigInt(priorityGwei * 1e9);
+
+  return {
+    chainId,
+    baseFeePerGas,
+    suggestedMaxFeePerGas: suggestedMaxFee,
+    suggestedMaxPriorityFeePerGas: suggestedPriority,
+    latestBlockNumber: Number(latestBlock),
+    gasUsedPercentage: gasUsedPct,
+    timestamp: Date.now(),
+    urgency,
+  };
 }
 
 // ── Print gas state ──────────────────────────────────────────────────────────

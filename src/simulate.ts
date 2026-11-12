@@ -23,6 +23,7 @@
 // endpoint failure, not for hoping one node evaluates the call differently.
 
 import { JsonRpcProvider } from "ethers";
+import { shortLivedProvider } from "./chains";
 
 export interface SimulateRequest {
   to: string;
@@ -85,6 +86,21 @@ export function parseRevert(err: any): { reason?: string; data?: string } {
 }
 
 /**
+ * True when an error from a node means "we could not tell", not "the call
+ * reverts". Shared by the simulation gate and the gas-estimate path so the two
+ * can never disagree about what counts as a revert — a transport failure must
+ * not be read as a verdict, or a public RPC having a bad moment blocks a good
+ * mint.
+ */
+export function isIndeterminateRpcError(err: any): boolean {
+  const msg = String(err?.reason ?? err?.shortMessage ?? err?.message ?? "").toLowerCase();
+  return (
+    err?.name === "AbortError" ||
+    /timeout|timed out|network error|failed to fetch|socket|econnrefused|enotfound|eai_again/i.test(msg)
+  );
+}
+
+/**
  * Simulate a transaction with eth_call.
  *
  * Returns { ok: true } when the call succeeds, { ok: false, reverted: true }
@@ -130,12 +146,7 @@ export async function simulateTx(
     // Distinguish "the node said no" from "the node did not answer". A timeout
     // or a network error is NOT evidence the transaction reverts — treating it
     // as a revert would block a good mint because a public RPC had a bad moment.
-    const msg = String(err?.reason ?? err?.shortMessage ?? err?.message ?? "").toLowerCase();
-    const indeterminate =
-      err?.name === "AbortError" ||
-      /timeout|timed out|network error|failed to fetch|socket|econnrefused|enotfound|eai_again/i.test(msg);
-
-    if (indeterminate) {
+    if (isIndeterminateRpcError(err)) {
       return {
         ok: false,
         reverted: false,
@@ -179,33 +190,19 @@ export async function simulateWithFallback(
       return { result: r, attempts, agreeOnRevert: false };
     }
   }
-  const agreeOnRevert = attempts.length > 0 && attempts.every((a) => !a.ok);
+  // Only a DEFINITIVE revert from every endpoint counts as agreement. An
+  // all-timeout run is not agreement — it is "no endpoint could tell", and
+  // reporting that as a revert would block a mint on a transient RPC failure.
+  // Prefer a definitive revert for the aggregate too: the last attempt may be
+  // an indeterminate one that arrived after a real revert.
+  const revert = attempts.find((a) => a.reverted === true);
+  const agreeOnRevert =
+    attempts.length > 0 && !!revert && attempts.every((a) => a.reverted === true);
   return {
-    result: attempts[attempts.length - 1] ?? { ok: false, reverted: true, reason: "no provider" },
+    result: revert ?? attempts[attempts.length - 1] ?? { ok: false, reverted: true, reason: "no provider" },
     attempts,
     agreeOnRevert,
   };
-}
-
-// ── Provider lifecycle ──────────────────────────────────────────────────────
-// ethers keeps a polling timer alive on every JsonRpcProvider. A provider that
-// is never destroyed keeps the Node event loop busy, so a script that finishes
-// its work still hangs forever. Every short-lived provider in this codebase must
-// be destroyed when done — hence this helper.
-
-/**
- * Build a short-lived provider for one-off reads (simulation, eth_getCode,
- * price reads). The caller MUST call destroy() when finished.
- */
-export function shortLivedProvider(
-  rpcUrl: string,
-  chainId?: number
-): JsonRpcProvider {
-  return new JsonRpcProvider(rpcUrl, chainId, {
-    staticNetwork: true,
-    // No retries: a dead endpoint should fail immediately, not back off.
-    pollingInterval: 1000,
-  });
 }
 
 /**

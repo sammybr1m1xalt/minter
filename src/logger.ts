@@ -65,7 +65,7 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
     info(msg) { push("INFO", msg); },
     warn(msg) { push("WARN", msg); },
     error(msg) { push("ERROR", msg); },
-    field(key, value) { fields.push([key, value]); },
+    field(key, value) { fields.push([key, maskFieldValue(key, String(value))]); },
     dumpError(err) {
       const msg = err instanceof Error ? err.message : String(err);
       const stack = err instanceof Error ? err.stack || "" : "";
@@ -147,6 +147,21 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
       }
     },
   };
+}
+
+/**
+ * Run fields are written verbatim, so a field whose value is a credential must
+ * be masked here. The error-dump env block already masked its values, but
+ * `field()` did not — and `rpc_env` put a full Alchemy URL, key included, into
+ * every log file on disk.
+ */
+const CREDENTIAL_FIELD = /key|token|secret|private|rpc|auth|password|seed|mnemonic/i;
+
+export function maskFieldValue(key: string, value: string): string {
+  if (!value || !CREDENTIAL_FIELD.test(key)) return value;
+  // Booleans and short flags ("true", "false", "<unset>") carry no secret.
+  if (value.length < 20) return value;
+  return maskRpc(value);
 }
 
 export function maskRpc(value: string): string {

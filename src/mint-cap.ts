@@ -40,7 +40,13 @@ function isLimit(v: number | null | undefined): v is number {
 export function mintableFromCap(cap: MintCap): number | null {
   const bounds: number[] = [];
   if (isLimit(cap.phaseLimit)) bounds.push(cap.phaseLimit);
-  if (isLimit(cap.runningCap)) bounds.push(Math.max(0, cap.runningCap - (cap.minted ?? 0)));
+  if (isLimit(cap.runningCap)) {
+    // An unknown minted count is NOT zero. `cap.minted ?? 0` quoted the wallet
+    // an allowance it may already have spent. With minted unknown the running
+    // cap is still a hard ceiling for this phase — it counts every stage up to
+    // and including this one — so it bounds the answer without being reduced.
+    bounds.push(cap.minted != null ? Math.max(0, cap.runningCap - cap.minted) : cap.runningCap);
+  }
   if (bounds.length === 0) return null;
   return Math.min(...bounds);
 }

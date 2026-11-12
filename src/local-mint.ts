@@ -14,7 +14,7 @@ import { warmConnections, rankRpcEndpoints, settleRanking, type RankedEndpoint }
 import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
 import { LocalMintPlan, buildLocalMintPlan } from "./seadrop-public";
-import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
+import { simulateTx, classifyRevert, isIndeterminateRpcError, type SimulateResult } from "./simulate";
 import { autoGasBounded } from "./auto-gas";
 import { assertPriceProtection } from "./price-protection";
 
@@ -274,42 +274,71 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
     // cap (maxFeePerGas × gasLimit) can exceed what the wallet can cover when the
     // base fee moves, so the tx never mines. Estimate once — the calldata is
     // identical for every wallet, so one estimate covers the batch.
+    //
+    // Skipped entirely while the stage is still closed: the call would revert
+    // for "stage not active", which says nothing about the calldata. Same reason
+    // the simulation gate above is skipped.
     let estimatedGasLimit = gasLimit || 250_000;
     let estimatedMaxFee = maxFeePerGas;
     let estimatedPriority = maxPriorityFee;
-    const gasProvider = new JsonRpcProvider(rpcUrls[0], undefined, {
-      staticNetwork: true,
-      pollingInterval: 1000,
-    });
-    try {
-      const est = await autoGasBounded(
-        gasProvider,
-        { to: plan.to, from: wallets[0].address, data: plan.data, value: plan.value },
-        8_000
-      );
-      if (est) {
-        estimatedGasLimit = Number(est.gasLimit);
-        if (est.maxFeePerGas) estimatedMaxFee = est.maxFeePerGas;
-        if (est.maxPriorityFeePerGas) estimatedPriority = est.maxPriorityFeePerGas;
-        console.log(
-          chalk.gray(
-            `  ✓ Gas estimated: ${estimatedGasLimit} (was the ${gasLimit || 250_000} default)`
-          )
-        );
-      } else {
-        console.log(
-          chalk.yellow(`  ⚠ Gas estimation inconclusive — using the ${estimatedGasLimit} default.`)
-        );
-      }
-    } catch (e: any) {
+
+    if (stageNotYetOpen) {
       console.log(
-        chalk.yellow(`  ⚠ Gas estimation failed (${e?.message ?? e}) — using the ${estimatedGasLimit} default.`)
+        chalk.gray(
+          `  … Stage not open yet — skipping the gas estimate (it would revert for "stage not active"); using the ${estimatedGasLimit} default.`
+        )
       );
-    } finally {
+    } else {
+      const gasProvider = new JsonRpcProvider(rpcUrls[0], undefined, {
+        staticNetwork: true,
+        pollingInterval: 1000,
+      });
       try {
-        gasProvider.destroy();
-      } catch {
-        // Already destroyed.
+        const est = await autoGasBounded(
+          gasProvider,
+          { to: plan.to, from: wallets[0].address, data: plan.data, value: plan.value },
+          8_000
+        );
+        if (est) {
+          estimatedGasLimit = Number(est.gasLimit);
+          if (est.maxFeePerGas) estimatedMaxFee = est.maxFeePerGas;
+          if (est.maxPriorityFeePerGas) estimatedPriority = est.maxPriorityFeePerGas;
+          console.log(
+            chalk.gray(
+              `  ✓ Gas estimated: ${estimatedGasLimit} (was the ${gasLimit || 250_000} default)`
+            )
+          );
+        } else {
+          console.log(
+            chalk.yellow(`  ⚠ Gas estimation inconclusive — using the ${estimatedGasLimit} default.`)
+          );
+        }
+      } catch (e: any) {
+        // autoGasBounded returns null ONLY on timeout and RETHROWS a failed
+        // estimate. A failed estimate is almost always a revert, and
+        // broadcasting a tx the node already said will revert only burns gas.
+        // An indeterminate transport error is not a verdict, so that falls back
+        // to the default — same predicate the simulation gate uses.
+        if (isIndeterminateRpcError(e)) {
+          console.log(
+            chalk.yellow(`  ⚠ Gas estimation inconclusive (${e?.message ?? e}) — using the ${estimatedGasLimit} default.`)
+          );
+        } else {
+          console.log(chalk.red(`  ✗ Gas estimation reverted: ${e?.message ?? e}`));
+          console.log(chalk.red(`  ✗ Refusing to broadcast — the node says this transaction will not succeed.`));
+          return wallets.map((w, i) => ({
+            walletIndex: i,
+            address: w.address,
+            txHash: null,
+            status: "REJECTED" as const,
+          }));
+        }
+      } finally {
+        try {
+          gasProvider.destroy();
+        } catch {
+          // Already destroyed.
+        }
       }
     }
 
@@ -493,7 +522,11 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
           const blastResults = await firing.responsePromise;
           const accepting = blastResults.find((r: any) => r.txHash != null);
           if (accepting) {
-            const ep = blastEndpoints.find((e) => e.label === accepting.label);
+            // Resolve by INDEX — never by label. labelFromUrl maps every URL
+            // containing "alchemy" to "ALCHEMY", so a label lookup returns the
+            // first match, not the endpoint that accepted; polling the receipt
+            // there yields null and reports a landed mint as UNKNOWN.
+            const ep = blastEndpoints[accepting.index];
             if (ep) url = ep.url;
           }
         }

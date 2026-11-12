@@ -35,6 +35,7 @@
 
 import { JsonRpcProvider, Interface } from "ethers";
 import type { DropPhase } from "./fcfs-drops";
+import { OPENSEA_FEE_RECIPIENT } from "./seadrop-public";
 
 const SEADROP = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
 
@@ -112,6 +113,13 @@ const RPC_URLS_BY_CHAIN: Record<string, string[]> = {
   soneium: [
     "https://rpc.soneium.org",
     "https://soneium-rpc.publicnode.com",
+  ],
+  // Arc (chainId 5042) is in CHAINS but was missing here, so rpcUrlsForChain
+  // fell back to the Ethereum list and an Arc collection probed Ethereum's
+  // SeaDrop — returning no phases for a drop that plainly had them.
+  arc: [
+    "https://rpc.mainnet.arc.io",
+    "https://rpc.drpc.mainnet.arc.io",
   ],
 };
 
@@ -192,7 +200,7 @@ async function fetchPublicDrop(
 
   // Resolve fee recipient from chain — SeaDrop rejects zero address and
   // disallowed recipients when restrictFeeRecipients is set.
-  let feeRecipient: string | null = "0x0000a26b00c1F0DF003000390027140000fAa719";
+  let feeRecipient: string | null = OPENSEA_FEE_RECIPIENT;
   if (d.restrictFeeRecipients) {
     let allowed: string[] = [];
     try {
@@ -219,7 +227,9 @@ async function fetchPublicDrop(
     name: "Public Mint",
     type: phaseType,
     startTime,
-    endTime: endTime || Math.floor(nowSec() + 86400 * 365),
+    // 0 = unknown. Fabricating a date (the old `now + 1 year`) made the phase
+    // look open for a year and stopped isPast/isStale from ever firing.
+    endTime,
     mintPrice: d.mintPrice || 0n,
     maxTotalMintableByWallet: Number(d.maxTotalMintableByWallet),
     maxTotalMintable: 0, // public drops don't have a total cap on-chain
@@ -356,13 +366,15 @@ async function fetchTokenGatedPhase(
       name: "Token-Gated Mint",
       type: "token-gated",
       startTime,
-      endTime: endTime || Math.floor(nowSec() + 86400 * 365),
+      // 0 = unknown. Fabricating a date (the old `now + 1 year`) made the phase
+    // look open for a year and stopped isPast/isStale from ever firing.
+    endTime,
       mintPrice: d.mintPrice || 0n,
       maxTotalMintableByWallet: Number(d.maxTotalMintableByWallet),
       maxTotalMintable: Number(d.maxTokenSupplyForStage),
       totalMinted: 0,
       feeBps: Number(d.feeBps),
-      feeRecipient: "0x0000a26b00c1F0DF003000390027140000fAa719",
+      feeRecipient: OPENSEA_FEE_RECIPIENT,
       mintData: null,
       mintSignature: null,
       gasLimit: null,

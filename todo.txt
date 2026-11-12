@@ -1,0 +1,384 @@
+MINTER — TODO
+==============
+Source: full src/ audit 2026-11-11 (22 modules read line-by-line, all 41 swept).
+Baseline: 41 files, 23,757 lines, typecheck + build clean, 0 unresolved imports.
+
+
+TIER 1 — verified, fix first
+---------------------------
+
+[DONE 2026-11-12] T1.1  sell-after-mint.ts:646 — sell path cannot broadcast.
+       `new Wallet(opts.walletKey)` has no provider, then line 765
+       `wallet.sendTransaction(...)` and ensureApproval:582 both throw.
+       Verified against ethers 6.17.0:
+         provider on wallet: null
+         sendTransaction THREW: missing provider (UNSUPPORTED_OPERATION)
+       Fix: connect the wallet to the provider (`new Wallet(key, provider)`),
+       or sign locally and broadcast via `provider.broadcastTransaction`.
+       Blocks: the whole sell-after-mint feature.
+
+[DONE 2026-11-12] T1.2  fcfs-drops.ts:922-926 (+914-916) — unknown eligibility becomes "not eligible".
+       The final `else` catches both isEligible === false AND === null, and
+       `eligible` is typed `boolean`. A scoped stage OpenSea could not answer
+       reads as a confident negative.
+       Fix: make it `boolean | null`; return null (unknown) when the scoped
+       stage's isEligible is null. Same for `trustworthy.length === 0`.
+       Blocks: correct eligibility reporting.
+
+[DONE 2026-11-12] T1.3  fcfs-mint.ts:1661, local-mint.ts:496 — receipt polled on the wrong endpoint.
+       `blastEndpoints.find((ep) => ep.label === accepted.label)` and
+       `labelFromUrl` (rpc-blast.ts:26-47) is non-injective: every URL
+       containing "alchemy" -> "ALCHEMY" (likewise QUICKNODE/INFURA/ANKR).
+       Two Alchemy endpoints => receipt polled on the first match => receipt
+       null => a landed mint reported UNKNOWN.
+       Fix: carry an index on BlastResult and resolve by index, not label.
+       (This was 5bf93ca, reverted at the user's request; still live.)
+
+[DONE 2026-11-12] T1.4  local-mint.ts:304-307 — revert-indicating gas estimate swallowed.
+       autoGasBounded returns null ONLY on timeout and RETHROWS a failed
+       estimate (auto-gas.ts:100-106). fcfs-mint.ts honours that (drops the
+       wallet); local-mint.ts catches it and signs anyway with the 250k
+       default, broadcasting a tx the RPC already said will revert.
+       Fix: treat a thrown estimate as do-not-send, same as the FCFS path.
+
+[DONE 2026-11-12] T1.5  opensea-gql.ts:756 + fcfs-drops.ts:909 — THE PER-WALLET CAP IS READ
+       FROM THE WRONG FIELD. Docs-checked and reproduced.
+       The code takes `maxPerWallet` from
+       `stages[].eligibleMaxTotalMintableByWallet ?? maxTotalMintableByWallet`
+       — that is the STAGE's own cap. The wallet's running cap lives in
+       `accountStageEligibility.wallets[].stages[].maxTotalMintableByWallet`,
+       which the code queries (opensea-gql.ts:46) and then NEVER READS: the
+       block is used only to count other wallets' eligibility (763-778).
+       What the docs say (REST `max_total_mintable_by_wallet`, same name and
+       semantics on the GQL account block):
+         "The wallet's running cap through this stage ... the limits of every
+          stage up to and including this one that the wallet is listed on,
+          added together, clamped to supply. The public stage's own limit is
+          added only on the public stage's result, not on any presale's. ...
+          subtract what the wallet has minted to get what it can still mint."
+       Reproduced live on jpegz with a wallet that is NOT allowlisted:
+         b88e9d05… SIGNED_PRESALE eligible=false  cap=100  walletMintable=100
+         619ce693… SIGNED_PRESALE eligible=false  cap=1    walletMintable=1
+         f3de2b08… SIGNED_PRESALE eligible=false  cap=2    walletMintable=2
+         af6f0359… PUBLIC_SALE    eligible=true   cap=2    walletMintable=2
+       The raw GQL account block for the same wallet says
+       maxTotalMintableByWallet = null, null, null, 2 — i.e. the presales have
+       NO cap for this wallet. The report says it can mint 100/1/2. Wrong.
+       Two parts to fix:
+         (a) read the running cap from the account block, keyed by dropStageUuid
+               and matched to the queried wallet;
+         (b) when eligible === false, walletMintable must be 0 (or null), not
+               the stage's own cap — mintableFromCap ignores an unknown
+               runningCap and falls back to phaseLimit, which is how a
+               non-eligible wallet ends up quoted a six-figure allowance.
+       For an eligible wallet this also UNDERSTATES: the running cap is the sum
+       of the wallet's listed stages up to this one, not this stage's own limit.
+
+
+TIER 2 — real, medium
+---------------------
+
+[DONE 2026-11-12] T2.1  index.ts:171,227 + logger.ts:92-93 — API key written to disk in plaintext.
+       `log.field("rpc_env", <raw RPC_URL>)` and `field()` writes verbatim.
+       Only the error-dump env block (logger.ts:127) calls maskRpc.
+       .env has keys inside RPC_URL_ETHEREUM / _ROBINHOOD / _ARC / _SONEIUM,
+       so any run with CHAIN set writes a live Alchemy key into
+       .minter-logs/*.log.
+       Fix: mask in field(), or stop logging the URL value.
+
+[DONE 2026-11-12] T2.2  seadrop-onchain.ts:103-116 — arc missing from RPC_URLS_BY_CHAIN.
+       Arc is in CHAINS (chains.ts:78) but not in the table, so
+       rpcUrlsForChain("arc") falls back to the Ethereum public RPCs and
+       on-chain discovery for an Arc collection silently returns nothing.
+       Fix: add the arc endpoints (https://rpc.mainnet.arc.io,
+       https://rpc.drpc.mainnet.arc.io).
+
+[DONE 2026-11-12] T2.3  sell-after-mint.ts:437 — per-token net becomes a whole-order total.
+       `return quantity > 0n ? total / quantity : total;` — when the seller's
+       order is not in input_data.orders, quantity stays 0 and the undivided
+       total is returned. orderQuantity() in the same file refuses instead.
+       Fix: return null when quantity is 0, matching orderQuantity().
+
+[DONE 2026-11-12] T2.4  opensea-gql.ts:119-143 (+ sell-after-mint.ts:139) — whole-ETH price reads as 1 wei.
+       parsePriceToWei: `Number.isInteger(value) -> BigInt(value)`. GQL
+       price.token.unit is an ETH float, so a 1 ETH drop arrives as `1` and
+       becomes 1 wei. priceWei in the report is then 1 wei and
+       assertPriceProtection (fcfs-mint.ts:1331-1345) passes trivially.
+       Fix: pass the source surface in and treat GQL units as ETH floats.
+
+[DONE 2026-11-12] T2.5  opensea-key.ts:706-708 — caller's deadline is per-operation, not global.
+       probeTimeout() is derived from the remaining budget once, but
+       probeAndRankPool retries server_error and timeout (up to 4 probes per
+       key, 408-418) and getValidApiKey can run a second full pass (794).
+       A caller asking for 8s can wait far longer.
+
+[DONE 2026-11-12] T2.6  simulate.ts:182 — agreeOnRevert counts indeterminate as revert.
+       `attempts.every((a) => !a.ok)` is true for an all-timeout run, which
+       then reports "every endpoint agrees it reverts".
+
+[DONE 2026-11-12] T2.7  rpc-blast.ts:230,235,236 + rpc-health.ts:58-60,110 — unguarded parseInt.
+       parseInt(receipt.gasUsed, 16) yields NaN when the field is absent,
+       which flows into gas reporting and the confirmation summary.
+
+[DONE 2026-11-12] T2.8  seadrop-onchain.ts:222,359 — unknown end time becomes now + 365 days.
+       `endTime || Math.floor(nowSec() + 86400 * 365)` fabricates a date where
+       the rest of the codebase carefully preserves 0 = unknown, so the phase
+       prints an end a year out and isStale never fires.
+
+[DONE 2026-11-12] T2.9  fcfs-mint.ts:1404-1436 — T-0 cap re-check is per-drop, not per-wallet.
+       One recheckMintable(quantity) result is applied to every entry in
+       [...ready, ...pendingAtT0] (1411-1418), so wallets with different
+       remaining allocations all get the same number.
+
+[DONE 2026-11-12] T2.10 fcfs-drops.ts:222 — outer AbortController timer never cleared on the
+       GQL-success path. The REST branch's finally (300-302) and Step 3 (314)
+       clear it, but a successful GQL run returns at 343 with the timer live,
+       holding the process open for up to timeoutMs (15s).
+
+[DONE 2026-11-12] T2.11 The REST eligibility endpoint is structurally unreachable.
+       GET /api/v2/drops/{slug}/eligibility needs ApiKeyAuth + WalletAuth with
+       scope `read:eligibility`, where WalletAuth is a WALLET JWT. The code
+       sends a Bearer derived from the SIWE access_token, which is not a wallet
+       JWT — so fetchRestEligibility can never succeed. The docs' auth page
+       gives the missing step: create a scoped PAT from the SIWE session, then
+       exchange it for a wallet JWT at /api/v2/auth/tokens/exchange. That flow
+       is not implemented anywhere in src/.
+       Options: (a) implement the PAT -> wallet JWT exchange so the documented
+       endpoint works (it also returns a wei price and a non-nullable verdict);
+       (b) delete fetchRestEligibility and stop pretending it is a fallback.
+       Either is better than the current state, which silently burns a request
+       on every phase where GQL is rate-limited.
+
+
+TIER 3 — smaller
+----------------
+
+[DONE 2026-11-12] T3.1  shortLivedProvider duplicated verbatim: chains.ts:187, simulate.ts:200.
+[DONE 2026-11-12] T3.2  Two incompatible StoredSession types (fcfs-mint.ts:149 disk shape vs
+       opensea-session.ts:18 SIWE shape), never reconciled; the SIWE session is
+       never persisted, so loadStoredSession() only returns a session written
+       by the legacy refreshSessionToken path.
+       NOTE (checked 2026-11-11): this does NOT degrade eligibility. The wizard
+       reduces the jar to `access_token=...` (wizard.ts:1179, 839), dropping
+       connected-account-server-hint. Tested live against GQL: full jar and
+       access_token-only return identical verdicts (authed=true, same per-stage
+       true/false), because the wallet address also goes out as the `address`
+       GraphQL variable. The opensea-session.ts:150-153 comment claiming the
+       hint cookie is required is wrong.
+[DONE 2026-11-12] T3.3  fcfs-drops.ts:800 — scopeStages compares uuids without normalizing
+       dashes; a dashed/undashed mismatch silently drops the GQL verdict.
+[DONE 2026-11-12] T3.4  fcfs-drops.ts:1369-1371 — printDropsInventory pairs
+       inventory.drops[i] with eligibility[i], relying on two independent
+       sorts agreeing. Aligned today, fragile.
+[DONE 2026-11-12] T3.5  fcfs-drops.ts:484,664 — max_total used as a per-wallet fallback,
+       conflating a collection-wide cap with a per-wallet limit.
+[DONE 2026-11-12] T3.6  rpc-health.ts:38,85 — receipt sweep polls only slice(0,3)/slice(0,2).
+[DONE 2026-11-12] T3.7  connection-warmer.ts:64 — settleRanking's timer is never cleared.
+[DONE 2026-11-12] T3.8  fcfs-drops.ts:1568 — fetchGasState tries only rpcUrls[0]; one dead
+       endpoint loses the whole gas state.
+[DONE 2026-11-12] T3.9  fcfs-drops.ts:429 — `if (!res.ok) return []` misclassifies a GQL 5xx
+       as "not found".
+[DONE 2026-11-12] T3.10 fcfs-drops.ts:355, opensea-gql.ts:47 — stale comments (query uses
+       dropBySlug, not collectionBySlug; collectionBySlug does expose
+       slug/name/address/chain).
+[DONE 2026-11-12] T3.11 mint-cap.ts:43, fcfs-drops.ts:779-782 — unknown minted treated as 0,
+       overstating what the wallet can still mint.
+[DONE 2026-11-12] T3.12 seadrop-public.ts:20 — OPENSEA_FEE_RECIPIENT hardcoded (acceptable as
+       a protocol constant, but a second source of truth).
+
+[DONE 2026-11-12] T3.13 GQL hash handling — external-audit recommendation, assessed 2026-11-11.
+       Recommendation: "auto-discover the current hash from the OpenSea
+       frontend in case OpenSea rotates it." VERDICT: do NOT scrape the
+       frontend; the recommendation solves a problem that is already handled,
+       and the real gap is smaller.
+       Facts established by reading the code and computing the hashes:
+         - Only ONE pinned hash is ever used: GQL_HASHES.mintTimeline, for
+           MintActionTimelineQuery (opensea-gql.ts:571). The other four
+           (mintModule, dropEligibility, mintQuery, collectionDrops) are
+           dead — never referenced anywhere.
+         - That pinned hash is exactly sha256 of OUR OWN query text
+           (verified: 1a786dd183540c6143038435ebb7d48c6e2007150210585e45137c8e1d779801
+           matches). It is not a frontend secret.
+         - DropEligibilityQuery uses gqlApqQuery, which always computes the
+           hash locally and POSTs — immune to rotation entirely.
+       So a rotation can only mean OpenSea dropped our registered hash, and
+       gqlPersistedQuery's APQ fallback re-registers and executes in the SAME
+       call. Correctness is never at risk; the cost is one extra round trip
+       on the first affected call.
+       Scraping the frontend would add a fragile dependency (bundle URL
+       discovery, JS parsing, its own rate limits and Cloudflare bot-blocks)
+       to save one round trip on a rare event, and a scraped query text that
+       differs in variables or fields would break the parser silently.
+       REAL FIX (small): the recovered hash is discarded. After a successful
+       APQ registration every later call in the run still tries the dead
+       pinned hash first and pays the APQ penalty again. Remember the working
+       hash in-module (optionally persist it to .minter-cache/) or skip the
+       hash-only GET once an APQ registration has happened in this process.
+       Also: delete the four dead hashes.
+
+
+VERIFIED CORRECT (no action)
+----------------------------
+seadrop-calldata.ts      ethers decoder + documented word offsets; fails open deliberately
+auto-gas.ts             timeout / indeterminate / revert contract is sound
+simulate.ts, deadline.ts tri-state and bound handling
+opensea-session.ts      SIWE message field order, hint cookie, JWT exp, transport retry
+rpc-resolver.ts         planRpcs matching / send-only / broken split; query-capable at [0]
+contract-verify.ts       hand-built selectors standard, address padded to 32 bytes
+sell-after-mint.ts:982   /api/v2/offers/fulfillment_data is correct (live HTTP 200)
+price-protection.ts     parse + assert logic
+mint-cap.ts             clamp / exhaust / unknown semantics
+seadrop-public.ts       calldata, value, fee-recipient resolution
+local-mint.ts           multi-endpoint nonce resolution
+
+
+DOCS-CHECKED 2026-11-12 (docs.opensea.io, eligibility + auth pages)
+-----------------------------------------------------------------
+Authoritative contract for GET /api/v2/drops/{slug}/eligibility:
+  - Auth: ApiKeyAuth + WalletAuth with scope `read:eligibility`.
+    WalletAuth = `Authorization: Bearer <wallet JWT>` — NOT the SIWE cookie.
+  - 200 -> { stages: [ { is_eligible (REQUIRED, boolean),
+                         stage_uuid (REQUIRED, uuid),
+                         max_total_mintable_by_wallet (string|null),
+                         max_total_mintable_by_wallet_per_token (string|null),
+                         price (string|null, WEI decimal) } ] }
+  - So the REST surface gives a DEFINITIVE per-stage verdict and a wei price.
+
+What that means for this codebase:
+  1. The REST fallback is structurally unreachable. fetchRestEligibility sends
+     a Bearer derived from the SIWE access_token (bearerFromSessionCookie);
+     the docs are explicit that wallet-scoped REST needs a wallet JWT, and the
+     SIWE session is only for managing PATs. The auth page gives the missing
+     link: a scoped PAT can be exchanged for a wallet JWT at
+     /api/v2/auth/tokens/exchange. Not implemented anywhere in src/.
+     -> GQL stays the only working wallet-scoped surface. Recorded as T2.11.
+  2. Price units are settled, not ambiguous: REST `price` = wei, GQL
+     `eligiblePrice.token.unit` = ETH float. parsePriceToWei's
+     `Number.isInteger(value) -> BigInt(value)` is therefore wrong for the GQL
+     surface (T2.4). The GQL path must always treat `unit` as ETH.
+  3. `is_eligible` is required on the REST surface, so a REST verdict is never
+     null. The GQL `stages[].isEligible` IS nullable, which is why the local
+     tri-state handling exists.
+  4. The running-cap semantics are as quoted under T1.5.
+
+Corrections to earlier items after re-checking against the docs:
+  - T3.3 (uuid dash normalization) is LATENT, not live. Measured: the GQL
+    inventory (CollectionDrops) and the GQL eligibility query return byte-identical
+    uuids for all four jpegz stages, in OpenSea's own mixed formats
+    (b88e9d0564cd46c3bb8b59c408dfcc7b undashed,
+     f3de2b08-f40c-45ed-9a0a-80b27c02558e dashed). Both surfaces agree, so the
+    raw-string join works today. Normalizing anyway is cheap insurance.
+  - T2.4 is confirmed and narrowed: only the GQL surface is affected.
+
+SESSION + ELIGIBILITY — what was actually checked 2026-11-11
+------------------------------------------------------------
+SIWE session creation: CLEAN. opensea-session.ts verified line-by-line
+(message field order, hint cookie, JWT exp, refresh rotation, transport
+retry). Nothing in src/ breaks session creation; a failure there would be
+environmental (Cloudflare bot-block on the IP), which the code already
+classifies as server_error and retries.
+
+Eligibility report — DOES affect it:
+  T1.2  unknown verdict becomes a confident "not eligible"
+  T3.3  uuid dash mismatch discards a good GQL verdict
+  T2.4  whole-ETH price reads as 1 wei (priceWei on the report)
+  T3.5  max_total used as a per-wallet cap
+  T3.11 unknown minted treated as 0 (overstates "You can mint")
+  T2.8  unknown end time becomes now + 1 year (isPast never fires)
+  T2.2  Arc: inventory finds no phases at all
+
+Eligibility report — does NOT affect it (checked, ruled out):
+  T1.1  provider-less wallet          -> sell path only
+  T1.3  label-collision receipt poll  -> mint receipt only
+  T1.4  swallowed gas estimate        -> public mint path only
+  T2.1  plaintext key in the log      -> logging only
+  T2.5  key-probe budget              -> planning-time only
+  T2.10 AbortController timer leak    -> process exit only
+  T3.2  two StoredSession shapes      -> eligibility uses the live cookie
+  GQL hash rotation                   -> DropEligibilityQuery uses APQ with a
+                                       computed hash, so it cannot go stale
+                                       (only buildOpenseaMint pins a hash,
+                                       and that has an APQ fallback)
+
+
+NOTES
+-----
+- Not read line-by-line (swept only): prompt.ts, deadline.ts, timer.ts,
+  schedule.ts, time-format.ts, nft-link.ts, target-resolver.ts,
+  slug-resolver.ts, universal-mint.ts, abi-mint.ts, scatter.ts,
+  allowlist-onchain.ts, site-scanner.ts, wizard.ts, wizard-fcfs-new.ts.
+- Repo HEAD 3fcb3c1. Only .env.example modified locally (user's CHAIN= edit).
+
+
+COMPLETED 2026-11-12 — all 29 items
+-----------------------------------
+Tier 1 (5) and Tier 2 (11) and Tier 3 (13) are implemented; typecheck + build
+clean, CLI runs, live eligibility verified.
+
+What changed, by area:
+
+Fire path
+  T1.1 sell wallet now carries its provider (the sell path could never broadcast)
+  T1.3 BlastResult.index; both fire paths resolve the accepting endpoint by
+      position, not by the non-injective label
+  T2.5 probe retries draw on one shared remaining budget (verified: a 2s budget
+      finished in 2007ms)
+  T2.6 agreeOnRevert needs a definitive revert from every endpoint
+  T2.9 the T-0 cap re-check is per wallet: one recheck per entry, per-wallet
+      fire quantity, exhausted wallets dropped, clamped ones re-fetched
+  T3.6 the confirmation sweep polls every endpoint, not slice(0,3)/slice(0,2)
+  T3.7 settleRanking clears its timer (both fire paths call it with budget 0)
+
+Eligibility report
+  T1.2 unknown stays null; a mix of false/null is null, not false
+  T1.5 the running cap is read from accountStageEligibility, keyed by uuid;
+      verified live on jpegz (a non-listed wallet was quoted 100/1/2, now 0)
+  T2.4 GQL prices are ETH floats; parseGqlPriceToWei at all three GQL sites
+  T2.8 an unknown end time stays 0; the fabricated "now + 1 year" is gone
+  T3.3 every uuid join normalizes dashes (scopeStages + the running-cap key)
+  T3.4 printDropsInventory pairs phases with reports by drop id, not by index
+  T3.5 max_total is no longer a per-wallet fallback
+  T3.11 an unknown minted count is no longer treated as 0 (the running cap is
+      applied as the ceiling it is, not reduced by a guessed 0)
+  T3.12 OPENSEA_FEE_RECIPIENT exported once from seadrop-public.ts; the three
+      copies now import it
+  T3.2 DONE, both halves. The SIWE type is SiweSession, distinct from fcfs-mint's
+      StoredSession. Persistence is implemented: src/session-store.ts is now the
+      single home for the session paths (fcfs-mint's SESSION_DIR/SESSION_FILE/
+      LEGACY_SESSION_FILE are thin wrappers over it), and opensea-session.ts
+      writes .minter-session/opensea_sessions.json (mode 0600, per-wallet) on
+      every login and refresh, reading it once lazily on the first request of a
+      process. Verified: a fresh process served a cached jar in 1ms with no
+      network call, and a real login wrote its full cookie jar back to disk
+      (including connected-account-server-hint).
+
+Correctness / robustness
+  T1.4 a revert-indicating estimate is do-not-send; a closed-stage estimate is
+      skipped outright rather than swallowed
+  T2.3 netFromOrders refuses rather than returning a whole-order total
+  T2.7 parseHexQuantity replaces unguarded parseInt in rpc-blast + rpc-health
+  T3.1 shortLivedProvider defined once (chains.ts), simulate.ts imports it
+  T3.8 fetchGasState tries every endpoint (verified: a dead rpcUrls[0] now
+      falls through to a live one)
+  T3.9 a GQL 5xx throws server_error instead of reading as "not found"
+  T3.10 the two stale collectionBySlug comments corrected
+  T3.13 the recovered APQ hash is remembered in-process; the four dead pinned
+      hashes deleted
+
+Removed
+  T2.11 fetchRestEligibility is deleted, along with its call site. The endpoint
+       needs a WALLET JWT with read:eligibility; the credential here is a PAT
+       plus the SIWE cookie. Probed live: POST /api/v2/auth/tokens/exchange with
+       {subjectToken} answers 403 "Token exchange is not available". Keeping it
+       burned a request on every phase where GQL was rate-limited and reported a
+       transport failure as a verdict.
+
+Logging
+  T2.1 field() masks credential-bearing keys; rpc_env no longer writes a live
+      Alchemy key. Verified: a real run's log is clean.
+  T2.10 the inventory AbortController timer is cleared on the GQL-success path
+  T2.2 arc added to RPC_URLS_BY_CHAIN
+
+Not done (deliberate)
+  - Persisting the recovered APQ hash to .minter-cache/ (in-process is enough;
+    a persisted hash outlives the query text it was computed from).

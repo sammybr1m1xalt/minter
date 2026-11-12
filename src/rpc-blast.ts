@@ -11,6 +11,16 @@ export interface RpcEndpoint {
 }
 
 export interface BlastResult {
+  /**
+   * Position in the endpoint array the blast was fired at. This is the ONLY
+   * reliable way to find the endpoint that accepted a transaction: `label` is
+   * derived from the URL host (`labelFromUrl`) and is not injective — every
+   * URL containing "alchemy" becomes "ALCHEMY", so with two Alchemy endpoints
+   * a label lookup returns the FIRST one, which may not be the one that
+   * accepted. Polling the receipt on the wrong endpoint yields a null receipt
+   * and reports a landed mint as UNKNOWN.
+   */
+  index: number;
   label: string;
   txHash: string | null;
   error: string | null;
@@ -122,16 +132,16 @@ export function blastToAll(
         .then(({ json, latencyMs }) => {
           if (json.result) {
             console.log(chalk.green(`  [${ep.label}] ACCEPTED ${latencyMs}ms — tx ${json.result}`));
-            results[index] = { label: ep.label, txHash: json.result, error: null };
+            results[index] = { index, label: ep.label, txHash: json.result, error: null };
           } else if (json.error) {
             const errMsg = json.error.message || JSON.stringify(json.error);
             console.log(chalk.red(`  [${ep.label}] REJECTED ${latencyMs}ms — ${errMsg}`));
-            results[index] = { label: ep.label, txHash: null, error: errMsg };
+            results[index] = { index, label: ep.label, txHash: null, error: errMsg };
           } else {
             // Neither result nor error.
             const msg = "empty JSON-RPC response (no result, no error)";
             console.log(chalk.yellow(`  [${ep.label}] UNKNOWN ${latencyMs}ms — ${msg}`));
-            results[index] = { label: ep.label, txHash: null, error: msg };
+            results[index] = { index, label: ep.label, txHash: null, error: msg };
           }
         })
         .catch((err) => {
@@ -139,7 +149,7 @@ export function blastToAll(
           // dead endpoint must not turn into a crashed mint.
           const msg = err?.message || String(err);
           console.log(chalk.yellow(`  [${ep.label}] FAILED ${Date.now() - t0}ms — ${msg}`));
-          results[index] = { label: ep.label, txHash: null, error: msg };
+          results[index] = { index, label: ep.label, txHash: null, error: msg };
         });
     });
     return Promise.all(promises).then(() => undefined);
@@ -156,6 +166,7 @@ export function blastToAll(
     for (let i = 0; i < results.length; i++) {
       if (results[i] == null) {
         results[i] = {
+          index: i,
           label: endpoints[i].label,
           txHash: null,
           error: "not fired — an earlier endpoint accepted the transaction",
@@ -198,12 +209,24 @@ export function blastToAll(
   return { txHash, responsePromise };
 }
 
+/**
+ * Parse a hex quantity from a receipt. A missing or malformed field must not
+ * become NaN: it flows into gas reporting and the confirmation summary, where
+ * NaN renders as "NaN" and silently poisons any arithmetic done with it.
+ * null means "the node did not supply it", which is honest.
+ */
+export function parseHexQuantity(value: unknown): number | null {
+  if (value == null || value === "") return null;
+  const n = parseInt(String(value), 16);
+  return Number.isFinite(n) ? n : null;
+}
+
 // Poll for a receipt with timeout. Used by both paths.
 export async function waitForReceipt(
   txHash: string,
   rpcUrl: string,
   timeoutMs: number = 60000
-): Promise<{ block: number; position: number; gasUsed: number; status: string; actualGasPrice?: bigint } | null> {
+): Promise<{ block: number | null; position: number | null; gasUsed: number | null; status: string; actualGasPrice?: bigint } | null> {
   const start = Date.now();
   let lastError: string | undefined;
 
@@ -227,13 +250,13 @@ export async function waitForReceipt(
       const json = (await res.json()) as any;
       const receipt = json.result;
       if (receipt) {
-        const gasUsed = parseInt(receipt.gasUsed, 16);
+        const gasUsed = parseHexQuantity(receipt.gasUsed);
         const effectiveGasPrice = receipt.effectiveGasPrice
           ? BigInt(receipt.effectiveGasPrice)
           : undefined;
         return {
-          block: parseInt(receipt.blockNumber, 16),
-          position: parseInt(receipt.transactionIndex, 16),
+          block: parseHexQuantity(receipt.blockNumber),
+          position: parseHexQuantity(receipt.transactionIndex),
           gasUsed,
           // A missing status is a pre-Byzantium receipt: the tx was included,
           // so it succeeded. Only an explicit 0x0 is a revert.

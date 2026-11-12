@@ -321,7 +321,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 
 ## Architecture
 
-40 TypeScript modules, ~24k lines. The important ones:
+41 TypeScript modules, ~24k lines. The important ones:
 
 | Module | Role |
 |---|---|
@@ -343,6 +343,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/seaport-abi.ts`](src/seaport-abi.ts) | Verified Seaport 1.5 / 1.6 ABIs (from Sourcify) |
 | [`src/opensea-key.ts`](src/opensea-key.ts) | API key pool — auto-mint, probe, rank, 7-day refresh |
 | [`src/opensea-session.ts`](src/opensea-session.ts) | SIWE session cookies per wallet |
+| [`src/session-store.ts`](src/session-store.ts) | Single source of truth for the on-disk session paths |
 | [`src/opensea-gql.ts`](src/opensea-gql.ts) | GraphQL queries and response parsing |
 | [`src/connection-warmer.ts`](src/connection-warmer.ts) | Parallel RPC latency ranking — orders endpoints fastest-first for the blast |
 | [`src/rpc-resolver.ts`](src/rpc-resolver.ts) | Endpoint discovery, chain-ID verification, blast-set planning |

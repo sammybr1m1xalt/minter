@@ -190,6 +190,7 @@ export function shortLivedProvider(
 ): JsonRpcProvider {
   return new JsonRpcProvider(rpcUrl, chainId, {
     staticNetwork: true,
+    // No retries: a dead endpoint should fail immediately, not back off.
     pollingInterval: 1000,
   });
 }

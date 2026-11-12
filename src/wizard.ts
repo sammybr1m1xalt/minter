@@ -830,11 +830,11 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         // quantity — when this comes back lower, the fire path re-fetches every
         // payload at the reduced quantity instead of broadcasting one that
         // would revert.
-        recheckMintable: async () => {
+        recheckMintable: async (walletAddress: string) => {
           const session = sessionResults[walletIndex]?.session ?? null;
           const report = await getPhaseEligibility({
             drop: selectedDrop,
-            wallet: wallet.address.toLowerCase(),
+            wallet: walletAddress.toLowerCase(),
             slug: slug || undefined,
             cookie: session ? sessionToStoredSessionCookie(session) : null,
             apiKey,
