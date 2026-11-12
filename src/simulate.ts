@@ -23,7 +23,6 @@
 // endpoint failure, not for hoping one node evaluates the call differently.
 
 import { JsonRpcProvider } from "ethers";
-import { shortLivedProvider } from "./chains";
 
 export interface SimulateRequest {
   to: string;
@@ -163,69 +162,6 @@ export async function simulateTx(
     };
   } finally {
     if (timer) clearTimeout(timer);
-  }
-}
-
-/**
- * Simulate against several providers and return the first definitive answer.
- *
- * Why several: a public RPC can be behind or mis-synced, and a single node's
- * "revert" is not always the chain's verdict. We treat a SUCCESS from any
- * endpoint as authoritative (the tx will land), and only refuse when EVERY
- * endpoint agrees it reverts.
- *
- * Returns the aggregate plus the individual results so callers can log which
- * endpoint said what.
- */
-export async function simulateWithFallback(
-  providers: JsonRpcProvider[],
-  req: SimulateRequest
-): Promise<{ result: SimulateResult; attempts: SimulateResult[]; agreeOnRevert: boolean }> {
-  const attempts: SimulateResult[] = [];
-  for (const p of providers) {
-    // Stop early on the first success — a successful simulation is definitive.
-    const r = await simulateTx(p, req);
-    attempts.push(r);
-    if (r.ok) {
-      return { result: r, attempts, agreeOnRevert: false };
-    }
-  }
-  // Only a DEFINITIVE revert from every endpoint counts as agreement. An
-  // all-timeout run is not agreement — it is "no endpoint could tell", and
-  // reporting that as a revert would block a mint on a transient RPC failure.
-  // Prefer a definitive revert for the aggregate too: the last attempt may be
-  // an indeterminate one that arrived after a real revert.
-  const revert = attempts.find((a) => a.reverted === true);
-  const agreeOnRevert =
-    attempts.length > 0 && !!revert && attempts.every((a) => a.reverted === true);
-  return {
-    result: revert ?? attempts[attempts.length - 1] ?? { ok: false, reverted: true, reason: "no provider" },
-    attempts,
-    agreeOnRevert,
-  };
-}
-
-/**
- * Run a read against a throwaway provider and always destroy it.
- * Returns null when the read fails — callers treat that as "unknown".
- */
-export async function withShortLivedProvider<T>(
-  rpcUrl: string,
-  fn: (provider: JsonRpcProvider) => Promise<T>,
-  chainId?: number
-): Promise<T | null> {
-  const provider = shortLivedProvider(rpcUrl, chainId);
-  try {
-    return await fn(provider);
-  } catch {
-    return null;
-  } finally {
-    // Destroy synchronously — this is what lets the process exit.
-    try {
-      provider.destroy();
-    } catch {
-      // Already destroyed.
-    }
   }
 }
 

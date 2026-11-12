@@ -17,7 +17,6 @@
 // (it is the primary platform) and fall back to Scatter, because a wrong guess
 // here means resolving to a contract on the wrong platform entirely.
 
-import { parseNftLink } from "./nft-link";
 import { resolveSlug, isSlug } from "./slug-resolver";
 import { getScatterCollection, ScatterCollection } from "./scatter";
 import { CHAINS, chainKeyFromId } from "./chains";
@@ -268,10 +267,16 @@ async function resolveTargetUnchecked(
   switch (target.platform) {
     case "opensea": {
       if (target.contract) {
+        // No third default. An assets URL always carries its chain, so reaching
+        // this without one means the input was malformed — and returning
+        // "ethereum" would put the mint on an arbitrary network. The `direct`
+        // branch below already refuses in this case.
+        const chainKey = target.chain || preferredChain;
+        if (!chainKey) return null;
         return {
           platform: "opensea",
           contract: target.contract,
-          chainKey: target.chain || preferredChain || "ethereum",
+          chainKey,
           amount: target.amount,
           tokenId: target.tokenId,
           resolvedViaFallback: false,
@@ -282,10 +287,12 @@ async function resolveTargetUnchecked(
       // OpenSea first.
       try {
         const info = await resolveSlug(target.slug, apiKey, target.chain || preferredChain);
+        const chainKey = target.chain || preferredChain || info.chain;
+        if (!chainKey) return null;
         return {
           platform: "opensea",
           contract: info.contractAddress,
-          chainKey: target.chain || preferredChain || info.chain || "ethereum",
+          chainKey,
           slug: target.slug,
           amount: target.amount,
           resolvedViaFallback: false,
@@ -344,10 +351,14 @@ async function resolveTargetUnchecked(
 
     case "zora": {
       if (!target.contract) return null;
+      // Same rule as `direct`: a Zora collect URL always names its chain, so
+      // reaching this without one is malformed input, not a reason to guess.
+      const chainKey = target.chain || preferredChain;
+      if (!chainKey) return null;
       return {
         platform: "zora",
         contract: target.contract,
-        chainKey: target.chain || preferredChain || "ethereum",
+        chainKey,
         amount: target.amount,
         tokenId: target.tokenId,
         resolvedViaFallback: false,
@@ -397,6 +408,11 @@ export async function parseAndResolve(
       throw new Error(
         `Manifold claim "${parsed.claimId}" cannot be resolved automatically — ` +
           `Manifold claims need the claim contract address. Paste the 0x… contract instead.`
+      );
+    }
+    if (!parsed.chain && (parsed.platform === "direct" || parsed.platform === "zora")) {
+      throw new Error(
+        `"${input}" does not name a chain. Pass one with --chain (supported: ${supportedChainKeys().join(", ")}).`
       );
     }
     throw new Error(

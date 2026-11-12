@@ -28,7 +28,8 @@ const repoRoot = __dirname.endsWith("dist") ? path.dirname(__dirname) : __dirnam
 try {
   require("dns").setDefaultResultOrder("ipv4first");
 } catch {
-  // Older Node without the API — the retry in opensea-session.ts still covers it.
+  // Older Node without the API: there is no fallback, so a host whose IPv6
+  // route is blackholed stays unreachable.
 }
 
 // Repo .env first; a .env in the CWD overrides it so a user can point at a
@@ -42,19 +43,7 @@ import { closePrompts } from "./prompt";
 import { parseWhen, isValidWhen } from "./schedule";
 import { parsePriceSpec, extractMaxPriceSpec } from "./price-protection";
 import { parseTarget, resolveTarget } from "./target-resolver";
-import { CHAINS, destroyProviderCache } from "./chains";
-
-// ── Provider cleanup ────────────────────────────────────────────────────────
-// ethers keeps a polling timer alive on every JsonRpcProvider. A provider that
-// is not destroyed keeps the Node event loop busy, so a run that finished its
-// work still never exits — the process hangs after printing its final line.
-//
-// Individual call sites destroy their own short-lived providers, but a single
-// missed `finally` on an early return is enough to hang the process. This hook
-// is the backstop: it runs on every normal exit path, including process.exit().
-process.on("exit", () => {
-  destroyProviderCache();
-});
+import { CHAINS } from "./chains";
 
 // Derived from the chain table so the help text can never advertise a chain the
 // tool cannot serve (it previously listed polygon/arbitrum/optimism).
@@ -93,6 +82,11 @@ function parseFlags(argv: string[]): CliFlags {
    *  reporting the missing argument. */
   const value = (flag: string, raw: string | undefined): string => {
     if (raw === undefined || raw === "") throw new Error(`${flag} requires a value.`);
+    // A value that is itself a flag means the argument was missing. Consuming
+    // the next flag as a value silently set e.g. chain to "--quantity".
+    if (raw.startsWith("-") && raw.length > 1) {
+      throw new Error(`${flag} requires a value (got "${raw}").`);
+    }
     return raw;
   };
 
@@ -114,6 +108,11 @@ function parseFlags(argv: string[]): CliFlags {
         throw new Error(`${a} must be a positive integer, got "${raw}".`);
       }
       out.quantity = n;
+    } else if (a.startsWith("-") && a.length > 1) {
+      // An unrecognised flag used to fall into `rest` and become the mint
+      // target, so a typo like `--typo` ran a snipe against a target named
+      // "--typo". Refuse it instead.
+      throw new Error(`Unknown option "${a}". Run with --help for the accepted flags.`);
     } else out.rest.push(a);
   }
   return out;

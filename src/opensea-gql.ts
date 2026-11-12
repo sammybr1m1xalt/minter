@@ -7,8 +7,10 @@
 //   gqlPersistedQuery — pinned hash (fast GET, fallback APQ on hash rotation)
 //   gqlApqQuery       — compute sha256 locally, register + execute in one POST
 //
-// Override pinned hashes via env (OS_HASH_MINT_MODULE, OS_HASH_MINT_TIMELINE,
-// OS_HASH_DROP_ELIGIBILITY, OS_HASH_MINT_QUERY, OS_HASH_COLLECTION_DROPS).
+// Both send the wallet bearer derived from the session cookie. The deleted
+// postMintTx sent only the cookie, so it would have been unauthenticated.
+//
+// Override the pinned hash via env (OS_HASH_MINT_TIMELINE).
 
 import { osChain } from "./chains";
 import {
@@ -112,12 +114,6 @@ export const SELECTOR_STAGE: Record<string, string> = {
 // empty and the primary path never worked for any fractional-ETH drop.
 
 /** True when a value is already a whole-wei quantity (integer or int string). */
-export function isWholeWei(value: unknown): boolean {
-  if (typeof value === "number") return Number.isInteger(value);
-  if (typeof value === "string") return /^-?\d+$/.test(value.trim());
-  return false;
-}
-
 /**
  * Convert a GQL `token.unit` price to wei.
  *
@@ -370,180 +366,6 @@ export async function gqlApqQuery(
   }
 }
 
-// ── POST /drops/{slug}/mint + payload-bound-to-wallet check ───────────────────
-//
-// These were extracted from fcfs-mint.ts into this module to break a circular
-// dependency: fcfs-drops.ts needs postMintTx + isPayloadBoundToWallet for
-// eligibility checks, while fcfs-mint.ts re-exports DropPhase types from
-// fcfs-drops.ts. By hosting both here (which has no upward deps), both sides
-// can import from opensea-gql.ts without a cycle.
-
-export interface PostMintTxResult {
-  eligible: boolean;
-  reason?: string;
-  mintData?: string | null;
-  mintSignature?: string | null;
-  seaDropAddress?: string | null;
-  feeRecipient?: string | null;
-  value?: bigint | null;
-  status?: number;      // HTTP status code for diagnostics
-  code?: string | null; // stable machine-readable error code — branch on this
-  stageUuid?: string | null;
-  stageType?: string | null;
-  stageStart?: number | null; // UNIX seconds
-  stageEnd?: number | null;   // UNIX seconds
-}
-
-export async function postMintTx(
-  slug: string,
-  walletAddress: string,
-  quantity: number,
-  apiKey?: string | null,
-  timeoutMs = 15000,
-  chainKey?: string,
-  sessionCookie?: string | null,
-): Promise<PostMintTxResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const headers: Record<string, string> = {
-      accept: "application/json",
-      "content-type": "application/json",
-    };
-    if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
-    if (sessionCookie) headers["cookie"] = sessionCookie;
-
-    // skip_balance_check: we fund wallets before firing, and an underfunded
-    // wallet should still get a buildable payload (the tx then fails on
-    // submission, which the receipt poll reports) rather than a 422 here.
-    // Documented in DropMintRequest.
-    const body = JSON.stringify({
-      minter: walletAddress,
-      quantity: quantity,
-      skip_balance_check: true,
-    });
-
-    const res = await fetch(
-      `https://api.opensea.io/api/v2/drops/${slug}/mint`,
-      {
-        method: "POST",
-        signal: controller.signal,
-        headers,
-        body,
-      },
-    );
-    clearTimeout(timer);
-
-    if (res.status === 401 || res.status === 403) {
-      throw new Error("OpenSea rejected the mint POST — API key or session required");
-    }
-    if (res.status === 404) {
-      // Bug M fix: 404 can mean either "not a drop" OR "drop has ended".
-      // Return structured result so caller can distinguish via recommendation.
-      return {
-        eligible: false,
-        reason: `No drop found for slug "${slug}" — the collection may not be an OpenSea-managed drop, or the drop has ended.`,
-        status: 404,
-      };
-    }
-    if (res.status === 429) {
-      throw new Error("OpenSea rate-limited the mint POST — retry in a few seconds");
-    }
-
-    const json = (await res.json()) as any;
-
-    // The docs are explicit: "Error bodies ... carry a stable `code` alongside
-    // `errors`. Branch on `code`, not on the message text." The previous code
-    // string-matched the message, which breaks silently whenever OpenSea
-    // rewords an error.
-    const errObj = json?.errors?.[0] ?? json ?? null;
-    const code: string | null = errObj?.code ?? json?.code ?? null;
-    const message: string = errObj?.message || json?.message || res.statusText;
-
-    // Documented: 200 = transaction data, 409 = NOT minting (NOT_MINTING),
-    // 422 = precondition failed. Only 200 means we got a buildable mint.
-    const isEligible = isEligibleStatus(res.status);
-    let reason: string;
-
-    if (res.status === 409) {
-      reason = code
-        ? `[${code}] ${message} — the drop is not minting right now (not started, ended, or paused)`
-        : "the drop is not minting right now (not started, ended, or paused)";
-    } else if (res.status === 422) {
-      // Documented 422 codes: MINTER_NOT_ELIGIBLE, MINT_LIMIT_EXCEEDED,
-      // SUPPLY_EXHAUSTED, INSUFFICIENT_BALANCE, NO_PAYOUT_ADDRESS.
-      switch (code) {
-        case "MINTER_NOT_ELIGIBLE":
-          reason = `${message} — wallet is not on the active presale's allowlist`;
-          break;
-        case "MINT_LIMIT_EXCEEDED":
-          reason = `${message} — over the wallet's limit for this stage; try reducing quantity`;
-          break;
-        case "SUPPLY_EXHAUSTED":
-          reason = `${message} — supply exhausted; try a different wallet or stage`;
-          break;
-        case "INSUFFICIENT_BALANCE":
-          reason = `${message} — wallet cannot pay the price and gas`;
-          break;
-        case "NO_PAYOUT_ADDRESS":
-          reason = `${message} — paid stage on a drop with no creator payout address`;
-          break;
-        default:
-          // Unknown code: fall back to the message, but surface the code so a
-          // new one is visible in logs rather than silently mis-bucketed.
-          reason = code ? `[${code}] ${message}` : (message || "not eligible");
-      }
-    } else {
-      reason = code ? `[${code}] ${message}` : (message || res.statusText);
-    }
-
-    const responseChain = json?.chain || null;
-    if (responseChain && chainKey && responseChain !== chainKey) {
-      console.warn(`  ⚠ Chain mismatch: OpenSea returned "${responseChain}" but expected "${chainKey}"`);
-    }
-    const mintData = json?.data || null;
-    const seaDropAddress = json?.to || null;
-    // `value` may be a wei string, an ETH float, or a nested { token: { unit } }
-    // object. BigInt(String(...)) throws on the object form and on a float,
-    // taking down the whole mint POST.
-    const value = json?.value ? parsePriceField(json.value) : null;
-
-    // Documented DropMintResponse fields. stage_uuid names the stage the tx was
-    // built for; a presale tx reverts if mined outside stage_start/end_time, so
-    // the caller can and should verify these against the intended stage.
-    const stageUuid = json?.stage_uuid ?? null;
-    const stageType = json?.stage_type ?? null;
-    const stageStart = toUnixSecondsSafe(json?.stage_start_time);
-    const stageEnd = toUnixSecondsSafe(json?.stage_end_time);
-
-    return {
-      eligible: isEligible,
-      // Surface the explanation for EVERY non-success. The previous
-      // `res.status === 422 ? ... : undefined` computed the 409 reason and then
-      // threw it away, leaving the caller only a numeric status.
-      reason: isEligible ? undefined : reason || "not eligible",
-      mintData,
-      mintSignature: json?.mint_signature || json?.mintSignature || null,
-      seaDropAddress,
-      feeRecipient: json?.fee_recipient || json?.feeRecipient || null,
-      value,
-      status: res.status, // HTTP status for diagnostics
-      code,               // stable machine-readable error code (branch on this)
-      stageUuid,
-      stageType,
-      stageStart,
-      stageEnd,
-    };
-  } catch (err: any) {
-    clearTimeout(timer);
-    if (err && err.name === "AbortError") {
-      throw new Error("OpenSea mint POST timed out");
-    }
-    throw err;
-  }
-}
-
 /**
  * Check whether a signed payload's mintData is bound to a specific wallet address.
  *
@@ -633,8 +455,16 @@ export async function buildOpenseaMint(args: {
   return {
     to: t.to,
     data,
-    // MintActionTimeline values have appeared as wei strings and as ETH floats;
-    // a raw BigInt throws on a float and takes down the whole payload fetch.
+    // MintActionTimeline values have appeared as wei strings ("5600000000000000")
+    // and as ETH floats (0.0056); a raw BigInt throws on a float and takes down
+    // the whole payload fetch.
+    //
+    // A whole-number JSON integer is the one ambiguous form: 1 is 1 wei under
+    // the wei convention and 1 ETH under the ETH one. This reads it as wei
+    // because that is the SAFE direction — an underpaid tx reverts and costs
+    // gas, whereas reading a wei string as ETH would overpay by 1e18 and the
+    // wallet could never cover it. The caller cross-checks the total against
+    // the price the eligibility query quoted and refuses a mismatch.
     value: parsePriceToWei(t.value),
     networkId: t.chain?.networkId ?? null,
     crossChain: !!mintAction.relayerFulfillment?.crossChain,
@@ -646,27 +476,6 @@ export async function buildOpenseaMint(args: {
 }
 
 
-/**
- * Probe whether a wallet can mint a drop RIGHT NOW by attempting to build the
- * mint tx via GraphQL. Returns { mintable:true, tx } or { mintable:false, code, reason, funds }.
- */
-export async function probeOpenseaMint(args: {
-  slug: string;
-  minterAddress: string;
-  contract: string;
-  chain: string;
-  cookie?: string | null;
-  apiKey?: string | null;
-}): Promise<{ mintable: boolean; tx?: OpenseaMintTx; code: string | null; reason: string; funds: boolean }> {
-  try {
-    const tx = await buildOpenseaMint(args);
-    return { mintable: true, tx, code: null, reason: "", funds: false };
-  } catch (e: any) {
-    const { code, meaning } = explainOpenseaError(e.message);
-    const funds = code === "InsufficientFundError";
-    return { mintable: false, code, reason: meaning, funds };
-  }
-}
 
 // ── Per-wallet stage eligibility via GraphQL ─────────────────────────────────
 // Uses the
@@ -768,9 +577,10 @@ export async function getDropEligibility(
           for (const st of wl.stages || []) {
             if (st.dropStageUuid == null) continue;
             const raw = st.maxTotalMintableByWallet;
+            const n = raw == null || raw === "" ? null : Number(raw);
             walletRunningCapByUuid.set(
               st.dropStageUuid,
-              raw == null || raw === "" ? null : parseInt(raw, 10)
+              n != null && Number.isFinite(n) ? n : null
             );
           }
         }

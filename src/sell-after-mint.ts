@@ -1,7 +1,49 @@
 // sell-after-mint.ts — sell minted tokens into the best OpenSea offer,
 // guarded so a sale never happens below cost.
 //
-// STUB — the implementation lands test-first. See tests/sell-after-mint.test.mjs.
+// The mint receipt is the source of truth for WHICH tokens to sell: its logs
+// name the ids, and ownership is re-confirmed on-chain before anything is
+// offered for sale.
+
+import {
+  AbiCoder,
+  Contract,
+  Interface,
+  JsonRpcProvider,
+  Wallet,
+  formatEther,
+  id,
+  type TransactionReceipt,
+} from "ethers";
+import {
+  SEAPORT_1_5_ABI,
+  SEAPORT_1_5_ADDRESS,
+  SEAPORT_1_6_ABI,
+  SEAPORT_1_6_ADDRESS,
+} from "./seaport-abi";
+
+/**
+ * ethers' FetchRequest has a 300s default timeout and retries 429s with
+ * exponential backoff, so an unguarded provider call can hold the sell path
+ * open for minutes behind a bad RPC. Every call below is raced against a timer
+ * instead; the caller decides what "could not tell" means for that step.
+ */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** How long a read may take before it is treated as inconclusive. */
+const RPC_READ_TIMEOUT_MS = 20_000;
 
 export interface OfferConsiderationItem {
   itemType: number;
@@ -120,6 +162,10 @@ export function computeNetProceeds(offer: SellOffer, seller: string): bigint | n
 
   // Redacted listing: no seller line, so every payment line is a fee.
   const fees = paymentItems.reduce((sum, i) => sum + parseWei(i.startAmount), 0n);
+  // A price below the surviving fee lines is not a proceed at all. Returning a
+  // negative figure would present a losing offer as a (negative) net, and the
+  // division would then spread that loss across the quantity.
+  if (offer.priceWei < fees) return null;
   return (offer.priceWei - fees) / quantity;
 }
 
@@ -191,14 +237,6 @@ export function rankOffers(offers: SellOffer[], seller: string): SellOffer[] {
     .sort((a, b) => (a.net < b.net ? 1 : a.net > b.net ? -1 : 0))
     .map((x) => x.offer);
 }
-
-import { AbiCoder, Contract, Interface, JsonRpcProvider, Wallet, formatEther, id } from "ethers";
-import {
-  SEAPORT_1_5_ABI,
-  SEAPORT_1_5_ADDRESS,
-  SEAPORT_1_6_ABI,
-  SEAPORT_1_6_ADDRESS,
-} from "./seaport-abi";
 
 /** The transaction block of a fulfillment_data response. */
 export interface FulfillmentTransaction {
@@ -279,12 +317,20 @@ function topicToAddress(topic: string): string {
  *
  * A mint is an ERC721 `Transfer` from the zero address, or an ERC1155
  * `TransferSingle`/`TransferBatch` from the zero address. Requiring the zero
- * sender is what separates a mint from an ordinary transfer in: a receipt can
- * carry both, and selling a token the wallet did not just mint would be a
- * transfer of a pre-existing holding.
+ * sender separates a mint from an ordinary transfer in, but it is not enough on
+ * its own: a receipt can carry mint-shaped logs from OTHER contracts too (an
+ * ERC1155 airdrop, a WETH mint, another collection minted in the same batch).
+ * `nftContract` attributes each log to the collection that was minted — without
+ * it the downstream ownerOf check only proves the wallet HOLDS the token, and a
+ * pre-existing holding would be sold as if it were freshly minted.
  */
-export function extractMintedTokenIds(logs: readonly any[], wallet: string): string[] {
+export function extractMintedTokenIds(
+  logs: readonly any[],
+  wallet: string,
+  nftContract: string
+): string[] {
   const wanted = wallet.toLowerCase();
+  const contract = nftContract.toLowerCase();
   const ids: string[] = [];
   const seen = new Set<string>();
 
@@ -296,6 +342,10 @@ export function extractMintedTokenIds(logs: readonly any[], wallet: string): str
   };
 
   for (const log of logs) {
+    // Logs from any other contract are not this mint, whatever their topics say.
+    const logAddr = (log?.address ?? "").toLowerCase();
+    if (logAddr !== contract) continue;
+
     const topics: string[] = log?.topics ?? [];
     const topic = topics[0];
     if (!topic) continue;
@@ -530,10 +580,11 @@ export async function liveGasQuote(
   gasLimit: number
 ): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | null> {
   try {
-    const [block, feeData] = await Promise.all([
-      provider.getBlock("latest"),
-      provider.getFeeData(),
-    ]);
+    const [block, feeData] = await withTimeout(
+      Promise.all([provider.getBlock("latest"), provider.getFeeData()]),
+      RPC_READ_TIMEOUT_MS,
+      "fee market read"
+    );
     // ethers' getFeeData().maxFeePerGas is an ESTIMATE (base*2 + tip), not the
     // base fee. The block's baseFeePerGas is the network's actual price.
     const base = block?.baseFeePerGas ?? null;
@@ -566,7 +617,11 @@ export async function approvalOperator(
   if (!conduitKey || conduitKey === ZERO_BYTES32) return seaportAddress;
   try {
     const controller = new Contract(CONDUIT_CONTROLLER_ADDRESS, CONDUIT_CONTROLLER_ABI, provider);
-    const [conduit, exists] = await controller.getConduit(conduitKey);
+    const [conduit, exists] = await withTimeout(
+      controller.getConduit(conduitKey),
+      RPC_READ_TIMEOUT_MS,
+      "conduit lookup"
+    );
     return exists ? conduit : null;
   } catch {
     return null;
@@ -588,7 +643,18 @@ export async function ensureApproval(
     const tx = await wallet.sendTransaction(
       await token.setApprovalForAll.populateTransaction(operator, true)
     );
-    await tx.wait();
+    try {
+      await withTimeout(tx.wait(), 60_000, "approval confirmation");
+    } catch (e: any) {
+      // A timeout is not evidence the approval failed — it may have mined while
+      // we were waiting. Re-read the allowance and report what the chain says.
+      const stillApproved = await token
+        .isApprovedForAll(wallet.address, operator)
+        .catch(() => false);
+      return stillApproved
+        ? { needed: true, txHash: tx.hash }
+        : { needed: false, error: e?.message ?? String(e) };
+    }
     return { needed: true, txHash: tx.hash };
   } catch (e: any) {
     return { needed: false, error: e?.message ?? String(e) };
@@ -670,12 +736,18 @@ export async function executeSellAfterMint(
   try {
     // 1. The mint receipt is authoritative: it names the tokens this wallet
     //    actually received, not the quantity that was requested.
-    const receipt = await provider.getTransactionReceipt(opts.mintTxHash);
+    // The explicit type parameter matters: `provider` is `any`, and an
+    // unconstrained inference from `any` yields `{}`, which has no `logs`.
+    const receipt = await withTimeout<TransactionReceipt | null>(
+      provider.getTransactionReceipt(opts.mintTxHash) as Promise<TransactionReceipt | null>,
+      RPC_READ_TIMEOUT_MS,
+      "mint receipt read"
+    );
     if (!receipt) {
       result.skippedReason = `no receipt for mint tx ${opts.mintTxHash}`;
       return result;
     }
-    result.mintedTokenIds = extractMintedTokenIds(receipt.logs, wallet.address);
+    result.mintedTokenIds = extractMintedTokenIds(receipt.logs, wallet.address, opts.contract);
     if (result.mintedTokenIds.length === 0) {
       result.skippedReason = "no mint logs found in the mint receipt";
       return result;
@@ -686,7 +758,7 @@ export async function executeSellAfterMint(
     const token = new Contract(opts.contract, ERC721_APPROVAL_ABI, provider);
     for (const id of result.mintedTokenIds) {
       try {
-        const owner = await token.ownerOf(id);
+        const owner = await withTimeout(token.ownerOf(id), RPC_READ_TIMEOUT_MS, "ownerOf");
         if (owner.toLowerCase() === wallet.address.toLowerCase()) {
           result.heldTokenIds.push(id);
         }
@@ -782,7 +854,9 @@ export async function executeSellAfterMint(
           maxFeePerGas: fees?.maxFeePerGas,
           maxPriorityFeePerGas: fees?.maxPriorityFeePerGas,
         });
-        const receipt2 = await sent.wait();
+        // A sale tx is worth waiting for longer than a read, but not unbounded:
+        // ethers' default is 300s with 429 backoff.
+        const receipt2 = await withTimeout(sent.wait(), 120_000, "sale confirmation");
         result.sold.push({
           tokenId,
           offerHash: decision.offer.orderHash,

@@ -384,13 +384,10 @@ async function fetchGraphqlDrops(
   };
   if (apiKey && apiKey.trim()) headers["X-API-KEY"] = apiKey.trim();
 
-  let slug = lookupTarget;
-  // If the target is a CA, try on-chain discovery instead of slug resolution
-  // for the GQL query. GQL collectionBySlug needs a slug, but if we can't
-  // resolve one without an API key the CA is used directly as fallback.
-  if (lookupTarget.toLowerCase().startsWith("0x")) {
-    slug = lookupTarget; // use CA as slug — GQL may still return results
-  }
+  // The target is used as-is. A contract address is passed to dropBySlug
+  // directly — GQL resolves it, and the previous `if (target.startsWith("0x"))
+  // slug = target` was a no-op that only suggested some conversion was happening.
+  const slug = lookupTarget;
 
   // Live-verified against the OpenSea schema (collectr, 2026-11-05; re-checked
   // 2026-11-08). `collectionBySlug` DOES answer collection metadata
@@ -799,8 +796,12 @@ export interface PhaseEligibilityVerdict {
 }
 
 /**
- * cap − minted. A null cap means unknown. A null minted count is treated as 0 —
- * the cap is still a valid upper bound on what the wallet may mint.
+ * cap − minted. A null cap means unknown.
+ *
+ * A null minted count is NOT zero: it is subtracted from nothing, so the result
+ * is the cap as a CEILING rather than a remainder. That is deliberate — an
+ * unknown minted count must never read as 0 (which would skip a wallet that
+ * still has allowance), and the callers that display this number say so.
  */
 function capRemaining(cap: number | null, minted: number | null): number | null {
   if (cap == null) return null;
@@ -1185,7 +1186,7 @@ function assessDropEligibilityLocal(
     // "this phase has already ended".
     const isPast = drop.endTime > 0 && now >= drop.endTime * 1000;
 
-    if (drop.type === "ovr" || drop.allowlistHash ||
+    if (drop.type === "ovr" || hasRealAllowlistHash ||
         drop.allowlistedAddresses.length > 0 ||
         (drop.type && /ovr|allowlist|allow_list/i.test(drop.type))) {
       // OVR/allowlist: isPast + no signed data → skip; otherwise still targetable
@@ -1443,7 +1444,6 @@ export function printDropsInventory(
     const endsAt = endMs != null ? new Date(endMs) : null;
     const isLive = startMs != null && endMs != null && now >= startMs && now < endMs;
     const notStarted = startMs != null && now < startMs;
-    const isActive = !notStarted && (endMs == null || now < endMs);
 
     let statusLabel: string;
     let statusColor: typeof chalk.green | typeof chalk.yellow | typeof chalk.red;
@@ -1500,12 +1500,17 @@ export function printDropsInventory(
     }
 
     // What THIS wallet can mint in this phase.
+    // When the minted count is unknown the running cap is a CEILING, not a
+    // remainder — quoting it as "N left" overstates what the wallet can still
+    // mint by everything it has already minted elsewhere.
     const mintableLine =
       report == null || report.walletMintable == null
         ? chalk.gray(`  You can mint: unknown`)
         : report.walletMintable <= 0
           ? chalk.red(`  You can mint: 0 — this wallet's allocation is used up`)
-          : chalk.gray(`  You can mint: ${report.walletMintable}`);
+          : report.minted == null && report.cap != null
+            ? chalk.gray(`  You can mint: up to ${report.walletMintable} (already-minted count unknown)`)
+            : chalk.gray(`  You can mint: ${report.walletMintable}`);
 
     // Eligibility line
     let eligLine = "";

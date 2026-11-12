@@ -51,11 +51,22 @@ export function parsePriceSpec(spec: string, amount = 1): PriceProtectionResult 
   const isTotal = s.endsWith("total");
   const clean = s.replace(/eth$/, "").replace(/\/unit$/, "").replace(/total$/, "").trim();
   const num = Number(clean);
-  if (Number.isNaN(num) || num < 0) {
+  if (Number.isNaN(num) || num < 0 || !Number.isFinite(num)) {
     throw new Error(`invalid max-price spec: "${spec}"`);
   }
+  // Number() accepts forms parseEther() rejects — "1e5", "0x10", "Infinity" —
+  // and the ethers error would name the library rather than the spec. Reject
+  // them here so the message points at what the user actually typed.
+  if (!/^(?:\d+(?:\.\d+)?|\.\d+)$/.test(clean)) {
+    throw new Error(`invalid max-price spec: "${spec}" — use a plain decimal like 0.01`);
+  }
 
-  const qty = BigInt(amount || 1);
+  // A non-positive quantity cannot be multiplied up into a total, and silently
+  // reading 0 as 1 would price the cap for a mint that is not happening.
+  if (!Number.isInteger(amount) || amount < 1) {
+    throw new Error(`invalid quantity for max-price spec: ${amount}`);
+  }
+  const qty = BigInt(amount);
   const parsedWei = parseEther(clean);
   const totalWei = isTotal ? parsedWei : parsedWei * qty;
   const unitWei = isTotal && qty > 0n ? totalWei / qty : parsedWei;
@@ -122,14 +133,3 @@ export function assertPriceProtection(args: {
   }
 }
 
-/**
- * True when a stored max price is still valid for the current observed price.
- * Non-throwing variant for callers that want to warn rather than abort.
- */
-export function isPriceProtected(
-  actualPriceWei: bigint,
-  maxPriceWei: bigint | null | undefined
-): boolean {
-  if (maxPriceWei == null) return true;
-  return BigInt(actualPriceWei) <= BigInt(maxPriceWei);
-}

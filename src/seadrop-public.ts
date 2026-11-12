@@ -16,8 +16,8 @@ export const SEADROP_ADDRESS = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
 
 // OpenSea's standard fee collector — the usual allowed recipient on their drops.
 // Only used when a drop leaves the recipient list empty and unrestricted, since
-// SeaDrop rejects the zero address outright. Exported: this address was copied
-// into three modules, and a copy silently edited would diverge from the others.
+// SeaDrop rejects the zero address outright. Exported so every module shares
+// one literal: a copy silently edited would diverge from the others.
 export const OPENSEA_FEE_RECIPIENT = "0x0000a26b00c1F0DF003000390027140000fAa719";
 
 const PUBLIC_ABI = [
@@ -50,14 +50,18 @@ export interface LocalMintPlan {
   feeRecipient: string;
 }
 
-// Returns null when this contract has no public drop on the SeaDrop singleton —
-// either it isn't a SeaDrop collection at all, or it uses a newer variant that
-// keeps drop config on the token contract itself.
-export async function fetchPublicDrop(
-  rpcUrl: string,
+/**
+ * Read the public drop off an existing provider.
+ *
+ * Takes a provider rather than a URL so `buildLocalMintPlan` can read the drop
+ * and its fee recipient over ONE connection. Two separate providers meant two
+ * TCP/TLS setups and two sequential round trips for data that is always read
+ * together.
+ */
+async function readPublicDrop(
+  provider: JsonRpcProvider,
   nftContract: string
 ): Promise<PublicDrop | null> {
-  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
   try {
     const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
     const raw = await seadrop.getPublicDrop(nftContract);
@@ -76,53 +80,108 @@ export async function fetchPublicDrop(
     return drop;
   } catch {
     return null;
+  }
+}
+
+// Returns null when this contract has no public drop on the SeaDrop singleton —
+// either it isn't a SeaDrop collection at all, or it uses a newer variant that
+// keeps drop config on the token contract itself.
+export async function fetchPublicDrop(
+  rpcUrl: string,
+  nftContract: string,
+  timeoutMs: number = DEFAULT_READ_TIMEOUT_MS
+): Promise<PublicDrop | null> {
+  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+  try {
+    return await withRpcTimeout(
+      readPublicDrop(provider, nftContract),
+      timeoutMs,
+      "read the public drop"
+    );
   } finally {
-    // ethers keeps a polling timer alive on every provider. Without an explicit
-    // destroy the process never exits.
-    try {
-      provider.destroy();
-    } catch {
-      // Already destroyed.
-    }
+    destroyProvider(provider);
   }
 }
 
 // SeaDrop reverts on a zero fee recipient, and on a disallowed one when the drop
 // restricts them — so this has to come from the chain, not a guess.
-export async function resolveFeeRecipient(
-  rpcUrl: string,
+async function readFeeRecipient(
+  provider: JsonRpcProvider,
   nftContract: string,
   restricted: boolean
 ): Promise<{ address: string; source: string } | null> {
+  const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
+  let allowed: string[] = [];
+  try {
+    allowed = await seadrop.getAllowedFeeRecipients(nftContract);
+  } catch {
+    allowed = [];
+  }
+
+  if (allowed.length > 0) {
+    return { address: allowed[0], source: "allowed fee recipient on-chain" };
+  }
+  if (restricted) {
+    // Nothing allowed and the drop enforces the list — a public mint cannot be
+    // constructed at all, locally or otherwise.
+    return null;
+  }
+  return { address: OPENSEA_FEE_RECIPIENT, source: "OpenSea default (drop does not restrict)" };
+}
+
+export async function resolveFeeRecipient(
+  rpcUrl: string,
+  nftContract: string,
+  restricted: boolean,
+  timeoutMs: number = DEFAULT_READ_TIMEOUT_MS
+): Promise<{ address: string; source: string } | null> {
   const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
   try {
-    const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
-    let allowed: string[] = [];
-    try {
-      allowed = await seadrop.getAllowedFeeRecipients(nftContract);
-    } catch {
-      allowed = [];
-    }
-
-    if (allowed.length > 0) {
-      return { address: allowed[0], source: "allowed fee recipient on-chain" };
-    }
-    if (restricted) {
-      // Nothing allowed and the drop enforces the list — a public mint cannot be
-      // constructed at all, locally or otherwise.
-      return null;
-    }
-    return { address: OPENSEA_FEE_RECIPIENT, source: "OpenSea default (drop does not restrict)" };
+    return await withRpcTimeout(
+      readFeeRecipient(provider, nftContract, restricted),
+      timeoutMs,
+      "read the fee recipient"
+    );
   } finally {
-    // ethers keeps a polling timer alive on every provider. Without an explicit
-    // destroy the process never exits.
-    try {
-      provider.destroy();
-    } catch {
-      // Already destroyed.
-    }
+    destroyProvider(provider);
   }
 }
+
+/** ethers keeps a polling timer alive on every provider; without an explicit
+ *  destroy the process never exits. */
+function destroyProvider(provider: JsonRpcProvider): void {
+  try {
+    provider.destroy();
+  } catch {
+    // Already destroyed.
+  }
+}
+
+/**
+ * Bound an RPC read.
+ *
+ * ethers v6 has no provider timeout, so a dead endpoint holds the promise (and
+ * the wizard) open until the OS gives up on the socket — 5 s here, minutes on a
+ * blackholed route. Every read through this module goes through this.
+ */
+async function withRpcTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out after ${timeoutMs} ms`)),
+          timeoutMs
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const DEFAULT_READ_TIMEOUT_MS = 15000;
 
 export interface MintMechanisms {
   signers: string[];
@@ -142,33 +201,46 @@ export interface MintMechanisms {
  */
 export async function getMintMechanisms(
   rpcUrl: string,
-  nftContract: string
+  nftContract: string,
+  timeoutMs: number = DEFAULT_READ_TIMEOUT_MS
 ): Promise<MintMechanisms> {
   const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
   try {
-    const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
-    let signers: string[] = [];
-    let tokenGated: string[] = [];
-    try {
-      signers = Array.from(await seadrop.getSigners(nftContract) as string[]);
-    } catch {
-      /* not supported on this SeaDrop variant */
-    }
-    try {
-      tokenGated = Array.from(
-        await seadrop.getTokenGatedAllowedTokens(nftContract) as string[]
-      );
-    } catch {
-      /* not supported on this SeaDrop variant */
-    }
-    return { signers, tokenGated };
+    return await withRpcTimeout(
+      readMintMechanisms(provider, nftContract),
+      timeoutMs,
+      "read the mint mechanisms"
+    );
+  } catch {
+    // Best-effort means best-effort: a provider failure is not evidence about
+    // the drop, and throwing here would abort the wizard that asked the
+    // question. The caller only uses this to explain a refusal.
+    return { signers: [], tokenGated: [] };
   } finally {
-    try {
-      provider.destroy();
-    } catch {
-      // Already destroyed.
-    }
+    destroyProvider(provider);
   }
+}
+
+async function readMintMechanisms(
+  provider: JsonRpcProvider,
+  nftContract: string
+): Promise<MintMechanisms> {
+  const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
+  let signers: string[] = [];
+  let tokenGated: string[] = [];
+  try {
+    signers = Array.from(await seadrop.getSigners(nftContract) as string[]);
+  } catch {
+    /* not supported on this SeaDrop variant */
+  }
+  try {
+    tokenGated = Array.from(
+      await seadrop.getTokenGatedAllowedTokens(nftContract) as string[]
+    );
+  } catch {
+    /* not supported on this SeaDrop variant */
+  }
+  return { signers, tokenGated };
 }
 
 // minterIfNotPayer = address(0) means "credit the caller", so the calldata is
@@ -189,13 +261,30 @@ export function encodeMintPublic(
 export async function buildLocalMintPlan(
   rpcUrl: string,
   nftContract: string,
-  quantity: number
+  quantity: number,
+  timeoutMs: number = DEFAULT_READ_TIMEOUT_MS
 ): Promise<LocalMintPlan | null> {
-  const drop = await fetchPublicDrop(rpcUrl, nftContract);
-  if (!drop) return null;
-
-  const fee = await resolveFeeRecipient(rpcUrl, nftContract, drop.restrictFeeRecipients);
-  if (!fee) return null;
+  // One provider for both reads: the drop and its fee recipient are always
+  // needed together, and two providers meant two connections for one plan.
+  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+  let drop: PublicDrop | null;
+  let fee: { address: string; source: string } | null;
+  try {
+    drop = await withRpcTimeout(
+      readPublicDrop(provider, nftContract),
+      timeoutMs,
+      "read the public drop"
+    );
+    if (!drop) return null;
+    fee = await withRpcTimeout(
+      readFeeRecipient(provider, nftContract, drop.restrictFeeRecipients),
+      timeoutMs,
+      "read the fee recipient"
+    );
+    if (!fee) return null;
+  } finally {
+    destroyProvider(provider);
+  }
 
   return {
     to: SEADROP_ADDRESS,

@@ -30,9 +30,8 @@
 // This is the same speed as public mint for signed phases too — the only difference
 // is that you need to have done the API round-trip BEFORE the window opens.
 
-import path from "path";
 import chalk from "chalk";
-import { Wallet, Interface, JsonRpcProvider } from "ethers";
+import { Wallet, JsonRpcProvider } from "ethers";
 import { parseRpcEndpoints, prepareBlast, blastToAll, waitForReceipt, type PreparedBlast } from "./rpc-blast";
 import { resolveChain } from "./chains";
 import { fetchOnChainDrops } from "./seadrop-onchain";
@@ -155,10 +154,6 @@ export async function loadStoredSession(): Promise<StoredSession | null> {
 export async function saveStoredSession(s: StoredSession): Promise<void> {
   // Contains a bearer token — owner-only.
   require("fs").writeFileSync(SESSION_FILE, JSON.stringify(s, null, 2), { encoding: "utf-8", mode: 0o600 });
-}
-
-export async function clearStoredSession(): Promise<void> {
-  try { require("fs").unlinkSync(SESSION_FILE); } catch {}
 }
 
 /** Convert a StoredSession to a cookie header string for GraphQL/OpenSea API calls.
@@ -507,7 +502,7 @@ export async function buildSignedPayloadFromDrop(
   quantity: number,
   _apiKey?: string | null,
 ): Promise<FcfsSignedPayload | null> {
-  const seaDropAddress = drop.seaDropAddress || drop.seadrop_address || "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
+  const seaDropAddress = drop.seaDropAddress || drop.seadrop_address || SEADROP_ADDRESS;
   const feeRecipient = drop.feeRecipient || drop.fee_recipient;
   const mintData = drop.mintData || drop.mint_data || drop.calldata;
   const mintSignature = drop.mintSignature || drop.mint_signature || drop.signature;
@@ -569,91 +564,6 @@ function buildGasDataFromDrop(drop: any): FcfsGasData | undefined {
   };
 }
 
-export function extractActiveDrop(json: any, nftContract: string): any | null {
-  if (!json || typeof json !== "object") return null;
-
-  // The documented shape is DropDetailedResponse:
-  //   { active_stage, next_stage, stages: DropStageResponse[], is_minting, ... }
-  // DropStageResponse carries stage_type / start_time / end_time / price /
-  // max_per_wallet / uuid. It has NO mintData and NO status field — the previous
-  // implementation required `c.status === "active" && c.mintData`, which no real
-  // response can satisfy, and it never looked at `stages` at all (a
-  // DropDetailedResponse matches none of its candidate branches). It could
-  // therefore never return anything.
-  //
-  // Signed calldata is NOT available from this endpoint; use
-  // POST /api/v2/drops/{slug}/mint for that.
-  const now = Date.now();
-  const unixSec = (v: unknown): number => {
-    if (v == null || v === "") return 0;
-    const n = Number(v);
-    if (String(v).trim() !== "" && Number.isFinite(n)) return Math.floor(n);
-    const parsed = Date.parse(String(v));
-    return Number.isNaN(parsed) ? 0 : Math.floor(parsed / 1000);
-  };
-  // 0 means unknown: an unknown bound must not exclude the stage.
-  const isLive = (s: any): boolean => {
-    if (!s || typeof s !== "object") return false;
-    const start = unixSec(s.start_time ?? s.startTime);
-    const end = unixSec(s.end_time ?? s.endTime);
-    if (end > 0 && now >= end * 1000) return false;
-    if (start > 0 && now < start * 1000) return false;
-    return true;
-  };
-
-  if (isLive(json.active_stage)) return json.active_stage;
-  const stages = Array.isArray(json.stages) ? json.stages : [];
-  return stages.find(isLive) ?? null;
-}
-
-// ── Extract a fireable payload from on-chain SEADROP results ───────────────
-//
-// On-chain drops from fetchOnChainDrops carry what the SEADROP contract exposes:
-//   - Public drops: mintPrice, startTime, endTime, maxTotalMintableByWallet, feeBps,
-//     restrictFeeRecipients — FULLY actionable on-chain.
-//   - Allowlist/OVR drops: merkle root + fee recipients — signals existence, but
-//     mintData/mintSignature are NULL because they live off-chain with OpenSea.
-//   - Token-gated drops: full mint params on-chain IF you know the gate token.
-//
-// This function filters for drops that are immediately fireable (have mintData) AND
-// also surfaces allowlist drops as "pre-fetch candidates" — phases we know exist on
-// chain but need off-chain data (signature / merkle proof) before they become
-// fireable. The caller decides whether to trigger that pre-fetch.
-
-export interface OnChainDrop {
-  dropId: string;
-  nftContract: string;
-  type: string | null;
-  startTime: number;
-  endTime: number;
-  mintPrice: bigint;
-  maxTotalMintableByWallet: number;
-  maxTotalMintable: number;
-  totalMinted: number;
-  feeBps: number;
-  feeRecipient: string | null;
-  mintData: string | null;
-  mintSignature: string | null;
-  gasLimit: number | null;
-  maxFeePerGas: bigint | null;
-  maxPriorityFeePerGas: bigint | null;
-  eligible: boolean | null;
-  eligibleCount: number | null;
-  totalAllocated: number | null;
-  allowlistedAddresses: string[];
-  allowlistHash: string | null;
-  seaDropAddress: string;
-  raw: Record<string, any>;
-}
-
-export interface AllowlistPreFetchCandidate {
-  drop: DropPhase;          // the on-chain drop info
-  merkleRoot: string | null;
-  feeRecipient: string | null;
-  needsAllowlistData: boolean; // true → must fetch allowlist tree from OpenSea
-  needsSignature: boolean;     // true → must fetch mintSignature from OpenSea
-}
-
 async function extractActiveDropFromOnChain(
   drops: DropPhase[],
   nftContract: string,
@@ -671,50 +581,12 @@ async function extractActiveDropFromOnChain(
     // Map DropPhase → the drop shape buildSignedPayloadFromDrop expects
     const mapped = {
       ...d,
-      seaDropAddress: d.raw?.seaDropAddress || d.raw?.seadrop_address || "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5",
+      seaDropAddress: d.raw?.seaDropAddress || d.raw?.seadrop_address || SEADROP_ADDRESS,
     } as any;
     const result = await buildSignedPayloadFromDrop(mapped, nftContract, quantity, apiKey);
     if (result) return result;
   }
   return null;
-}
-
-// ── Identify allowlist/OVR phases that need off-chain data pre-fetch ───────
-// Called AFTER on-chain discovery returns. Returns the list of allowlist phases
-// that exist on-chain but need their off-chain data (signatures, merkle proofs)
-// fetched from OpenSea before they become fireable.
-//
-// The actual pre-fetch is done by the caller (wizard / preparation module) using
-// fetchSignedPayload or fetchSignedPayloadWithSession — this function just tells
-// you WHICH phases to pre-fetch and what they need.
-
-export function identifyAllowlistPreFetchCandidates(
-  onChainDrops: DropPhase[],
-  _nftContract: string,
-): AllowlistPreFetchCandidate[] {
-  const candidates: AllowlistPreFetchCandidate[] = [];
-
-  for (const d of onChainDrops) {
-    if (d.isPublicStage) continue;   // public stages are fireable locally
-    if (d.mintData) continue;        // already fireable — nothing to pre-fetch
-    // A non-empty, non-zero allowlistHash is the real signal that this phase
-    // needs an off-chain merkle proof. An all-zero root means "no allowlist".
-    const rawHash = d.allowlistHash || "";
-    const hexPart = rawHash.startsWith("0x") ? rawHash.slice(2) : rawHash;
-    const isAllowlistHashReal =
-      hexPart.length >= 2 && ![...hexPart].every((c) => c === "0");
-    if (isAllowlistHashReal || d.allowlistedAddresses.length > 0) {
-      candidates.push({
-        drop: d,
-        merkleRoot: d.allowlistHash ?? null,
-        feeRecipient: d.feeRecipient ?? null,
-        needsAllowlistData: isAllowlistHashReal,
-        needsSignature: true,
-      });
-    }
-  }
-
-  return candidates;
 }
 
 // ── OAuth refresh (path B helper) ───────────────────────────────────────────
@@ -784,141 +656,6 @@ export async function refreshSessionToken(
   }
 }
 
-// ── Pre-fetch signed payloads for all discovered phases ─────────────────────
-// Run this BEFORE the mint window opens. For each phase discovered on-chain (or
-// via REST), fetch the signed data from OpenSea and cache it. At T-0, use the
-// cached payload to broadcast — no API call in the critical path.
-//
-// IMPORTANT: mintSignature is wallet-specific. The pre-fetch at line 563/585
-// fetches ONE payload per drop (quantity=1), which is only correct for a
-// single-wallet run. For multi-wallet sniping, each wallet needs its own
-// per-wallet pre-fetch (see fetchSignedPayloadForWallet at line 912). If you
-// pass the result of this function into executeFcfsSnipe for a multi-wallet
-// run, the wrong signature may be used for wallets other than the one that
-// was pre-fetched. Either pre-fetch per-wallet here, or let executeFcfsSnipe
-// do its own per-wallet fetch at T-0.
-//
-// Returns a map of dropId → pre-fetched FcfsSignedPayload, so the fire step can
-// pick the right one without calling the API again.
-
-export interface PreFetchResult {
-  /** Wallet-indexed payloads, in the same order as the `walletAddresses` passed
-   *  in. null = no payload for that wallet. This is exactly the shape
-   *  executeFcfsSnipe's `payloads` option consumes. */
-  payloads: (FcfsSignedPayload | null)[];
-  failed: { walletAddress: string; reason: string }[];
-}
-
-/**
- * Pre-fetch OpenSea's signed calldata for every wallet, ahead of the window.
- *
- * Mint signatures are wallet-specific, so each wallet needs its own payload —
- * and the result must stay wallet-indexed so it can be handed straight to
- * executeFcfsSnipe. The previous shape (a single wallet address, a flat array)
- * could not be passed to a multi-wallet snipe at all.
- */
-export async function preFetchSignedPayloads(
-  nftContract: string,
-  drop: DropPhase,
-  walletAddresses: string[],
-  quantity: number,
-  apiKey?: string | null,
-  session?: StoredSession | null,
-  opts: { timeoutMs?: number; slug?: string; chainKey?: string } = {},
-): Promise<PreFetchResult> {
-  const timeoutMs = opts.timeoutMs ?? 15000;
-  const failed: { walletAddress: string; reason: string }[] = [];
-
-  // POST /api/v2/drops/{slug}/mint takes a collection SLUG, not a contract
-  // address, and a minter address. Without either this path cannot work.
-  const slug = opts.slug?.trim();
-  if (!slug || walletAddresses.length === 0) {
-    return {
-      payloads: walletAddresses.map(() => null),
-      failed: walletAddresses.map((a) => ({
-        walletAddress: a,
-        reason: "no collection slug / minter address — the mint endpoint needs both",
-      })),
-    };
-  }
-
-  // Public stages are minted through the local on-chain path, not OpenSea's
-  // signed-payload flow.
-  if (drop.isPublicStage) {
-    return {
-      payloads: walletAddresses.map(() => null),
-      failed: walletAddresses.map((a) => ({
-        walletAddress: a,
-        reason: "public stage — minted on-chain, no signed payload needed",
-      })),
-    };
-  }
-
-  // The signed calldata comes from POST /drops/{slug}/mint. GET /drops/{slug}
-  // returns DropDetailedResponse — stage metadata with NO mintData — so it can
-  // never produce a payload.
-  //
-  // The wallet JWT is required for presale stages; an API key alone only works
-  // for some public drops.
-  const accessToken = session?.accessToken || null;
-
-  const payloads = await Promise.all(walletAddresses.map(async (addr) => {
-    try {
-      return await postMintTxFallback(
-        slug, addr, quantity, apiKey, timeoutMs, opts.chainKey, nftContract, accessToken,
-      );
-    } catch (err: any) {
-      failed.push({ walletAddress: addr, reason: err.message || "fetch error" });
-      return null;
-    }
-  }));
-
-  return { payloads, failed };
-}
-
-// ── Build allowlist mint calldata locally (NO OpenSea signature needed) ─────
-// When we have the allowlist merkle proof for our wallet, we can build the
-// mintAllowlist calldata entirely on-chain — no API call at fire time.
-//
-// This is the analog of encodeMintPublic() in seadrop-public.ts, but for the
-// allowlist path. The merkle proof comes from the allowlist tree data (fetched
-// from OpenSea ahead of time), not from the chain.
-
-export interface AllowlistMintCalldata {
-  to: string;           // always the SeaDrop singleton
-  data: string;         // mintAllowlist(...) calldata — same for every wallet
-  value: bigint;        // mintPrice × quantity
-  feeRecipient: string; // SeaDrop fee recipient
-  merkleRoot: string;   // the on-chain merkle root (for verification)
-}
-
-// Note: the exact SeaDrop function name for allowlist mints may vary by version.
-// Common patterns: mintAllowlist, mintWithProof, mintAllowlistWithSig.
-// Adjust the function name below when the real ABI is known.
-
-export function encodeAllowlistMintCalldata(
-  _nftContract: string,
-  _feeRecipient: string,
-  _quantity: number,
-  _merkleRoot: string,
-  _merkleProof: string[],   // hex-encoded proof paths from the allowlist tree
-  _walletAddress: string,   // the allowlisted wallet
-  _mintPrice: bigint,
-): string | null {
-  // SeaDrop does NOT expose a standalone mintAllowlist function.
-  // Allowlist/OVR mints go through mintSigned() — OpenSea produces a per-wallet
-  // signature (mintSignature) that is passed to mintSigned along with the
-  // mint params. The merkle proof from the allowlist tree is embedded inside
-  // the signed payload's mintData, not passed separately.
-  //
-  // This previously returned the literal string "0xplaceholder_allowlist_calldata",
-  // which a caller could have broadcast as if it were real calldata. Returning
-  // null is the honest answer: there is no local allowlist mint to encode.
-  // The real calldata comes from the signed payload fetched from OpenSea
-  // (buildSignedPayloadFromDrop -> drop.mintData).
-  return null;
-}
-
 // ── Determine mint mode from on-chain data ──────────────────────────────────
 // Given an on-chain DropPhase, returns what mint mode it uses and whether it's
 // immediately fireable locally (public) or needs an API pre-fetch (signed/allowlist).
@@ -979,69 +716,6 @@ export function classifyMintMode(drop: DropPhase): { mode: MintMode; fireableLoc
 
   return { mode: "unknown", fireableLocally: false, preFetchNeeded: true };
 }
-
-// ── Token-gated mint (probe with known gate token) ──────────────────────────
-// Token-gated phases store everything on-chain IF you know the gate token address.
-// The mint params come from getTokenGatedDrop(nftContract, gateToken).
-// Once you have them, this is identical to public mint — pre-build, pre-sign, fire.
-
-export async function fetchTokenGatedMintParams(
-  nftContract: string,
-  gateToken: string,
-  rpcUrl: string,
-): Promise<SeaDropDropMeta | null> {
-  // Direct on-chain call to getTokenGatedDrop(nftContract, gateToken)
-  // This is the same function seadrop-onchain.ts uses in fetchTokenGatedPhase
-  const ABI = [
-    "function getTokenGatedDrop(address nftContract, address allowedNftToken) view returns (" +
-      "uint80 mintPrice, " +
-      "uint16 maxTotalMintableByWallet, " +
-      "uint48 startTime, " +
-      "uint48 endTime, " +
-      "uint8 dropStageIndex, " +
-      "uint32 maxTokenSupplyForStage, " +
-      "uint16 feeBps, " +
-      "bool restrictFeeRecipients" +
-    ")",
-  ];
-  const iface = new Interface(ABI);
-  // staticNetwork: true — without it ethers performs a network detection
-  // (eth_chainId) on first use, which adds a round trip and, on a slow or
-  // rate-limited endpoint, times out before the read it was created for.
-  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
-
-  try {
-    const data = iface.encodeFunctionData("getTokenGatedDrop", [nftContract, gateToken]);
-    const result = await provider.send("eth_call", [{ to: SEADROP_ADDRESS, data }, "latest"]);
-    if (!result || result === "0x") return null;
-
-    const d = iface.decodeFunctionResult("getTokenGatedDrop", result);
-    const startTime = Number(d.startTime);
-    const endTime = Number(d.endTime);
-
-    if (startTime === 0 && endTime === 0) return null;
-
-    return {
-      mintPrice: d.mintPrice || 0n,
-      startTime,
-      endTime,
-      maxTotalMintableByWallet: Number(d.maxTotalMintableByWallet),
-      feeBps: Number(d.feeBps),
-      restrictFeeRecipients: Boolean(d.restrictFeeRecipients),
-    };
-  } catch {
-    return null;
-  } finally {
-    // ethers keeps a polling timer alive on every provider; without an explicit
-    // destroy the process never exits.
-    try {
-      provider.destroy();
-    } catch {
-      // Already destroyed.
-    }
-  }
-}
-
 
 // ── Build a mint plan from a fetched signed payload ─────────────────────────
 export function buildFcfsMintPlan(
@@ -1330,6 +1004,28 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
           return;
         }
       }
+      // Unit check. MintActionTimeline's `value` is ambiguous for whole numbers
+      // (1 = 1 wei under the wei convention, 1 ETH under the ETH one), and the
+      // wei reading can only underpay — which reverts on-chain and burns the
+      // T-0 window. The eligibility check quoted a per-unit price in wei, so a
+      // total orders of magnitude away from that quote is a unit error, not a
+      // price move. The 1000x band is far wider than any real movement between
+      // the quote and the fire.
+      if (opts.quotedPriceWei != null && quantity > 0) {
+        const expected = opts.quotedPriceWei * BigInt(quantity);
+        const actual = payload.value;
+        if (actual !== 0n && (actual < expected / 1000n || actual > expected * 1000n)) {
+          results[i] = {
+            walletIndex: i,
+            walletAddress: addr,
+            success: false,
+            error:
+              `Signed payload value (${actual} wei) is far from the quoted total (${expected} wei) — ` +
+              "a price-unit mismatch, not a price move. Refusing to broadcast.",
+          };
+          return;
+        }
+      }
       if (opts.maxPriceWei != null) {
         try {
           assertPriceProtection({
@@ -1540,7 +1236,20 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   // The chainId is passed explicitly. Without it ethers performs a network
   // detection (eth_chainId) on the first request — an extra round trip inside
   // the T-0 critical path, and on some endpoints it retries first.
-  const fireProvider = new JsonRpcProvider(rpcUrls[0], chainId, {
+  // Resolve the endpoint ranking BEFORE the fire block. The nonce read, the gas
+  // estimate and the simulation all go through this one provider, and a failed
+  // gas estimate is do-not-send evidence — so pinning it to rpcUrls[0] let a
+  // single dead URL fail every wallet at T-0, even though the blast below had
+  // live endpoints to send the same transactions to.
+  // Zero budget: a ranking that is not done yet must never hold up the fire.
+  let fireUrl = rpcUrls[0];
+  try {
+    const preFire = await settleRanking(ranking, 0);
+    if (preFire && preFire.length > 0 && preFire[0].url) fireUrl = preFire[0].url;
+  } catch {
+    // Fall back to the first configured endpoint.
+  }
+  const fireProvider = new JsonRpcProvider(fireUrl, chainId, {
     staticNetwork: true,
     pollingInterval: 1000,
   });
@@ -1678,11 +1387,18 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         accepted && accepted.index < blastEndpoints.length
           ? blastEndpoints[accepted.index]
           : undefined;
-      const receiptUrl = acceptingEndpoint ? acceptingEndpoint.url : rpcUrls[0];
+      // Poll the accepting endpoint FIRST, then every other one. The endpoint
+      // that accepted the tx is not the only place the receipt can be read: if
+      // that node falls over before the poll completes, a landed mint is
+      // reported UNKNOWN — and the sell-after-mint step then skips a wallet
+      // that actually holds the tokens.
+      const ordered = acceptingEndpoint
+        ? [acceptingEndpoint.url, ...rpcUrls.filter((u) => u !== acceptingEndpoint.url)]
+        : rpcUrls;
 
       let receipt: ConfirmedTx | undefined;
       if (accepted && accepted.txHash) {
-        const receiptResult = await waitForReceipt(accepted.txHash, receiptUrl);
+        const receiptResult = await waitForReceipt(accepted.txHash, ordered);
         if (receiptResult) {
           receipt = {
             address: b.addr,
@@ -1770,10 +1486,10 @@ export async function fetchSignedPayloadForWallet(
       // mintData/signature is not for this wallet, reject it.
       // The mintData calldata encodes the recipient; we check it here.
       // Verify the payload is bound to the requested wallet address before using it.
-      if (!isPayloadBoundToWallet(payload, walletAddress)) {
-        return null; // payload is for a different wallet — reject, don't use it
-      }
-      return payload;
+      if (isPayloadBoundToWallet(payload, walletAddress)) return payload;
+      // Not bound to this wallet — reject it, but do NOT give up. The session
+      // path below asks OpenSea for a payload bound to THIS wallet, and
+      // returning null here dropped the wallet outright.
     }
   }
 

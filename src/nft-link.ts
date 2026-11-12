@@ -12,20 +12,15 @@ export interface LinkTarget {
   tokenId?: string;
 }
 
-// OpenSea's URL chain segment → our chain key (src/chains.ts).
-const CHAIN_ALIASES: Record<string, string> = {
-  ethereum: "ethereum",
-  eth: "ethereum",
-  mainnet: "ethereum",
-  base: "base",
-  robinhood: "robinhood",
-  arc: "arc",
-  soneium: "soneium",
-};
+// OpenSea's URL chain segment → our chain key. The alias table lives in
+// target-resolver.ts; a second copy here had already drifted (it knew "matic"
+// and "arbitrum" as raw strings, not as the keys src/chains.ts uses).
+import { chainSlug } from "./target-resolver";
 
 function normalizeChain(segment: string): string {
-  const key = segment.trim().toLowerCase();
-  return CHAIN_ALIASES[key] ?? key;
+  const key = segment.trim();
+  if (!key) return "";
+  return chainSlug(key);
 }
 
 function isContractAddress(value: string): boolean {

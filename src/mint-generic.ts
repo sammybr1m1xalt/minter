@@ -27,6 +27,7 @@
 
 import { id as keccakId, Interface, JsonRpcProvider } from "ethers";
 import { autoGasBounded } from "./auto-gas";
+import { SEADROP_ADDRESS } from "./seadrop-public";
 
 // ── Selector registry ───────────────────────────────────────────────────────
 //
@@ -214,15 +215,11 @@ export const PRICE_READERS: PriceReader[] = [
 // no shared v2 address to probe. Verified against ProjectOpenSea/seadrop
 // docs/Deployments.md.
 //
-// The address previously held by SEADROP_V1 was Seaport 1.1
+// This address previously held Seaport 1.1
 // (0x00000000006c3852cbef3e08e8df289169ede581) — NOT SeaDrop. Probing it for
 // SeaDrop getters could never produce evidence.
-export const SEADROP_V1 = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
+export const SEADROP_V1 = SEADROP_ADDRESS;
 export const SEADROP_V2 = SEADROP_V1;
-
-// Seaport 1.1 — the marketplace, not SeaDrop. Kept for callers that compare
-// against it; do not use it as a SeaDrop singleton.
-export const SEAPORT_1_1 = "0x00000000006c3852cbef3e08e8df289169ede581";
 
 // The return types use plain uintN. SeaDrop's documentation writes them as
 // uint16B/uint32B (a byte-width convention), but those are NOT valid Solidity

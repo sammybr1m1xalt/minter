@@ -13,6 +13,7 @@
 // Estimates per transaction and adds a 20% buffer.
 
 import { JsonRpcProvider } from "ethers";
+import { isIndeterminateRpcError } from "./simulate";
 
 export interface AutoGasRequest {
   to: string;
@@ -49,6 +50,10 @@ export async function autoGas(
   const [feeData, rawGasLimit] = await Promise.all([
     provider.getFeeData(),
     provider.estimateGas(txRequest).catch((e: any) => {
+      // A network or timeout failure says nothing about the transaction — it is
+      // "could not tell", not "revert". Wrapping it as "likely revert" made the
+      // caller treat a dead RPC as do-not-send evidence and drop every wallet.
+      if (isIndeterminateRpcError(e)) throw e;
       // Wrapped here so the rejection Promise.all reports is the estimate
       // failure, not whatever getFeeData happened to reject with.
       throw new Error(
@@ -67,8 +72,12 @@ export async function autoGas(
   const priorityFee = feeData.maxPriorityFeePerGas
     ? (feeData.maxPriorityFeePerGas * 110n) / 100n
     : 1_500_000_000n;
-  const base = feeData.maxFeePerGas;
-  const maxFee = base * 2n + priorityFee;
+  // `feeData.maxFeePerGas` is already the node's EIP-1559 suggestion — ethers
+  // derives it as roughly 2× the base fee plus the tip. Doubling it again asked
+  // the wallet to cover ~4× the base fee, which is the "unaffordable, never
+  // mines" failure this module's own header describes. One more tip on top of
+  // the node's suggestion is a snipe premium without the balance blow-up.
+  const maxFee = feeData.maxFeePerGas + priorityFee;
   return { gasLimit, maxPriorityFeePerGas: priorityFee, maxFeePerGas: maxFee };
 }
 
@@ -98,11 +107,12 @@ export async function autoGasBounded(
       }),
     ]);
   } catch (e: any) {
-    // A timeout means "could not tell" — the caller may fall back to a default.
-    // Anything else is a failed estimate, which is almost always a revert; the
-    // caller must treat that as "do not send", not as an inconclusive result.
-    // Swallowing both let a guaranteed revert through to the broadcast path.
-    if (e && /gas estimation timeout/.test(String(e.message))) return null;
+    // A timeout or a network failure means "could not tell" — the caller may
+    // fall back to a default. Anything else is a failed estimate, which is
+    // almost always a revert; the caller must treat that as "do not send", not
+    // as an inconclusive result. Swallowing both let a guaranteed revert
+    // through to the broadcast path, so the two are told apart here.
+    if (isIndeterminateRpcError(e)) return null;
     throw e;
   } finally {
     if (timer) clearTimeout(timer);

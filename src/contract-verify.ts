@@ -17,7 +17,8 @@
 // broadcasts anything.
 
 import { JsonRpcProvider } from "ethers";
-import { CHAINS, resolveChain } from "./chains";
+import { resolveChain } from "./chains";
+import { SEADROP_ADDRESS } from "./seadrop-public";
 
 // ── ERC165 interface IDs ────────────────────────────────────────────────────
 // ERC165 works by asking a contract "do you support interface X?" — the answer
@@ -37,19 +38,11 @@ export const ERC1155_METADATA_URI = "0x0e89341c";
 // cheaper and more certain than probing for behaviour.
 
 // SeaDrop has exactly one shared singleton (v1); v2 has no singleton address —
-// see mint-generic.ts. The address previously held by SEADROP_V1 was Seaport
-// 1.1, not SeaDrop.
-export const SEADROP_V1 = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
+// see mint-generic.ts. The address lives in seadrop-public.ts and is imported
+// rather than copied; a second literal here would drift from the one the mint
+// path actually targets.
+export const SEADROP_V1 = SEADROP_ADDRESS;
 export const SEADROP_V2 = SEADROP_V1;
-export const SEAPORT_1_1 = "0x00000000006c3852cbef3e08e8df289169ede581";
-
-/** Well-known token addresses that frequently appear in scraped page data. */
-export const KNOWN_TOKENS: Record<string, string> = {
-  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "WETH",
-  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "USDC",
-  "0xdac17f958d2ee523a2206206994575c13d831ec7": "USDT",
-  "0x6b175474e89094c44da98b954eedeac495271d0f": "DAI",
-};
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -83,7 +76,8 @@ export interface VerificationResult {
  */
 async function withProviderFailover<T>(
   chainId: number,
-  fn: (provider: JsonRpcProvider) => Promise<T>
+  fn: (provider: JsonRpcProvider) => Promise<T>,
+  timeoutMs = 20_000
 ): Promise<T> {
   const profile = resolveChain(chainId);
   const urls = profile?.rpc?.public ?? [];
@@ -91,17 +85,30 @@ async function withProviderFailover<T>(
     throw new Error(`No public RPC configured for chainId ${chainId}`);
   }
 
+  // ethers' FetchRequest default is 300s per call, so a failover loop over
+  // several endpoints had no ceiling at all. One deadline for the whole
+  // failover, spent per endpoint.
+  const deadline = Date.now() + timeoutMs;
   let lastErr: unknown;
   for (const url of urls) {
+    const remaining = deadline - Date.now();
+    if (remaining < 200) throw lastErr ?? new Error("contract verification timed out");
     const provider = new JsonRpcProvider(url, undefined, {
       staticNetwork: true,
       pollingInterval: 2000,
     });
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await fn(provider);
+      return await Promise.race([
+        fn(provider),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("RPC timeout")), remaining);
+        }),
+      ]);
     } catch (err) {
       lastErr = err;
     } finally {
+      if (timer) clearTimeout(timer);
       // ethers keeps a polling timer alive on every provider. Without an
       // explicit destroy the process never exits.
       try {
@@ -241,12 +248,14 @@ export async function detectStandardFallback(
   }
 
   // Last resort: name() exists on both standards but not on a plain wallet.
+  // Either way the standard is indeterminate — the call only distinguishes
+  // "some contract" from "nothing", and both branches reported the same thing.
   try {
     await provider.call({ to: address, data: "0x06fdde03" }); // name()
-    return { standard: "unknown", erc165Supported: false };
   } catch {
-    return { standard: "unknown", erc165Supported: false };
+    // No name() either — still a contract, still unknown.
   }
+  return { standard: "unknown", erc165Supported: false };
 }
 
 // ── Step 4: full verification ───────────────────────────────────────────────
@@ -357,44 +366,3 @@ async function verifyContractInner(
   };
 }
 
-// ── Multi-chain scan ────────────────────────────────────────────────────────
-
-/**
- * Try the chain the page indicated first, then every other configured chain.
- * An address that is a contract on Base and an EOA on Ethereum is a Base
- * contract — assuming Ethereum is how you scrape the wrong chain.
- */
-export async function verifyAcrossChains(
-  address: string,
-  preferredChainId?: number
-): Promise<VerificationResult> {
-  const order: number[] = [];
-  if (preferredChainId) order.push(preferredChainId);
-  for (const c of CHAINS) {
-    if (!order.includes(c.chainId)) order.push(c.chainId);
-  }
-
-  for (const chainId of order) {
-    try {
-      const result = await verifyContract(address, chainId);
-      if (result.isContract) return result;
-    } catch {
-      // No RPC for this chain, or it is down — try the next one.
-    }
-  }
-
-  return {
-    address,
-    chainId: preferredChainId ?? 0,
-    isContract: false,
-    standard: "unknown",
-    erc165Supported: false,
-    platform: "none",
-    reason: "not a contract on any configured chain",
-  };
-}
-
-/** True when the address is a known token (WETH/USDC/...) — not an NFT. */
-export function isKnownToken(address: string): string | null {
-  return KNOWN_TOKENS[address.toLowerCase()] ?? null;
-}

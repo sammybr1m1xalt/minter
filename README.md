@@ -326,7 +326,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | Module | Role |
 |---|---|
 | [`src/index.ts`](src/index.ts) | CLI entry — flag parsing, the three branches, provider cleanup |
-| [`src/chains.ts`](src/chains.ts) | Chain registry, provider cache, OpenSea chain mapping |
+| [`src/chains.ts`](src/chains.ts) | Chain registry and OpenSea chain mapping |
 | [`src/wizard.ts`](src/wizard.ts) | Interactive wizard (steps 1–17) |
 | [`src/wizard-fcfs-new.ts`](src/wizard-fcfs-new.ts) | `--fcfs` branch and `--eligibility` |
 | [`src/wizard-helpers.ts`](src/wizard-helpers.ts) | Gas prompt, balances, confirm, timing, sell plan/execution |
@@ -341,7 +341,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/contract-verify.ts`](src/contract-verify.ts) | The gate that makes the scanner safe — checks a candidate really is a contract |
 | [`src/sell-after-mint.ts`](src/sell-after-mint.ts) | Offer ranking, net-proceeds guard, Seaport calldata, sale orchestration |
 | [`src/seaport-abi.ts`](src/seaport-abi.ts) | Verified Seaport 1.5 / 1.6 ABIs (from Sourcify) |
-| [`src/opensea-key.ts`](src/opensea-key.ts) | API key pool — auto-mint, probe, rank, 7-day refresh |
+| [`src/opensea-key.ts`](src/opensea-key.ts) | API key pool — auto-mint, probe, rank, 3-day refresh |
 | [`src/opensea-session.ts`](src/opensea-session.ts) | SIWE session cookies per wallet |
 | [`src/session-store.ts`](src/session-store.ts) | Single source of truth for the on-disk session paths |
 | [`src/opensea-gql.ts`](src/opensea-gql.ts) | GraphQL queries and response parsing |

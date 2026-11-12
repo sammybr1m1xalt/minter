@@ -3,6 +3,8 @@
 // REST v2 is the primary path. GraphQL is a fallback when REST needs a key
 // that isn't available. Addresses (0x…) bypass slug resolution entirely.
 
+import { SEADROP_ADDRESS } from "./seadrop-public";
+
 const REST_URL = "https://api.opensea.io/api/v2/collections";
 const GQL_URL = "https://gql.opensea.io/graphql";
 
@@ -26,18 +28,17 @@ async function htmlScrapeCollection(slug: string, timeoutMs = 10000): Promise<{ 
     return null;
   }
 
-  // The page embeds several JSON payloads. The "contracts" block only carries
-  // chain info ({chain:{identifier}}), while the contract address lives in the
-  // collection payload as "address":"0x…". Anchor on that field instead.
-  const contractsBlock = html.match(/"contracts":\[[^\]]{0,500}\]/);
-  const chainM = contractsBlock ? contractsBlock[0].match(/"identifier":"([\w-]+)"/) : null;
-  // Prefer the address inside the contracts block — that is the collection's own
-  // contract. The first bare "address" anywhere in the page can belong to the
-  // owner, a fee recipient, or an unrelated collection embedded in the payload.
-  const addrInBlock = contractsBlock
-    ? contractsBlock[0].match(/"address":"(0x[a-fA-F0-9]{40})"/)
-    : null;
-  const addrM = addrInBlock || html.match(/"address":"(0x[a-fA-F0-9]{40})"/);
+  // Read only a bounded window starting at the "contracts" array. The first bare
+  // "address" anywhere in the page can belong to the owner, a fee recipient, or
+  // an unrelated collection embedded in the payload — and that fallback used to
+  // run whenever the contracts block yielded nothing, handing back an address
+  // with no provenance. Resolving the wrong contract means signing a mint
+  // against it, so an unprovenanced address is refused rather than used.
+  const contractsIdx = html.indexOf('"contracts":[');
+  if (contractsIdx < 0) return null;
+  const window = html.slice(contractsIdx, contractsIdx + 1500);
+  const addrM = window.match(/"address":"(0x[a-fA-F0-9]{40})"/);
+  const chainM = window.match(/"identifier":"([\w-]+)"/);
   if (!addrM || /^0x0+$/.test(addrM[1])) return null; // zero-address = placeholder
   return { address: addrM[1], chain: chainM ? chainM[1] : "ethereum" };
 }
@@ -212,8 +213,12 @@ export async function resolveSlug(
     };
   }
 
-  // 2. GraphQL — fallback when REST denied us (needs key we don't have)
-  if (!apiKey || !apiKey.trim()) {
+  // 2. GraphQL — fallback whenever REST left the slug unresolved. This used to
+  // be skipped entirely when an API key was present, on the assumption that a
+  // keyed REST call would succeed; a REST network failure or a key-scoped 403
+  // then went straight to the HTML scrape. This query is unauthenticated, so
+  // it is worth trying on any REST failure.
+  {
     const gql = await gqlCollectionBySlug(slug);
     if (gql?.address) {
       return {
@@ -258,7 +263,8 @@ export function isSlug(input: string): boolean {
 //
 // A singleton address can never identify a collection, so it is refused outright
 // rather than passed downstream.
-const SEADROP_SINGLETON = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
+// Single source of truth for the singleton address.
+const SEADROP_SINGLETON = SEADROP_ADDRESS;
 
 function isSyntheticSeDropSlug(slug: string, address: string): boolean {
   // <address>-<digits> is GraphQL's placeholder shape for a contract that is not
@@ -296,16 +302,10 @@ export async function resolveContractToSlug(
       if (json.errors && json.errors.length > 0) return null;
       const collection = (json.collection ?? json.slug) as string | undefined;
       if (collection) return collection;
-      // If it's a CA lookup that returned the collection object, also
-      // extract slug from contracts array as a fallback
-      const contracts = json.contracts;
-      if (Array.isArray(contracts) && contracts.length > 0) {
-        const c = contracts[0] as any;
-        const addr = (c.address as string) || "";
-        if (addr.toLowerCase() === nftContract.toLowerCase()) {
-          return collection ?? null;
-        }
-      }
+      // No slug field, so this was not a collection lookup. The contracts array
+      // cannot supply one either — it carries addresses, not slugs — and the
+      // block that used to read it returned `collection ?? null`, which at this
+      // point could only ever be null.
     }
   } catch (err: any) {
     console.error("[resolveContractToSlug] REST failed:", err?.message || err);

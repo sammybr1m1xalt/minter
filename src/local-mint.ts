@@ -43,9 +43,48 @@ export interface LocalSnipeOpts {
 
 interface NonceCheck {
   address: string;
-  nonce: number;
+  nonce: number | null;
   agreed: boolean;
   mismatched: string[];
+}
+
+/**
+ * Read the chain id from EVERY endpoint and take the majority value.
+ *
+ * `provider.getNetwork()` was used here, which pins the whole snipe to
+ * rpcUrls[0] with no timeout: a dead first endpoint hangs the run, and an
+ * ethers provider constructed with no network of its own throws instead of
+ * answering. The chainId is the one value every signed transaction depends
+ * on, so it must come from more than one source and the run must refuse when
+ * none of them answer.
+ */
+async function resolveChainId(rpcUrls: string[], timeoutMs = 4000): Promise<number | null> {
+  const values = await Promise.all(
+    rpcUrls.map(async (url) => {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "eth_chainId", params: [], id: 1 }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        const json = (await res.json()) as any;
+        if (json.result == null) return null;
+        const id = parseInt(json.result, 16);
+        return Number.isFinite(id) ? id : null;
+      } catch {
+        return null;
+      }
+    })
+  );
+  const readable = values.filter((v): v is number => v != null);
+  if (readable.length === 0) return null;
+  const counts = new Map<number, number>();
+  for (const v of readable) counts.set(v, (counts.get(v) ?? 0) + 1);
+  // Most-reported wins; a tie goes to the higher value, because a chainId
+  // disagreement means at least one endpoint is pointed at the wrong network
+  // and signing against the minority is the failure this avoids.
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0][0];
 }
 
 /**
@@ -72,7 +111,11 @@ async function resolveNonces(wallets: Wallet[], rpcUrls: string[]): Promise<Nonc
               signal: AbortSignal.timeout(4000),
             });
             const json = (await res.json()) as any;
-            perEndpoint.push({ url, nonce: json.result != null ? parseInt(json.result, 16) : null });
+            const parsed = json.result != null ? parseInt(json.result, 16) : null;
+            perEndpoint.push({
+              url,
+              nonce: parsed != null && Number.isFinite(parsed) ? parsed : null,
+            });
           } catch {
             perEndpoint.push({ url, nonce: null });
           }
@@ -84,6 +127,11 @@ async function resolveNonces(wallets: Wallet[], rpcUrls: string[]): Promise<Nonc
       // report. A lone endpoint claiming a higher nonce is the one most likely
       // to be ahead, and signing against it leaves every other endpoint rejecting
       // the tx as a stale nonce.
+      //
+      // No readable endpoint is NOT a nonce of 0: a wallet that has transacted
+      // before signed with 0 is rejected as "nonce too low" everywhere, and a
+      // guessed nonce can also collide with an in-flight tx. The caller refuses
+      // instead of signing it.
       const counts = new Map<number, number>();
       for (const n of nonces) counts.set(n, (counts.get(n) ?? 0) + 1);
       const agreed = [...counts.entries()]
@@ -91,7 +139,7 @@ async function resolveNonces(wallets: Wallet[], rpcUrls: string[]): Promise<Nonc
         .map(([n]) => n);
       const highest = agreed.length > 0
         ? Math.max(...agreed)
-        : (nonces.length > 0 ? Math.max(...nonces) : 0);
+        : (nonces.length > 0 ? Math.max(...nonces) : null);
       // "agreed" is true only when every readable endpoint reported the same value.
       const unanimous = nonces.length > 0 && new Set(nonces).size === 1;
       return {
@@ -143,6 +191,26 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
     // See resolveNonces for why a single-endpoint read is not enough.
     const nonceChecks = await resolveNonces(wallets, rpcUrls);
 
+    const unknownNonce = nonceChecks.filter((c) => c.nonce == null);
+    if (unknownNonce.length > 0) {
+      console.log(
+        chalk.bold.red(
+          `\n  ✗ No RPC would answer eth_getTransactionCount for ${unknownNonce.length} wallet(s) — refusing to sign.`
+        )
+      );
+      console.log(
+        chalk.gray(
+          "    A guessed nonce is rejected as \"nonce too low\" everywhere, or collides with a tx already in flight."
+        )
+      );
+      return wallets.map((w, i) => ({
+        walletIndex: i,
+        address: w.address,
+        txHash: null,
+        status: "REJECTED" as const,
+      }));
+    }
+
     // If endpoints disagree, warn but proceed with highest nonce — the blast will
     // tell us which endpoints accepted. We do NOT refuse to fire, because refusing
     // loses the mint; the blast + receipt poll is the real signal.
@@ -155,9 +223,20 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
       console.log(chalk.gray(`  If your txs are rejected as "nonce too low", a wallet was active on another endpoint.` + "\n"));
     }
 
-    const nonces = nonceChecks.map((c) => c.nonce);
-    const network = await provider.getNetwork();
-    const chainId = network.chainId;
+    const nonces = nonceChecks.map((c) => c.nonce!);
+    const chainId = await resolveChainId(rpcUrls);
+    if (chainId == null) {
+      console.log(chalk.bold.red("\n  ✗ No RPC would answer eth_chainId — refusing to sign."));
+      console.log(
+        chalk.gray("    Signing without a chainId would put every transaction on the wrong network.")
+      );
+      return wallets.map((w, i) => ({
+        walletIndex: i,
+        address: w.address,
+        txHash: null,
+        status: "REJECTED" as const,
+      }));
+    }
     console.log(chalk.gray(`  Nonces: [${nonces.join(", ")}] | chainId: ${chainId}`));
 
     // ── Price protection ────────────────────────────────────────────────────
@@ -414,13 +493,17 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
     const freshChecks = await resolveNonces(wallets, rpcUrls);
     let reSigned = 0;
     for (let i = 0; i < freshChecks.length; i++) {
-      const nonceMoved = freshChecks[i].nonce !== nonces[i];
+      const freshNonce = freshChecks[i].nonce;
+      // A nonce we cannot read is not a nonce that moved. Keep the original
+      // signature rather than signing against a guess.
+      if (freshNonce == null) continue;
+      const nonceMoved = freshNonce !== nonces[i];
       if (!planChanged && !nonceMoved) continue;
       const rawTx = await wallets[i].signTransaction({
         to: activePlan.to,
         data: activePlan.data,
         value: activePlan.value,
-        nonce: freshChecks[i].nonce,
+        nonce: freshNonce,
         maxFeePerGas: estimatedMaxFee,
         maxPriorityFeePerGas: estimatedPriority,
         gasLimit: estimatedGasLimit,
@@ -512,8 +595,10 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
 
     // We know which wallet fired which txHash. The blast results are matched by
     // index to `fired`, and `accepted` carries the `idx` so we can find the
-    // endpoint that accepted each tx. Poll that endpoint first; fall back to
-    // rpcUrls[0] if the poll fails or times out.
+    // endpoint that accepted each tx. Poll that endpoint FIRST, then every
+    // other one — the comment used to promise a fallback to rpcUrls[0] that the
+    // code never performed, so a landed mint was reported UNKNOWN whenever the
+    // single polled node fell over.
     const receiptPolls = await Promise.all(
       accepted.map(async ({ idx, txHash }) => {
         const firing = fired[idx];
@@ -530,7 +615,8 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
             if (ep) url = ep.url;
           }
         }
-        return waitForReceipt(txHash, url, 60_000);
+        const ordered = [url, ...rpcUrls.filter((u) => u !== url)];
+        return waitForReceipt(txHash, ordered, 60_000);
       })
     );
 

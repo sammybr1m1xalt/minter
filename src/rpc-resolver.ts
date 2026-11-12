@@ -8,9 +8,10 @@
 //   2. RPC_URL + EXTRA_RPC_URLS — only when CHAIN in .env matches the selection
 //   3. the public endpoints in src/chains.ts
 //
-// (verifyChainId was removed — chain confirmation is done inline now)
+// Chain confirmation happens inline: planRpcs() probes every endpoint for
+// eth_chainId and drops any that report a different network.
 
-import { ChainProfile, resolveChain } from "./chains";
+import { resolveChain } from "./chains";
 
 interface ResolvedRpcs {
   urls: string[];
@@ -27,26 +28,6 @@ function splitList(raw: string | undefined): string[] {
 
 function dedupe(urls: string[]): string[] {
   return [...new Set(urls)];
-}
-
-// Does this URL obviously belong to this chain? Providers encode the network in
-// the hostname (base-mainnet.g.alchemy.com), which lets a single RPC_URL be
-// matched to the right chain even when CHAIN is unset.
-function urlMatchesChain(url: string, profile: ChainProfile): boolean {
-  let host: string;
-  try {
-    host = new URL(url).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
-  if (profile.rpc.alchemyHost && host === profile.rpc.alchemyHost.toLowerCase()) return true;
-  return profile.rpc.public.some((p) => {
-    try {
-      return new URL(p).hostname.toLowerCase() === host;
-    } catch {
-      return false;
-    }
-  });
 }
 
 // Private endpoints already configured in .env for this chain, if any.

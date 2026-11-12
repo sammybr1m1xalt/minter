@@ -35,7 +35,11 @@ import * as path from "path";
 const PACKAGE_ROOT = path.resolve(__dirname, "..");
 
 const KEY_CACHE_DIR = (() => {
-  const explicit = process.env.OPENSEA_SESSION_DIR?.trim();
+  // OPENSEA_KEY_DIR is the honest name. OPENSEA_SESSION_DIR is still honoured
+  // for back-compat — older builds pointed a variable called "session" at the
+  // key pool, and silently moving the pool would orphan every cached key.
+  const explicit =
+    process.env.OPENSEA_KEY_DIR?.trim() || process.env.OPENSEA_SESSION_DIR?.trim();
   if (explicit) return explicit;
   // Project-local by default. .gitignore already excludes .minter-cache/, and
   // keeping it beside the code makes it obvious where the plaintext keys live.
@@ -807,7 +811,10 @@ export async function getValidApiKey(
       updated.times_used += 1;
       updated.last_used_at = new Date().toISOString();
       if (updated.remaining_calls > 0) updated.remaining_calls -= 1;
-      saveKeyPool(cachedKeys.map((e) => (e.api_key === result.entry.api_key ? updated : e)));
+      // Read the pool back rather than mapping the pre-probe snapshot: pickBestKey
+      // already saved this pass's verdicts, and writing the snapshot over them
+      // discarded every other key's fresh status, score and remaining_calls.
+      saveKeyPool(loadKeyPool().map((e) => (e.api_key === result.entry.api_key ? updated : e)));
       syncEnvKey(result.entry.api_key);
       return { api_key: result.entry.api_key, source: `cached (re-probed: ${result.entry.last_probe})` };
     }

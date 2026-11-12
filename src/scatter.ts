@@ -13,9 +13,6 @@
 
 const SCATTER_API = "https://api.scatter.art/v1";
 
-/** Sentinel the contract uses for "unlimited" wallet/list limits (uint32 max). */
-export const SCATTER_UNLIMITED = 4294967295;
-
 const NATIVE = "0x0000000000000000000000000000000000000000";
 
 export interface ScatterCollection {
@@ -55,7 +52,7 @@ export async function getScatterCollection(
   timeoutMs = 15_000
 ): Promise<ScatterCollection | null> {
   try {
-    // Unbounded: a stalled API would hang the mint path indefinitely.
+    // Bounded: a stalled API must not hang the mint path.
     const r = await fetch(`${SCATTER_API}/collection/${encodeURIComponent(slug)}`, {
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -115,7 +112,12 @@ export function isNativeList(list: ScatterList): boolean {
 export function pickBestList(lists: ScatterList[]): ScatterList | null {
   if (!lists.length) return null;
   const priced = lists
-    .map((l) => ({ list: l, price: Number(l.token_price ?? 0), native: isNativeList(l) }))
+    .map((l) => {
+      // Number() maps an oversized price string to Infinity, which would sort
+      // first as "cheapest". Read it as a finite number or treat it as unknown.
+      const n = Number(l.token_price ?? 0);
+      return { list: l, price: Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER, native: isNativeList(l) };
+    })
     .sort((a, b) => {
       if (a.native !== b.native) return a.native ? -1 : 1; // native first
       if (a.price !== b.price) return a.price - b.price; // cheapest first
@@ -173,4 +175,3 @@ export async function buildScatterMint(args: {
   };
 }
 
-export const SCATTER_NATIVE_SENTINEL = NATIVE;

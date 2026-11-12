@@ -186,13 +186,19 @@ export function blastToAll(
     // within escalateAfterMs. A slow tail must not delay the endpoints most
     // likely to include the transaction.
     const first = fire(wave1);
-    const timer = new Promise<"timeout">((resolve) =>
-      setTimeout(() => resolve("timeout"), escalateAfterMs)
-    );
-    const outcome = await Promise.race([
-      first.then(() => "settled" as const),
-      timer,
-    ]);
+    // The escalation timer must not outlive the race. When the first wave
+    // settles first, an un-cleared handle keeps the event loop open for the
+    // whole escalateAfterMs — the same defect settleRanking had.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), escalateAfterMs);
+    });
+    let outcome: "settled" | "timeout";
+    try {
+      outcome = await Promise.race([first.then(() => "settled" as const), timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
 
     if (outcome === "settled") {
       if (results.some((r) => r != null && r.txHash != null)) return finalize();
@@ -221,89 +227,114 @@ export function parseHexQuantity(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * Parse a hex gas-price field. A raw `BigInt(receipt.effectiveGasPrice)` throws
+ * on anything malformed, and the throw discarded a perfectly good receipt —
+ * turning a landed mint into UNKNOWN. null means "not usable".
+ */
+export function parseGasPrice(value: unknown): bigint | null {
+  if (value == null || value === "") return null;
+  try {
+    return BigInt(value as string);
+  } catch {
+    return null;
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 // Poll for a receipt with timeout. Used by both paths.
+//
+// Accepts one URL or several. Polling a single endpoint meant a slow or dead
+// node reported a landed mint as UNKNOWN even when the caller had other
+// working endpoints; the confirmation sweep already polls all of them, and the
+// two paths disagreed.
 export async function waitForReceipt(
   txHash: string,
-  rpcUrl: string,
+  rpcUrlOrUrls: string | string[],
   timeoutMs: number = 60000
 ): Promise<{ block: number | null; position: number | null; gasUsed: number | null; status: string; actualGasPrice?: bigint } | null> {
+  const rpcUrls = (Array.isArray(rpcUrlOrUrls) ? rpcUrlOrUrls : [rpcUrlOrUrls]).filter(Boolean);
+  if (rpcUrls.length === 0) return null;
+
   const start = Date.now();
   let lastError: string | undefined;
+  // "Mined, but no node will hand us a receipt" is a real state (a node still
+  // indexing its latest blocks). It is not a reason to keep polling for the
+  // whole budget, so it gets a short grace of its own and then reports UNKNOWN.
+  const MINED_GRACE_MS = 10_000;
+  let minedNoReceiptSince: number | null = null;
 
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
-      const res = await fetch(rpcUrl, {
+  const post = (url: string, method: string) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    return {
+      promise: fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          method: "eth_getTransactionReceipt",
-          params: [txHash],
-          id: 1,
-        }),
+        body: JSON.stringify({ jsonrpc: "2.0", method, params: [txHash], id: 1 }),
         signal: controller.signal,
-      });
-      clearTimeout(timer);
+      }).then((r) => r.json() as any).catch(() => null),
+      cancel: () => clearTimeout(timer),
+    };
+  };
 
-      const json = (await res.json()) as any;
-      const receipt = json.result;
-      if (receipt) {
-        const gasUsed = parseHexQuantity(receipt.gasUsed);
-        const effectiveGasPrice = receipt.effectiveGasPrice
-          ? BigInt(receipt.effectiveGasPrice)
-          : undefined;
-        return {
-          block: parseHexQuantity(receipt.blockNumber),
-          position: parseHexQuantity(receipt.transactionIndex),
-          gasUsed,
-          // A missing status is a pre-Byzantium receipt: the tx was included,
-          // so it succeeded. Only an explicit 0x0 is a revert.
-          status: receipt.status === "0x0" ? "REVERTED" : "SUCCESS",
-          actualGasPrice: effectiveGasPrice,
-        };
+  while (Date.now() - start < timeoutMs) {
+    // Ask EVERY endpoint in parallel, then take the first receipt. A hung
+    // endpoint cannot hold the poll: each request is bounded individually, and
+    // the loop's own deadline is checked between iterations.
+    const receiptCalls = rpcUrls.map((url) => post(url, "eth_getTransactionReceipt"));
+    const receiptAnswers = await Promise.all(receiptCalls.map((c) => c.promise));
+    for (const c of receiptCalls) c.cancel();
+    const receipt = receiptAnswers.find((j) => j?.result != null)?.result;
+
+    if (receipt) {
+      const effectiveGasPrice = parseGasPrice(receipt.effectiveGasPrice);
+      return {
+        block: parseHexQuantity(receipt.blockNumber),
+        position: parseHexQuantity(receipt.transactionIndex),
+        gasUsed: parseHexQuantity(receipt.gasUsed),
+        // A missing status is a pre-Byzantium receipt: the tx was included,
+        // so it succeeded. Only an explicit 0x0 is a revert.
+        status: receipt.status === "0x0" ? "REVERTED" : "SUCCESS",
+        actualGasPrice: effectiveGasPrice ?? undefined,
+      };
+    }
+
+    // No receipt anywhere. Is the tx mined, pending, or absent?
+    const txCalls = rpcUrls.map((url) => post(url, "eth_getTransactionByHash"));
+    const txAnswers = await Promise.all(txCalls.map((c) => c.promise));
+    for (const c of txCalls) c.cancel();
+    const tx = txAnswers.find((j) => j?.result != null)?.result;
+
+    if (tx && tx.blockNumber === null) {
+      // Still pending — keep polling.
+      await sleep(1000);
+      continue;
+    }
+    if (tx && tx.blockNumber !== null) {
+      // Mined, but no receipt. UNKNOWN is the honest verdict — the tx may have
+      // landed, so it must not be reported as a failure. Give a node that is
+      // still indexing a short grace, then stop rather than burning the budget.
+      if (minedNoReceiptSince == null) {
+        minedNoReceiptSince = Date.now();
+        lastError = `mined in block ${parseHexQuantity(tx.blockNumber) ?? "?"} but no receipt returned`;
       }
-      // Receipt not found — check if the tx itself exists (pending/dropped).
-      // This fetch MUST be bounded too. The loop's `timeoutMs` is checked
-      // between iterations; a fetch that hangs inside an iteration bypasses it
-      // entirely, so an RPC that accepts the connection and then stalls would
-      // hang the receipt poll forever.
-      const txController = new AbortController();
-      const txTimer = setTimeout(() => txController.abort(), 3000);
-      let txJson: any;
-      try {
-        const txRes = await fetch(rpcUrl, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            method: "eth_getTransactionByHash",
-            params: [txHash],
-            id: 1,
-          }),
-          signal: txController.signal,
-        });
-        txJson = (await txRes.json()) as any;
-      } catch {
-        // Treat a failed lookup as "not found yet" and keep polling.
-        txJson = null;
-      } finally {
-        clearTimeout(txTimer);
-      }
-      const tx = txJson?.result;
-      if (tx && tx.blockNumber === null) {
-        // Still pending — keep polling
-        await new Promise((r) => setTimeout(r, 1000));
+      if (Date.now() - minedNoReceiptSince < MINED_GRACE_MS) {
+        await sleep(1000);
         continue;
       }
-      // Not found at all
-      lastError = "tx not found";
-      await new Promise((r) => setTimeout(r, 1500));
-    } catch (err: any) {
-      lastError = err.message;
-      await new Promise((r) => setTimeout(r, 1500));
+      console.log(
+        chalk.yellow(
+          `  [${txHash.slice(0, 10)}…] mined but no receipt after ${MINED_GRACE_MS / 1000}s — reporting UNKNOWN (last: ${lastError})`
+        )
+      );
+      return null;
     }
+
+    // Not found at all
+    lastError = "tx not found";
+    await sleep(1500);
   }
 
   console.log(chalk.yellow(`  [${txHash.slice(0, 10)}…] TIMEOUT after ${timeoutMs/1000}s — no receipt, last error: ${lastError}`));

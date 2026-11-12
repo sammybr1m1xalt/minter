@@ -35,9 +35,8 @@
 
 import { JsonRpcProvider, Interface } from "ethers";
 import type { DropPhase } from "./fcfs-drops";
-import { OPENSEA_FEE_RECIPIENT } from "./seadrop-public";
-
-const SEADROP = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
+import { CHAINS } from "./chains";
+import { OPENSEA_FEE_RECIPIENT, SEADROP_ADDRESS } from "./seadrop-public";
 
 // ── Minimal ABI: only the read functions we actually call ──────────────────
 const ABI = [
@@ -92,57 +91,56 @@ const ABI = [
 
 const IFACE = new Interface(ABI);
 
-const RPC_URLS_PUBLIC = [
-  "https://ethereum.publicnode.com",
-  "https://rpc.ankr.com/eth",
-  "https://cloudflare-eth.com",
-];
+// Per-chain public RPCs, DERIVED from the chain registry rather than copied.
+// The SeaDrop singleton is deployed on every network, so the probe must go to
+// the chain the collection lives on — an Ethereum RPC returns empty data for a
+// Base drop, which silently looks like "no phases". A hand-maintained second
+// list is how Arc was missed: an Arc collection probed Ethereum's SeaDrop and
+// reported no phases for a drop that plainly had them. Adding a chain to
+// chains.ts now adds it here.
+const RPC_URLS_BY_CHAIN: Record<string, string[]> = Object.fromEntries(
+  CHAINS.map((c) => [
+    c.key,
+    // Send-only sequencer endpoints accept eth_sendRawTransaction but reject
+    // eth_blockNumber/eth_call, so probing them only burns the probe budget.
+    c.rpc.public.filter((u) => !u.includes("sequencer.")),
+  ])
+);
 
-// Per-chain public RPCs. The SeaDrop singleton is deployed on every network,
-// so the probe must go to the chain the collection lives on — an Ethereum RPC
-// returns empty data for a Base drop, which silently looks like "no phases".
-const RPC_URLS_BY_CHAIN: Record<string, string[]> = {
-  ethereum: RPC_URLS_PUBLIC,
-  base: [
-    "https://mainnet.base.org",
-    "https://base-rpc.publicnode.com",
-  ],
-  robinhood: [
-    "https://rpc.mainnet.chain.robinhood.com",
-  ],
-  soneium: [
-    "https://rpc.soneium.org",
-    "https://soneium-rpc.publicnode.com",
-  ],
-  // Arc (chainId 5042) is in CHAINS but was missing here, so rpcUrlsForChain
-  // fell back to the Ethereum list and an Arc collection probed Ethereum's
-  // SeaDrop — returning no phases for a drop that plainly had them.
-  arc: [
-    "https://rpc.mainnet.arc.io",
-    "https://rpc.drpc.mainnet.arc.io",
-  ],
-};
+const DEFAULT_RPC_URLS = RPC_URLS_BY_CHAIN.ethereum;
 
 // Use .env RPC first if configured (private, faster), then fall back to public
 function rpcUrlsForChain(chainKey?: string): string[] {
   const key = (chainKey || "ethereum").trim().toLowerCase();
   const envVar = `RPC_URL_${key.toUpperCase()}`;
   const envRpc = process.env[envVar];
-  const publics = RPC_URLS_BY_CHAIN[key] ?? RPC_URLS_PUBLIC;
+  const publics = RPC_URLS_BY_CHAIN[key] ?? DEFAULT_RPC_URLS;
   if (envRpc && envRpc.trim()) {
     return [envRpc.trim(), ...publics];
   }
   return publics;
 }
 
-async function getProvider(chainKey?: string): Promise<JsonRpcProvider | null> {
+async function getProvider(
+  chainKey?: string,
+  probeTimeoutMs: number | (() => number) = 4000
+): Promise<JsonRpcProvider | null> {
   for (const url of rpcUrlsForChain(chainKey)) {
     const p = new JsonRpcProvider(url, undefined, { staticNetwork: true });
     try {
+      // Drawn per endpoint. A single fixed budget is multiplied by the number
+      // of endpoints, so three dead URLs cost 3× the caller's whole deadline.
+      const budget = typeof probeTimeoutMs === "function" ? probeTimeoutMs() : probeTimeoutMs;
+      if (budget < 200) return null;
+      let probeTimer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
         p.getBlockNumber(),
-        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 4000)),
-      ]);
+        new Promise<never>((_, rej) => {
+          probeTimer = setTimeout(() => rej(new Error("timeout")), budget);
+        }),
+      ]).finally(() => {
+        if (probeTimer) clearTimeout(probeTimer);
+      });
       return p;
     } catch {
       // This endpoint failed its probe — destroy it before trying the next, or
@@ -184,7 +182,7 @@ async function fetchPublicDrop(
   nftContract: string,
 ): Promise<DropPhase | null> {
   const data = IFACE.encodeFunctionData("getPublicDrop", [nftContract]);
-  const result = await provider.send("eth_call", [{ to: SEADROP, data }, "latest"]);
+  const result = await provider.send("eth_call", [{ to: SEADROP_ADDRESS, data }, "latest"]);
   if (!result || result === "0x") return null;
 
   const d = IFACE.decodeFunctionResult("getPublicDrop", result);
@@ -205,7 +203,7 @@ async function fetchPublicDrop(
     let allowed: string[] = [];
     try {
       const feeData = await provider.send("eth_call", [
-        { to: SEADROP, data: IFACE.encodeFunctionData("getAllowedFeeRecipients", [nftContract]) },
+        { to: SEADROP_ADDRESS, data: IFACE.encodeFunctionData("getAllowedFeeRecipients", [nftContract]) },
         "latest",
       ]);
       if (feeData && feeData !== "0x") {
@@ -247,7 +245,7 @@ async function fetchPublicDrop(
     allowlistedAddresses: [],
     allowlistHash: null,
     raw: { source: "onchain_public" },
-    isPublicStage: true,
+    isPublicStage: isPublic,
     eligiblePrice: null,
   };
 }
@@ -267,11 +265,11 @@ async function fetchAllowlistPhase(
 ): Promise<DropPhase | null> {
   const [merkleRootRaw, feeRecipientsRaw] = await Promise.all([
     provider.send("eth_call", [
-      { to: SEADROP, data: IFACE.encodeFunctionData("getAllowListMerkleRoot", [nftContract]) },
+      { to: SEADROP_ADDRESS, data: IFACE.encodeFunctionData("getAllowListMerkleRoot", [nftContract]) },
       "latest",
     ]),
     provider.send("eth_call", [
-      { to: SEADROP, data: IFACE.encodeFunctionData("getAllowedFeeRecipients", [nftContract]) },
+      { to: SEADROP_ADDRESS, data: IFACE.encodeFunctionData("getAllowedFeeRecipients", [nftContract]) },
       "latest",
     ]),
   ]);
@@ -350,7 +348,7 @@ async function fetchTokenGatedPhase(
 ): Promise<DropPhase | null> {
   try {
     const data = IFACE.encodeFunctionData("getTokenGatedDrop", [nftContract, nftContract]);
-    const result = await provider.send("eth_call", [{ to: SEADROP, data }, "latest"]);
+    const result = await provider.send("eth_call", [{ to: SEADROP_ADDRESS, data }, "latest"]);
     if (!result || result === "0x") return null;
 
     const d = IFACE.decodeFunctionResult("getTokenGatedDrop", result);
@@ -401,7 +399,13 @@ export async function fetchOnChainDrops(
   timeoutMs = 10000,
   chainKey?: string,
 ): Promise<DropPhase[]> {
-  const provider = await getProvider(chainKey);
+  // The budget covers endpoint discovery too — getProvider probes sequentially,
+  // so an unbounded probe per URL multiplies the caller's deadline by the number
+  // of endpoints.
+  const discoveryDeadline = Date.now() + timeoutMs;
+  const provider = await getProvider(chainKey, () =>
+    Math.max(200, Math.min(4000, discoveryDeadline - Date.now()))
+  );
   if (!provider) return [];
 
   // timeoutMs must bound the whole discovery. The individual eth_calls carry
@@ -457,29 +461,45 @@ export async function fetchOnChainDrops(
 
 export async function fetchSingleOnChainDrop(
   nftContract: string,
-  _timeoutMs = 10000,
+  timeoutMs = 10000,
   chainKey?: string,
 ): Promise<DropPhase | null> {
-  const provider = await getProvider(chainKey);
+  // The caller's budget covers the WHOLE call, including endpoint discovery.
+  // getProvider probes endpoints sequentially, so unless it is handed the
+  // remaining time it can spend N × probeTimeout before the race even starts.
+  const deadline = Date.now() + timeoutMs;
+  const provider = await getProvider(chainKey, () =>
+    Math.max(200, Math.min(4000, deadline - Date.now()))
+  );
   if (!provider) return null;
 
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    // Try public drop first (most common / most likely to be targetable)
-    const publicDrop = await fetchPublicDrop(provider, nftContract);
-    if (publicDrop) return publicDrop;
-
-    // Then allowlist
-    const allowlist = await fetchAllowlistPhase(provider, nftContract);
-    if (allowlist) return allowlist;
-
-    // Then token-gated
-    const tg = await fetchTokenGatedPhase(provider, nftContract);
-    if (tg) return tg;
-
+    // Run the three probes together rather than sequentially, and stop at the
+    // first that returns data (array order = priority: public, allowlist,
+    // token-gated). The previous sequential version carried no bound at all —
+    // `timeoutMs` was accepted and ignored, so a stalled RPC hung the wizard's
+    // fallback path indefinitely.
+    const probes = [
+      fetchPublicDrop(provider, nftContract),
+      fetchAllowlistPhase(provider, nftContract),
+      fetchTokenGatedPhase(provider, nftContract),
+    ];
+    const results = await Promise.race([
+      Promise.allSettled(probes),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()));
+      }),
+    ]);
+    if (results == null) return null;
+    for (const r of results) {
+      if (r.status === "fulfilled" && r.value) return r.value;
+    }
     return null;
   } catch {
     return null;
   } finally {
+    if (timer) clearTimeout(timer);
     try {
       provider.destroy();
     } catch {

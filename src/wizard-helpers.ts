@@ -53,24 +53,12 @@ export async function promptGasGwei(
   envMaxFeeOverride?: number,
   envPriorityOverride?: number,
 ): Promise<{ maxFeePerGasWei: bigint; maxPriorityFeePerGasWei: bigint; defaultGasLimit: number }> {
-  const provider = new (await import("ethers")).JsonRpcProvider(rpcUrls[0]);
-
   console.log(chalk.bold.white("\nGas"));
 
   const envMaxFee = envMaxFeeOverride ?? Number(process.env.MAX_FEE_PER_GAS || (chainProfile.key === "ethereum" ? 80 : 2));
   const envPriority = envPriorityOverride ?? Number(process.env.MAX_PRIORITY_FEE || (chainProfile.key === "ethereum" ? 5 : 0.05));
 
-  let baseFeeGwei: number | null = null;
-  try {
-    baseFeeGwei = await currentBaseFeeGwei(provider);
-  } catch {}
-  // The provider is only needed for that one read. Without an explicit destroy
-  // its polling timer keeps the process alive after the wizard finishes.
-  try {
-    provider.destroy();
-  } catch {
-    // Already destroyed.
-  }
+  const baseFeeGwei = await currentBaseFeeGwei(rpcUrls);
 
   console.log(chalk.gray(`  Network base fee right now: ${(baseFeeGwei ?? 0).toFixed(6)} gwei`));
 
@@ -93,12 +81,38 @@ export async function promptGasGwei(
   };
 }
 
-// Same base-fee helper, in case callers need it outside promptGasGwei.
-async function currentBaseFeeGwei(provider: any): Promise<number | null> {
-  const block = await provider.getBlock("latest");
-  const baseFee = block.baseFeePerGas;
-  if (!baseFee) return null;
-  return Number(baseFee) / 1e9;
+/**
+ * Read the latest block's base fee from the first endpoint that answers.
+ *
+ * This used to build a JsonRpcProvider against rpcUrls[0] with no timeout and no
+ * chainId: a dead first endpoint hung the prompt, and the provider's polling
+ * timer kept the process alive after the wizard finished. A raw call is bounded
+ * and falls through to the next endpoint.
+ */
+async function currentBaseFeeGwei(rpcUrls: string[]): Promise<number | null> {
+  for (const url of rpcUrls) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "eth_getBlockByNumber",
+          params: ["latest", false],
+          id: 1,
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      const json = (await res.json()) as any;
+      const base = json?.result?.baseFeePerGas;
+      if (base == null) continue;
+      const gwei = parseInt(base, 16) / 1e9;
+      if (Number.isFinite(gwei) && gwei > 0) return gwei;
+    } catch {
+      // Try the next endpoint.
+    }
+  }
+  return null;
 }
 
 function gweiToWei(gwei: number): bigint {
@@ -135,7 +149,9 @@ export function displayBalances(input: SnipeReadyInput): { shortCount: number; p
       .reduce((a, b) => (a === null || b < a ? b : a), null as bigint | null);
 
     const requiredWithoutMint = required - input.valuePerWallet;
-    const affordable = poorerBalance !== null && requiredWithoutMint > 0n
+    // gasLimit is a divisor here. A zero would throw a RangeError out of the
+    // display path and abort the wizard after the user already committed.
+    const affordable = poorerBalance !== null && requiredWithoutMint > 0n && input.gasLimit > 0
       ? Number(requiredWithoutMint / BigInt(input.gasLimit)) / 1e9
       : null;
 
@@ -291,7 +307,10 @@ export async function planSellAfterMint(ctx: SellPromptContext): Promise<SellPla
   const usd = await fetchUsdPrice(ctx.chainKey, ctx.apiKey).catch(() => null);
   const estProvider = new JsonRpcProvider(ctx.rpcUrl, undefined, { staticNetwork: true });
   let base: bigint | null = null;
-  let tip = 0n;
+  // The tip is READ, not defaulted. It used to fall back to 0n when getFeeData()
+  // failed, which made the cost floor LOWER than reality — the one direction a
+  // guard must never err in.
+  let tip: bigint | null = null;
   try {
     const latest = await estProvider.getBlock("latest").catch(() => null);
     const feeData = await estProvider.getFeeData().catch(() => null);
@@ -301,18 +320,19 @@ export async function planSellAfterMint(ctx: SellPromptContext): Promise<SellPla
     // floor silently blocks profitable sales — the number has to be right, and
     // liveGasQuote in sell-after-mint.ts already avoids this exact mistake.
     base = latest?.baseFeePerGas != null && latest.baseFeePerGas > 0n ? latest.baseFeePerGas : null;
-    tip = feeData?.maxPriorityFeePerGas ?? 0n;
+    tip = feeData?.maxPriorityFeePerGas ?? null;
   } finally {
     try { estProvider.destroy(); } catch { /* already destroyed */ }
   }
 
-  // Without a live base fee there is no honest quote. The previous fallback
-  // produced a zero cost, which reported "$0.00" and set a cost floor of just
-  // the mint price — a failed read presenting itself as a free sale, letting any
-  // offer through. Refuse instead.
-  if (base == null) {
-    console.log(chalk.yellow("\n  ⚠ Could not read the live base fee — no sell gas quote is available."));
-    console.log(chalk.gray("    Sell-after-mint needs a fee read to set a safe cost floor."));
+  // Without a live base fee AND a live tip there is no honest quote. The
+  // previous fallback produced a zero cost, which reported "$0.00" and set a
+  // cost floor of just the mint price — a failed read presenting itself as a
+  // free sale, letting any offer through. Refuse instead.
+  if (base == null || tip == null) {
+    const what = base == null ? "base fee" : "priority fee";
+    console.log(chalk.yellow(`\n  ⚠ Could not read the live ${what} — no sell gas quote is available.`));
+    console.log(chalk.gray("    Sell-after-mint needs both reads to set a safe cost floor."));
     console.log(chalk.gray("    Re-run when the RPC is reachable."));
     return null;
   }

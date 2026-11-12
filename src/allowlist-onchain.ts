@@ -1,7 +1,5 @@
 // ── SeaDrop allowlist / merkle-proof resolution ────────────────────────────
 //
-// 
-//
 // The TS port had NO allowlist resolution at all. It could detect that an
 // allowlist phase existed (a non-zero merkle root) but could never obtain the
 // proof needed to mint it — so every allowlist stage was reported as
@@ -52,23 +50,45 @@ export async function fetchAllowListUri(
     zeroPadValue(getAddress(nftContract), 32),
   ];
 
-  let logs: any[];
+  // A single fromBlock:0 scan is refused by most RPCs (Infura and Alchemy cap
+  // eth_getLogs ranges), and the catch-all was a false negative: it reported
+  // "no allowlist" for a drop whose tree was perfectly reachable. Walk
+  // backwards from the latest block in bounded chunks instead, and stop at the
+  // first hit. A URI is set when the drop is configured — hours before the
+  // mint — so a few days of history is more than enough.
+  const CHUNK = 10_000;
+  const MAX_CHUNKS = 24; // ~4 days on Ethereum
+  let latest: number;
   try {
-    logs = await provider.getLogs({ address: seadropAddr, topics, fromBlock: 0, toBlock: "latest" });
+    latest = await provider.getBlockNumber();
   } catch {
-    // RPC block-range limits, etc. — treat as unknown rather than throwing.
     return null;
   }
-  if (!logs || logs.length === 0) return null;
 
   const iface = new Interface(ALLOWLIST_EVENT_ABI);
-  const last = logs[logs.length - 1]; // most recent update wins
-  try {
-    const parsed = iface.parseLog(last as any);
-    return normalizeUri(parsed?.args?.allowListURI);
-  } catch {
-    return null;
+  for (let i = 0; i < MAX_CHUNKS; i++) {
+    const toBlock = latest - i * CHUNK;
+    const fromBlock = Math.max(0, toBlock - CHUNK + 1);
+    let logs: any[];
+    try {
+      logs = await provider.getLogs({ address: seadropAddr, topics, fromBlock, toBlock });
+    } catch {
+      // This endpoint caps the range harder than assumed. A smaller chunk may
+      // still work, so keep walking rather than reporting "no allowlist".
+      continue;
+    }
+    if (logs.length > 0) {
+      const last = logs[logs.length - 1]; // most recent update wins
+      try {
+        const parsed = iface.parseLog(last as any);
+        return normalizeUri(parsed?.args?.allowListURI);
+      } catch {
+        return null;
+      }
+    }
+    if (fromBlock === 0) break;
   }
+  return null;
 }
 
 interface AllowlistEntry {
@@ -123,15 +143,31 @@ export async function fetchTree(uri: string, timeoutMs = 20_000): Promise<Allowl
  * price or reverts.
  */
 export function toMintParams(mp: any): bigint[] {
+  // Every field is coerced defensively. A single malformed entry — a float
+  // price, an exponent string — would throw out of checkAllowlist and take the
+  // whole allowlist path down. An unreadable field becomes 0, which the
+  // on-chain mint rejects rather than silently minting at the wrong price.
+  const read = (v: any): bigint => {
+    if (v == null) return 0n;
+    if (typeof v === "bigint") return v;
+    if (typeof v === "number") return Number.isInteger(v) ? BigInt(v) : 0n;
+    const s = String(v).trim();
+    if (!/^\d+$/.test(s)) return 0n;
+    try {
+      return BigInt(s);
+    } catch {
+      return 0n;
+    }
+  };
   return [
-    BigInt(mp.mintPrice ?? 0),
-    BigInt(mp.maxTotalMintableByWallet ?? 0),
-    BigInt(mp.startTime ?? 0),
-    BigInt(mp.endTime ?? 0),
-    BigInt(mp.dropStageIndex ?? 0),
-    BigInt(mp.maxTokenSupplyForStage ?? 0),
-    BigInt(mp.feeBps ?? 0),
-    BigInt(mp.restrictFeeRecipients ? 1 : 0),
+    read(mp.mintPrice),
+    read(mp.maxTotalMintableByWallet),
+    read(mp.startTime),
+    read(mp.endTime),
+    read(mp.dropStageIndex),
+    read(mp.maxTokenSupplyForStage),
+    read(mp.feeBps),
+    mp.restrictFeeRecipients ? 1n : 0n,
   ];
 }
 
