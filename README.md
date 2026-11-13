@@ -321,7 +321,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 
 ## Architecture
 
-41 TypeScript modules, ~24k lines. The important ones:
+42 TypeScript modules, ~24.4k lines. The important ones:
 
 | Module | Role |
 |---|---|
@@ -333,9 +333,9 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/fcfs-mint.ts`](src/fcfs-mint.ts) | The T-0 fire coordinator for signed phases |
 | [`src/fcfs-drops.ts`](src/fcfs-drops.ts) | Drop/phase discovery across GQL, REST and on-chain |
 | [`src/local-mint.ts`](src/local-mint.ts) | Public-mint snipe — builds calldata on-chain, no OpenSea |
-| [`src/universal-mint.ts`](src/universal-mint.ts) | ABI-driven mint adapter for non-SeaDrop contracts |
+| [`src/universal-mint.ts`](src/universal-mint.ts) | Mint adapter for non-SeaDrop contracts — tries SeaDrop, generic registry, then ABI |
 | [`src/abi-mint.ts`](src/abi-mint.ts) | ABI fetching (Sourcify, then Etherscan V2) |
-| [`src/mint-generic.ts`](src/mint-generic.ts) | Generic calldata builder for discovered mint functions |
+| [`src/mint-generic.ts`](src/mint-generic.ts) | Generic calldata builder for discovered mint functions — includes the pre-mint contract screen |
 | [`src/target-resolver.ts`](src/target-resolver.ts) | Turns a link/slug/address into a chain + contract |
 | [`src/site-scanner.ts`](src/site-scanner.ts) | Generic any-site scanner — finds a site's API calls and contract addresses |
 | [`src/contract-verify.ts`](src/contract-verify.ts) | The gate that makes the scanner safe — checks a candidate really is a contract |
@@ -351,6 +351,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/auto-gas.ts`](src/auto-gas.ts) | Gas estimation with a hard timeout |
 | [`src/mint-cap.ts`](src/mint-cap.ts) | Per-wallet cap arithmetic — how many tokens a wallet may mint in a phase |
 | [`src/deadline.ts`](src/deadline.ts) | `withDeadline` / `withDeadlineOrThrow` — the RPC timeout backstop |
+| [`src/rpc-timeout.ts`](src/rpc-timeout.ts) | `withRpcTimeout` — bounds a single chain read so a dead endpoint cannot stall a mint |
 | [`src/simulate.ts`](src/simulate.ts) | Pre-flight eth_call simulation |
 | [`src/allowlist-onchain.ts`](src/allowlist-onchain.ts) | Reading allowlist state from chain |
 | [`src/scatter.ts`](src/scatter.ts) | Scatter.art collections and mint calldata |
@@ -371,6 +372,24 @@ locally. A free API key is auto-minted if you don't supply one.
 nothing about the contract, the bytecode is probed for a known mint selector
 (ERC721/ERC1155, Manifold, Zora, Scatter, bespoke) and calldata is built from the
 verified ABI.
+
+Before any calldata is built, the generic path **screens the contract**
+(`screenMintContract` in `mint-generic.ts`). This is the only adapter that mints
+into a contract we did not positively identify, so it is the only one that needs
+to ask what the contract is:
+
+- **refuse** — no bytecode (an EOA), an EIP-7702 delegated EOA, or a contract
+  that answers ERC165 and claims no NFT standard. These are definite answers
+  from the chain, not suspicions.
+- **unknown** — the contract could not be read. An unanswered probe is not
+  evidence of safety, so this blocks exactly like a refusal.
+- **warn** — a live contract with privileges the deployer keeps: an owner that
+  can still change the price or pause the sale, a paused mint, an exhausted
+  supply, an upgradeable implementation slot. The wizard prints these **before**
+  the confirmation prompt.
+
+Warnings never silently become part of the transaction. A contract that only
+warns is mintable; one that refuses or cannot be read is not.
 
 ### How the fire reaches the chain
 

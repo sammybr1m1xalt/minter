@@ -25,7 +25,8 @@ import {
   fetchPublicDrop,
   SEADROP_ADDRESS,
 } from "./seadrop-public";
-import { buildGenericMintTx, GenericMintPlan } from "./mint-generic";
+import { buildGenericMintTx, GenericMintPlan, isPlanBroadcastable } from "./mint-generic";
+import type { ContractScreen } from "./mint-generic";
 import {
   fetchAbi,
   deriveMintCandidates,
@@ -36,6 +37,7 @@ import {
 } from "./abi-mint";
 import { simulateTx, classifyRevert } from "./simulate";
 import { getAllowlistRoot, checkAllowlist } from "./allowlist-onchain";
+import { withRpcTimeout, DEFAULT_READ_TIMEOUT_MS } from "./rpc-timeout";
 
 export type MintAdapter =
   | "seadrop-public"
@@ -55,6 +57,12 @@ export interface UniversalMintPlan {
   /** True when the plan was confirmed by simulation. */
   simulated: boolean;
   simulationReason?: string;
+  /**
+   * Pre-mint contract safety screen, when the plan came from the generic
+   * registry — the only adapter that mints into a contract we did not
+   * positively identify. Absent on the platform paths.
+   */
+  screen?: ContractScreen;
 }
 
 export interface UniversalMintResult {
@@ -86,7 +94,15 @@ export async function findUniversalMint(
   // simulation reports success. That is the worst possible failure mode: a
   // signed transaction to an address that cannot mint.
   try {
-    const code = await provider.getCode(contract);
+    // Bounded: an unbounded eth_getCode holds this whole call open until the OS
+    // gives up on the socket — minutes on a blackholed route. A timeout is not
+    // evidence of "no contract", so it stops the search with a reason rather
+    // than falling through to the adapters, which cannot read the contract either.
+    const code = await withRpcTimeout(
+      provider.getCode(contract),
+      DEFAULT_READ_TIMEOUT_MS,
+      "eth_getCode"
+    );
     if (!code || code === "0x") {
       return {
         plan: null,
@@ -100,7 +116,16 @@ export async function findUniversalMint(
       };
     }
   } catch (e: any) {
-    attempts.push({ adapter: "generic-registry", ok: false, reason: `eth_getCode failed: ${e?.message}` });
+    return {
+      plan: null,
+      attempts: [
+        {
+          adapter: "generic-registry",
+          ok: false,
+          reason: `${contract} could not be read (${e?.message ?? e}) — the RPC did not answer, so no adapter can be tried`,
+        },
+      ],
+    };
   }
 
   // ── 1. SeaDrop public ──────────────────────────────────────────────────
@@ -185,7 +210,7 @@ export async function findUniversalMint(
   // 61 known signatures. Cheap: no ABI fetch, just selector probes.
   try {
     const generic = await buildGenericMintTx(contract, provider, from, amount, opts);
-    if (generic && !generic.simulationReverted) {
+    if (generic && isPlanBroadcastable(generic)) {
       return {
         plan: {
           adapter: "generic-registry",
@@ -195,11 +220,19 @@ export async function findUniversalMint(
           description: `${generic.selector} (${formatEther(generic.value)} ETH)`,
           signature: generic.selector,
           simulated: true,
+          screen: generic.screen,
         },
         attempts,
       };
     }
-    if (generic?.simulationReverted) {
+    if (generic?.screenRefused) {
+      const why = generic.screen.findings.map((f) => f.detail).join("; ");
+      attempts.push({
+        adapter: "generic-registry",
+        ok: false,
+        reason: `contract ${generic.screen.verdict}: ${why}`,
+      });
+    } else if (generic?.simulationReverted) {
       attempts.push({
         adapter: "generic-registry",
         ok: false,
@@ -307,11 +340,17 @@ export async function findAllUniversalMints(
   let code = "";
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      code = await provider.getCode(contract);
+      code = await withRpcTimeout(
+        provider.getCode(contract),
+        DEFAULT_READ_TIMEOUT_MS,
+        "eth_getCode"
+      );
       break;
     } catch (e: any) {
       if (attempt === 1) {
-        throw new Error(`eth_getCode failed after retry: ${e?.message ?? e}`);
+        throw new Error(
+          `eth_getCode failed after retry: ${e?.message ?? e} — the RPC did not answer`
+        );
       }
     }
   }
@@ -348,7 +387,7 @@ export async function findAllUniversalMints(
   // ── 2. Generic registry ────────────────────────────────────────────────
   try {
     const generic = await buildGenericMintTx(contract, provider, from, amount, opts);
-    if (generic && !generic.simulationReverted) {
+    if (generic && isPlanBroadcastable(generic)) {
       plans.push({
         adapter: "generic-registry",
         to: generic.to,
@@ -357,6 +396,7 @@ export async function findAllUniversalMints(
         description: `${generic.selector} (${formatEther(generic.value)} ETH)`,
         signature: generic.selector,
         simulated: true,
+        screen: generic.screen,
       });
     }
   } catch {

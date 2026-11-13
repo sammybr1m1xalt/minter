@@ -418,6 +418,22 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         console.log(chalk.green(`  ✓ ${plan.description}`));
         console.log(chalk.gray(`    via ${plan.adapter}`));
 
+        // The generic adapter mints into a contract we did not positively
+        // identify, so its screen is the only safety information available.
+        // Warnings print BEFORE the confirmation prompt — a user who has not
+        // been told the owner can still pause the sale has not consented to it.
+        if (plan.screen) {
+          for (const f of plan.screen.findings) {
+            if (f.level === "refuse") {
+              console.log(chalk.red(`    ✗ ${f.detail}`));
+            } else if (f.level === "warn") {
+              console.log(chalk.yellow(`    ⚠ ${f.detail}`));
+            } else {
+              console.log(chalk.gray(`    · ${f.detail}`));
+            }
+          }
+        }
+
         // A universal plan is a single-wallet, single-contract mint. Confirm and
         // execute it directly — there is no phase matrix to pick from.
         const didConfirm = await askYesNo(

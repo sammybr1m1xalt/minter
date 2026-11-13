@@ -11,6 +11,7 @@
 // OpenSea and there is no local equivalent.
 
 import { Contract, Interface, JsonRpcProvider } from "ethers";
+import { withRpcTimeout, DEFAULT_READ_TIMEOUT_MS } from "./rpc-timeout";
 
 export const SEADROP_ADDRESS = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
 
@@ -163,25 +164,11 @@ function destroyProvider(provider: JsonRpcProvider): void {
  * ethers v6 has no provider timeout, so a dead endpoint holds the promise (and
  * the wizard) open until the OS gives up on the socket — 5 s here, minutes on a
  * blackholed route. Every read through this module goes through this.
+ *
+ * The helper now lives in rpc-timeout.ts and is re-exported here so existing
+ * imports keep working; new code should import it from there.
  */
-async function withRpcTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`${label} timed out after ${timeoutMs} ms`)),
-          timeoutMs
-        );
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-const DEFAULT_READ_TIMEOUT_MS = 15000;
+export { withRpcTimeout, DEFAULT_READ_TIMEOUT_MS } from "./rpc-timeout";
 
 export interface MintMechanisms {
   signers: string[];

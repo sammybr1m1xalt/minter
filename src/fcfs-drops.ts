@@ -775,7 +775,15 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
 // count on the contract, so what is left to mint is cap − minted. It is not a
 // per-stage limit, and it is not "slots remaining in this phase".
 
-export type EligibilitySource = "gql" | "rest" | "local";
+/**
+ * Where a verdict came from.
+ *
+ * "rest" used to be a member: GET /api/v2/drops/{slug}/eligibility was probed as
+ * a fallback and answered 403 for every credential shape this code can hold, so
+ * the fallback was deleted and no path produces it. Kept out of the union rather
+ * than left as a value no report can carry.
+ */
+export type EligibilitySource = "gql" | "local";
 
 export interface PhaseEligibilityVerdict {
   stageUuid: string | null;
