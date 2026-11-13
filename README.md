@@ -344,7 +344,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/sell-after-mint.ts`](src/sell-after-mint.ts) | Offer ranking, net-proceeds guard, Seaport calldata, sale orchestration |
 | [`src/seaport-abi.ts`](src/seaport-abi.ts) | Verified Seaport 1.5 / 1.6 ABIs (from Sourcify) |
 | [`src/opensea-key.ts`](src/opensea-key.ts) | API key pool — lazy probe, state-based retirement, budget gate |
-| [`src/opensea-session.ts`](src/opensea-session.ts) | SIWE session cookies per wallet |
+| [`src/opensea-session.ts`](src/opensea-session.ts) | SIWE session cookies per wallet, plus the scoped-PAT → wallet-JWT exchange |
 | [`src/session-store.ts`](src/session-store.ts) | Single source of truth for the on-disk session paths |
 | [`src/opensea-gql.ts`](src/opensea-gql.ts) | GraphQL queries and response parsing |
 | [`src/connection-warmer.ts`](src/connection-warmer.ts) | Parallel RPC latency ranking — orders endpoints fastest-first for the blast |
@@ -393,6 +393,31 @@ to ask what the contract is:
 
 Warnings never silently become part of the transaction. A contract that only
 warns is mintable; one that refuses or cannot be read is not.
+
+### Eligibility: GraphQL first, REST as fallback
+
+Eligibility is wallet-scoped. The primary path is the GraphQL `DropEligibilityQuery`
+with the per-wallet SIWE cookie; when that fails, the code falls back to
+`GET /api/v2/drops/{slug}/eligibility`.
+
+The REST endpoint needs a **wallet JWT**, which the SIWE cookie is not — it
+answers `401` without one. The minter mints one from the session it already holds:
+
+    SIWE session cookies
+      → POST /api/v2/auth/tokens           {label, scopes:["read:eligibility"], expiresInDays}
+      → POST /api/v2/auth/tokens/exchange  {subjectToken, subjectTokenType:"ACCESS_TOKEN"}
+      → Authorization: Bearer <jwt>  +  X-API-KEY
+
+Both the PAT and the JWT are stored in the same owner-only session jar as the
+cookies. The JWT is short-lived — measured at **one hour**, not the ~12 hours the
+docs' credential table claims — so it is re-exchanged on demand; the PAT lasts 7
+days.
+
+The REST response's `price` is a **wei decimal string**, unlike GraphQL's ETH
+float, and `mints_remaining` is OpenSea's own remainder for that wallet — which
+is more accurate than the GraphQL path's reconstruction. In a live comparison
+against the same wallet and stage, GraphQL reported a remainder of 180 (the stage
+cap) while REST reported 166, the wallet's actual allowance.
 
 ### API key pool
 

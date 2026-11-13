@@ -21,6 +21,7 @@ import {
 import { resolveChain } from "./chains";
 import { mintableFromCap } from "./mint-cap";
 import { noteKeyCall } from "./opensea-key";
+import { getWalletJwt } from "./opensea-session";
 
 const OPENSEA_BASE = "https://api.opensea.io";
 
@@ -779,12 +780,12 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
 /**
  * Where a verdict came from.
  *
- * "rest" used to be a member: GET /api/v2/drops/{slug}/eligibility was probed as
- * a fallback and answered 403 for every credential shape this code can hold, so
- * the fallback was deleted and no path produces it. Kept out of the union rather
- * than left as a value no report can carry.
+ * "rest" is back: GET /api/v2/drops/{slug}/eligibility answers 401 without a
+ * WALLET JWT and 200 with one. The earlier conclusion that the exchange was
+ * unavailable (403 "Token exchange is not available") was wrong — the flow
+ * works, verified live. See getWalletJwt in opensea-session.ts.
  */
-export type EligibilitySource = "gql" | "local";
+export type EligibilitySource = "gql" | "rest" | "local";
 
 export interface PhaseEligibilityVerdict {
   stageUuid: string | null;
@@ -899,6 +900,74 @@ function verdictToReport(drop: DropPhase, v: PhaseEligibilityVerdict): Eligibili
           ? 0
           : null,
   };
+}
+
+// ── REST eligibility ─────────────────────────────────────────────────────────
+// GET /api/v2/drops/{slug}/eligibility — per-stage, wallet-scoped.
+//
+// Requires BOTH X-API-KEY and a wallet JWT (Authorization: Bearer). Without the
+// JWT it answers 401; a SIWE cookie alone is not a wallet token. The JWT comes
+// from getWalletJwt (scoped PAT → exchange).
+//
+// Units, verified live 2026-11-13 against `earthly-appetites`: `price` is a WEI
+// DECIMAL STRING, identical to the stage price in GET /api/v2/drops/{slug}
+// ("1500000000000000" = 0.0015 ETH) — NOT the ETH float GraphQL returns.
+// `mints_remaining` is the wallet's own remainder, which is what the GraphQL
+// path reconstructs from the account block.
+
+interface RestEligibilityStage {
+  stage_uuid: string;
+  is_eligible: boolean | null;
+  price: string | null;
+  max_total_mintable_by_wallet: string | null;
+  max_total_mintable_by_wallet_per_token: string | null;
+  mints_remaining: string | null;
+}
+
+interface RestEligibility {
+  stages: RestEligibilityStage[];
+}
+
+/** A REST decimal string → number. null stays null; a malformed value stays null. */
+function parseRestDecimal(value: string | null): number | null {
+  if (value == null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** A REST wei decimal string → bigint. Anything else is null, never 0n. */
+function parseRestWei(value: string | null): bigint | null {
+  if (value == null || !/^\d+$/.test(value)) return null;
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchRestEligibility(
+  slug: string,
+  apiKey: string,
+  jwt: string,
+  timeoutMs: number
+): Promise<RestEligibility | null> {
+  try {
+    const res = await fetch(
+      `${OPENSEA_BASE}/api/v2/drops/${encodeURIComponent(slug)}/eligibility`,
+      {
+        headers: {
+          accept: "application/json",
+          "x-api-key": apiKey,
+          authorization: `Bearer ${jwt}`,
+        },
+        signal: AbortSignal.timeout(timeoutMs),
+      }
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as RestEligibility;
+  } catch {
+    return null; // transport failure is not a verdict
+  }
 }
 
 /**
@@ -1048,14 +1117,58 @@ export async function getPhaseEligibility(args: {
       }
     }
 
-    // There is deliberately no REST fallback here. GET
-    // /api/v2/drops/{slug}/eligibility is wallet-scoped and requires a WALLET
-    // JWT with the read:eligibility scope; the credential this code holds is a
-    // PAT (X-API-KEY) plus the SIWE cookie, which the docs restrict to PAT
-    // management. Probed live, the exchange that would mint such a JWT answers
-    // 403 "Token exchange is not available". A fallback built on it would only
-    // burn a request on every phase where GQL is rate-limited, and report a
-    // transport failure as a verdict.
+    // ── REST fallback ──────────────────────────────────────────────────────
+    // GraphQL is aggressively rate-limited (429) as of late 2026 — observed
+    // again on 2026-11-13, where every eligibility query was throttled while the
+    // REST endpoint answered 200. The REST path is a different limiter, so it is
+    // worth having when GQL fails.
+    //
+    // The earlier comment here said the token exchange answers 403 "Token
+    // exchange is not available" and declared the fallback impossible. That was
+    // wrong. The exchange works (verified live), and the JWT it returns is what
+    // unlocks this endpoint. See getWalletJwt in opensea-session.ts.
+    if (apiKey && slug) {
+      const token = await getWalletJwt(wallet);
+      if (token) {
+        const rest = await fetchRestEligibility(slug, apiKey, token.jwt, timeoutMs);
+        if (rest && rest.stages.length > 0) {
+          // One OpenSea call spent.
+          noteKeyCall(apiKey);
+          const wanted = normalizeUuid(matchUuid);
+          const stage = wanted
+            ? rest.stages.find((s) => normalizeUuid(s.stage_uuid) === wanted) ?? null
+            : rest.stages[0];
+          if (stage) {
+            const eligible = stage.is_eligible;
+            const cap = parseRestDecimal(stage.max_total_mintable_by_wallet);
+            // mints_remaining is OpenSea's own remainder for this wallet —
+            // better than the GraphQL path's reconstruction, which has to fall
+            // back to the stage cap when the account block is absent.
+            const remaining = parseRestDecimal(stage.mints_remaining);
+            const reason =
+              eligible === true
+                ? "OpenSea REST: wallet is eligible for this stage."
+                : eligible === false
+                  ? "OpenSea REST: wallet is authenticated but not eligible for this stage."
+                  : "OpenSea REST returned this stage but no per-wallet verdict (is_eligible was null).";
+            return verdictToReport(drop, {
+              stageUuid: matchUuid,
+              eligible,
+              reason,
+              source: "rest",
+              priceWei: parseRestWei(stage.price),
+              cap,
+              // Unknown: the REST row gives a remainder directly, not a
+              // lifetime minted count. Reporting a guess here would let a
+              // wallet that already minted read as fresh.
+              minted: null,
+              capRemaining: remaining,
+              stages: [],
+            });
+          }
+        }
+      }
+    }
   }
 
   return null;

@@ -31,6 +31,15 @@ export interface SiweSession {
   cookies: Map<string, string>;
   token: string;
   exp: number;
+  // ── Wallet JWT (scoped PAT → access token) ──────────────────────────────
+  // The REST drop-eligibility endpoint needs a WALLET token; the SIWE cookie is
+  // not one. See getWalletJwt below for the flow and the live verification.
+  jwt?: string;
+  jwtExp?: number;
+  scopes?: string[];
+  pat?: string;
+  patId?: string;
+  patExp?: number;
 }
 
 const BASE = "https://opensea.io/__api/auth";
@@ -61,7 +70,17 @@ const sessions = new Map<string, SiweSession>();
 
 interface PersistedSiweSessions {
   version: 1;
-  sessions: Record<string, { cookies: Record<string, string>; token: string; exp: number }>;
+  sessions: Record<string, {
+    cookies: Record<string, string>;
+    token: string;
+    exp: number;
+    jwt?: string;
+    jwtExp?: number;
+    scopes?: string[];
+    pat?: string;
+    patId?: string;
+    patExp?: number;
+  }>;
 }
 
 let loadedFromDisk = false;
@@ -79,6 +98,14 @@ function loadPersistedSessions(): void {
         cookies: new Map(Object.entries(s.cookies)),
         token: s.token,
         exp: Number(s.exp) || 0,
+        // Absent on sessions written before the wallet-JWT leg existed; the
+        // optional fields degrade to "no cached token" rather than a parse error.
+        jwt: typeof s.jwt === "string" ? s.jwt : undefined,
+        jwtExp: Number(s.jwtExp) || 0,
+        scopes: Array.isArray(s.scopes) ? s.scopes : undefined,
+        pat: typeof s.pat === "string" ? s.pat : undefined,
+        patId: typeof s.patId === "string" ? s.patId : undefined,
+        patExp: Number(s.patExp) || 0,
       });
     }
   } catch {
@@ -131,6 +158,12 @@ function persistSessions(): void {
         cookies: Object.fromEntries(s.cookies),
         token: s.token,
         exp: s.exp,
+        jwt: s.jwt,
+        jwtExp: s.jwtExp,
+        scopes: s.scopes,
+        pat: s.pat,
+        patId: s.patId,
+        patExp: s.patExp,
       };
     }
     // Contains bearer tokens: owner-only, like the legacy session file.
@@ -363,6 +396,171 @@ export async function refreshSiweSession(wallet: Wallet): Promise<string> {
   const session = await loginSiwe(wallet);
   sessions.set(wallet.address.toLowerCase(), session);
   return cookieHeader(session.cookies);
+}
+
+// ── Wallet JWT: scoped PAT → access token ───────────────────────────────────
+//
+// The REST drop-eligibility endpoint needs a WALLET token. The SIWE cookie is
+// not one, and the API key alone answers 401 ("Wallet token lacks permission").
+// The documented route from the session we already hold:
+//
+//   SIWE session cookies
+//     → POST /api/v2/auth/tokens           {label, scopes, expiresInDays} → PAT
+//     → POST /api/v2/auth/tokens/exchange  {subjectToken, subjectTokenType} → JWT
+//
+// Verified live 2026-11-13 against a real session:
+//   - the PAT is returned ONCE, at creation; GET /auth/tokens lists metadata
+//     only and never the token, so it must be stored or it is lost;
+//   - the exchange answers expiresIn=3599 — ONE HOUR, not the ~12h the docs'
+//     credential table claims. The cache margin below is sized for the measured
+//     value, not the documented one;
+//   - the JWT unlocks GET /api/v2/drops/{slug}/eligibility (401 without it,
+//     200 with it) and carries tokenScopes ["read:eligibility"].
+//
+// An earlier probe of this flow reported 403 "Token exchange is not available";
+// that was wrong — the exchange works. The REST fallback is therefore real.
+
+const AUTH_BASE = "https://api.opensea.io/api/v2/auth";
+const PAT_SCOPES = ["read:eligibility"];
+const PAT_LIFETIME_DAYS = 7;
+/** Re-issue a JWT this long before it expires. */
+const JWT_MARGIN_SEC = 600;
+/** Create a fresh PAT this long before the cached one expires. */
+const PAT_MARGIN_SEC = 24 * 3600;
+
+export interface WalletToken {
+  jwt: string;
+  /** Unix seconds. */
+  exp: number;
+  scopes: string[];
+}
+
+/**
+ * Create a scoped PAT from a SIWE session.
+ *
+ * One retry: the endpoint answered a bare 400 once and 200 for the identical
+ * request seconds later. A real validation failure (400 with `details`, or 422
+ * for a missing field) is deterministic and will not pass on retry — the retry
+ * costs one call and only fires when we have no token to show for it.
+ */
+async function createScopedToken(cookie: string): Promise<{ id: string; token: string; exp: number } | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let r: Response;
+    try {
+      r = await fetchWithRetry(
+        `${AUTH_BASE}/tokens`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json", cookie },
+          body: JSON.stringify({ label: "minter", scopes: PAT_SCOPES, expiresInDays: PAT_LIFETIME_DAYS }),
+          signal: AbortSignal.timeout(10_000),
+        },
+        1
+      );
+    } catch {
+      return null; // transport failure — nothing about the session
+    }
+    if (r.ok) {
+      try {
+        const j = (await r.json()) as any;
+        if (!j?.token) return null;
+        return {
+          id: String(j.id ?? ""),
+          token: j.token,
+          exp: Math.floor(new Date(j.expiresAt).getTime() / 1000) || 0,
+        };
+      } catch {
+        return null;
+      }
+    }
+    // 422 (missing field) and a validation 400 will not fix themselves; a 5xx or
+    // a bare 400 might. Either way one retry is the budget.
+  }
+  return null;
+}
+
+/** Exchange a PAT for a short-lived wallet JWT. */
+async function exchangeForWalletJwt(pat: string): Promise<WalletToken | null> {
+  try {
+    const r = await fetchWithRetry(
+      `${AUTH_BASE}/tokens/exchange`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ subjectToken: pat, subjectTokenType: "ACCESS_TOKEN" }),
+        signal: AbortSignal.timeout(10_000),
+      },
+      1
+    );
+    if (!r.ok) return null;
+    const j = (await r.json()) as any;
+    if (!j?.accessToken) return null;
+    return {
+      jwt: j.accessToken,
+      exp: Math.floor(Date.now() / 1000) + Number(j.expiresIn) || 0,
+      scopes: Array.isArray(j.tokenScopes) ? j.tokenScopes : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function cacheWalletToken(
+  address: string,
+  token: WalletToken,
+  pat?: { id: string; token: string; exp: number }
+): void {
+  const cached = sessions.get(address);
+  if (!cached) return;
+  cached.jwt = token.jwt;
+  cached.jwtExp = token.exp;
+  cached.scopes = token.scopes;
+  if (pat) {
+    cached.pat = pat.token;
+    cached.patId = pat.id;
+    cached.patExp = pat.exp;
+  }
+  persistSessions();
+}
+
+/**
+ * A wallet-scoped JWT for `address`, or null when no session can produce one.
+ *
+ * Takes an ADDRESS, not a Wallet: the session jar is already on disk keyed by
+ * address, so no private key is needed — only a cached SIWE login for that
+ * wallet. That matters because the eligibility path knows the wallet address
+ * but not necessarily its key.
+ *
+ * Order: cached JWT → exchange the cached PAT → create a PAT, then exchange.
+ */
+export async function getWalletJwt(address: string): Promise<WalletToken | null> {
+  loadPersistedSessions();
+  const key = address.toLowerCase();
+  const cached = sessions.get(key);
+  if (!cached) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (cached.jwt && (cached.jwtExp ?? 0) > now + JWT_MARGIN_SEC) {
+    return { jwt: cached.jwt, exp: cached.jwtExp as number, scopes: cached.scopes ?? PAT_SCOPES };
+  }
+
+  // A still-valid PAT can be exchanged without creating a new one — the PAT is
+  // the scarce object (creation is session-scoped and rate-limited), the JWT is
+  // not.
+  if (cached.pat && (cached.patExp ?? 0) > now + PAT_MARGIN_SEC) {
+    const exchanged = await exchangeForWalletJwt(cached.pat);
+    if (exchanged) {
+      cacheWalletToken(key, exchanged);
+      return exchanged;
+    }
+  }
+
+  const pat = await createScopedToken(cookieHeader(cached.cookies));
+  if (!pat) return null;
+  const exchanged = await exchangeForWalletJwt(pat.token);
+  if (!exchanged) return null;
+  cacheWalletToken(key, exchanged, pat);
+  return exchanged;
 }
 
 // ── Internal: extract Set-Cookie headers in a fetch-compatible way ───────────
