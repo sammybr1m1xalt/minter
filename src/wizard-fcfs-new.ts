@@ -737,27 +737,41 @@ export async function runFcfsBranch(
       chalk.gray(`    Skipped — the phase is not open. Payloads are fetched at T-0.`)
     );
   } else {
-    for (let i = 0; i < walletKeys.length; i++) {
-      const w = new Wallet(walletKeys[i]);
-      try {
-        const p = await fetchSignedPayloadForWallet(
-          nftContract,
-          quantity,
-          w.address,
-          apiKey || undefined,
-          // slug + chainKey are REQUIRED: fetchSignedPayload gates both its GraphQL
-          // and REST branches on them. Omitting them here made the pre-fetch fall
-          // through to the on-chain branch, which only ever returns PUBLIC drops —
-          // so the pre-fetch could never populate a signed/allowlist payload.
-          { timeoutMs: 15000, slug: effectiveSlug, chainKey },
-        );
-        preFetched.push(p);
-        if (!p) console.log(chalk.yellow(`    ${w.address} — no payload (will retry at T-0)`));
-      } catch (err: any) {
-        console.log(chalk.yellow(`    ${w.address} — pre-fetch failed: ${err.message}`));
-        preFetched.push(null);
-      }
-    }
+    // Parallel, not sequential. Each fetch is an independent network round trip,
+    // and the whole point of the pre-fetch is to have payloads in hand well
+    // before T-0 — a serial loop costs N round trips, so 8 wallets at ~1s each
+    // is 8 seconds of avoidable delay before the timer even starts.
+    //
+    // This mirrors wizard.ts's pre-fetch exactly. It had been a plain for-loop
+    // here while the wizard was already parallel, so the same operation behaved
+    // two different ways depending on which branch ran it.
+    //
+    // Each fetch is independently guarded so one failure cannot reject the
+    // batch (Promise.all would reject on the first throw).
+    const fetched = await Promise.all(
+      walletKeys.map(async (key) => {
+        const w = new Wallet(key);
+        try {
+          const p = await fetchSignedPayloadForWallet(
+            nftContract,
+            quantity,
+            w.address,
+            apiKey || undefined,
+            // slug + chainKey are REQUIRED: fetchSignedPayload gates both its GraphQL
+            // and REST branches on them. Omitting them here made the pre-fetch fall
+            // through to the on-chain branch, which only ever returns PUBLIC drops —
+            // so the pre-fetch could never populate a signed/allowlist payload.
+            { timeoutMs: 15000, slug: effectiveSlug, chainKey },
+          );
+          if (!p) console.log(chalk.yellow(`    ${w.address} — no payload (will retry at T-0)`));
+          return p;
+        } catch (err: any) {
+          console.log(chalk.yellow(`    ${w.address} — pre-fetch failed: ${err.message}`));
+          return null;
+        }
+      })
+    );
+    preFetched.push(...fetched);
   }
 
   const snipeResults = await executeFcfsSnipe({
