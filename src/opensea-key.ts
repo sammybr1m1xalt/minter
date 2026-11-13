@@ -349,16 +349,33 @@ export async function probeKey(
 
 // ── Score a pool entry after probing ──────────────────────────────────────
 
+/**
+ * A cached verdict decays with age.
+ *
+ * Without this, a key probed six days ago with a high `remaining_calls`
+ * outranks one verified a minute ago — so the pool spends its probe budget
+ * re-validating a stale winner instead of trusting a fresh one. Capped at 24h
+ * so age alone never outweighs a real verdict.
+ */
+function agePenalty(entry: KeyPoolEntry, now: number): number {
+  const at = entry.last_probe_at ? new Date(entry.last_probe_at).getTime() : NaN;
+  if (isNaN(at)) return 0;
+  return Math.min(Math.max(0, (now - at) / 3_600_000), 24) * 10;
+}
+
 export function computeScore(entry: KeyPoolEntry): number {
   const now = Date.now();
   // Higher = better.
   if (entry.last_probe === "dead") return -10000;
-  if (entry.last_probe === "timeout") return 5;
-  // The API was unreachable or erroring, not the key. Worth far more than a
-  // timeout (the key is untested, not slow) but less than a confirmed-alive
-  // key, because we have no evidence it works right now.
-  if (entry.last_probe === "server_error") return 20;
-  if (entry.last_probe === "throttled") {
+  let score: number;
+  if (entry.last_probe === "timeout") {
+    score = 5;
+  } else if (entry.last_probe === "server_error") {
+    // The API was unreachable or erroring, not the key. Worth far more than a
+    // timeout (the key is untested, not slow) but less than a confirmed-alive
+    // key, because we have no evidence it works right now.
+    score = 20;
+  } else if (entry.last_probe === "throttled") {
     // 429 — actively rate-limited, can't use this call. Low score but keep
     // it in the pool; if reset time is recorded and in the future, it'll
     // recover and become useful again.
@@ -366,24 +383,27 @@ export function computeScore(entry: KeyPoolEntry): number {
     // Comparing them directly is always false, which silently disabled this tier.
     const resetMs = entry.rate_limit_reset > 0 ? entry.rate_limit_reset * 1000 : 0;
     if (resetMs > now) {
-      return 50; // will recover, but useless right now
+      score = 50; // will recover, but useless right now
+    } else {
+      score = 30; // reset passed but still getting 429 — server hasn't caught up
     }
-    return 30; // reset passed but still getting 429 — server hasn't caught up
-  }
-  if (entry.last_probe === "alive_but_exhausted") {
+  } else if (entry.last_probe === "alive_but_exhausted") {
     // Got a 200 but remaining is 0 or 1. Still usable for THIS call (one
     // more shot before the window closes). Don't abandon it.
     const resetMs = entry.rate_limit_reset > 0 ? entry.rate_limit_reset * 1000 : 0;
     if (resetMs > now) {
-      return 150; // one more call then it resets — valuable
+      score = 150; // one more call then it resets — valuable
+    } else {
+      score = 100; // reset already passed but still at 0 — might recover, still try
     }
-    return 100; // reset already passed but still at 0 — might recover, still try
+  } else {
+    // alive: base 1000 + remaining calls bonus - latency penalty - usage penalty
+    score = 1000 + Math.max(0, entry.remaining_calls) * 10 - Math.min(entry.probe_latency_ms, 2000) * 0.5 - entry.times_used * 20;
   }
-  // alive: base 1000 + remaining calls bonus - latency penalty - usage penalty
-  return 1000 + Math.max(0, entry.remaining_calls) * 10 - Math.min(entry.probe_latency_ms, 2000) * 0.5 - entry.times_used * 20;
+  return score - agePenalty(entry, now);
 }
 
-// ── Probe ALL keys in parallel, re-score, return sorted best→worst ──────
+// ── Rank by cached state, verify the winner, return it ───────────────────
 
 export async function probeAndRankPool(
   pool: KeyPoolEntry[],
@@ -399,87 +419,96 @@ export async function probeAndRankPool(
   // the contradiction the run then reports.
   const prior = new Map(pool.map((e) => [e.api_key, e]));
 
-  // Probe all in parallel — each bounded by timeoutMs, but all at once, so the
-  // whole pass costs one timeout rather than one per key.
-  const probed = await Promise.all(
-    pool.map(async (entry) => {
-      // Every attempt draws on the SAME remaining budget. Retries used to get a
-      // fresh full timeout each, so a key that hit server_error and then timeout
-      // could spend 3x the caller's whole budget on its own and the caller's
-      // deadline became meaningless.
-      const attempt = async () => {
-        const remaining = budget();
-        if (remaining < 500) return null;
-        return probeKey(entry.api_key, Math.min(remaining, 5000));
-      };
-      let result = (await attempt()) ?? ({ status: "timeout", latencyMs: 0, remaining: -1, resetAt: 0 } as const);
-      // A server_error means the API was unreachable or erroring — nothing about
-      // the key. Observed live: the same key returned server_error at 1112ms and
-      // alive at 860ms seconds later. One retry separates a transient hiccup
-      // from a key that genuinely cannot be validated, without paying for it on
-      // every probe.
-      if (result.status === "server_error") {
-        const retry = await attempt();
-        if (retry && retry.status !== "server_error") result = retry;
-      }
-      // Same class of fault: a timeout means the request never completed, so it
-      // says nothing about the key either. Retrying once keeps a slow minute
-      // from retiring a working credential.
-      if (result.status === "timeout") {
-        const retry = await attempt();
-        if (retry && retry.status !== "timeout") result = retry;
-      }
-      // Persist the fresh quota numbers. Without this the entry keeps whatever
-      // remaining_calls it had before — a stale value that can exceed the real
-      // limit (observed: 598 stored vs 114 actual) and inflates the score by
-      // thousands of points, letting a bad key outrank a good one.
-      const refreshed: KeyPoolEntry = {
-        ...entry,
-        last_probe: result.status,
-        last_probe_at: new Date().toISOString(),
-        probe_latency_ms: result.latencyMs,
-        remaining_calls: result.remaining,
-        rate_limit_reset: result.resetAt,
-      };
-      refreshed.score = computeScore(refreshed);
-      return refreshed;
-    })
-  );
+  // Rank by CACHED state, then verify — do not census the pool.
+  //
+  // This used to probe every key on every run: a 14-key pool cost 14 calls
+  // (up to 42 with retries) to learn what probing the winner would have told
+  // you. Probing draws on the same budget the mint needs, so the census was
+  // spending the run's own headroom to measure it.
+  const ranked = [...pool].sort((a, b) => computeScore(b) - computeScore(a));
+  const refreshed = new Map(pool.map((e) => [e.api_key, e]));
+  const now = Date.now();
 
-  // Mark dead keys for removal (don't delete them, just deprioritize).
-  //
-  // "timeout" is NOT usable. A timeout means the request never completed, so we
-  // have no evidence the key works — and the caller is about to spend a mint on
-  // it. Treating it as usable let a timed-out key win selection and be reported
-  // as "Key ready: timeout", then fail at the first real API call. A timeout is
-  // a network fault, not a property of the key, so it is scored low (below a
-  // confirmed-alive key) but it must not be selected while any key with a real
-  // answer exists.
-  //
-  // "server_error" stays usable: a 5xx or Cloudflare 403 is the API's fault, and
-  // the key is known-valid from earlier probes.
-  const usable = probed
-    .filter((e) => e.last_probe === "alive" || e.last_probe === "alive_but_exhausted" || e.last_probe === "throttled" || e.last_probe === "server_error")
-    .sort((a, b) => b.score - a.score);
+  const probeOne = async (entry: KeyPoolEntry): Promise<KeyPoolEntry> => {
+    // Every attempt draws on the SAME remaining budget. Retries used to get a
+    // fresh full timeout each, so a key that hit server_error and then timeout
+    // could spend 3x the caller's whole budget on its own and the caller's
+    // deadline became meaningless.
+    const attempt = async () => {
+      const remaining = budget();
+      if (remaining < 500) return null;
+      return probeKey(entry.api_key, Math.min(remaining, 5000));
+    };
+    let result = (await attempt()) ?? ({ status: "timeout", latencyMs: 0, remaining: -1, resetAt: 0 } as const);
+    // One retry separates a transient hiccup from a key that genuinely cannot
+    // be validated, without paying for it on every probe.
+    if (result.status === "server_error" || result.status === "timeout") {
+      const retry = await attempt();
+      if (retry && retry.status !== result.status) result = retry;
+    }
+    // A timeout reads no headers and says nothing about the key, so it must not
+    // erase the evidence that the key was working — otherwise one transient
+    // network fault makes every good key look unusable.
+    const keep = result.status === "timeout" ? prior.get(entry.api_key) : undefined;
+    const next: KeyPoolEntry = keep
+      ? { ...keep, remaining_calls: result.remaining, rate_limit_reset: result.resetAt }
+      : {
+          ...entry,
+          last_probe: result.status,
+          last_probe_at: new Date().toISOString(),
+          probe_latency_ms: result.latencyMs,
+          remaining_calls: result.remaining,
+          rate_limit_reset: result.resetAt,
+        };
+    next.score = computeScore(next);
+    return next;
+  };
 
-  // Only fall back to a timed-out key when nothing with a real answer exists —
-  // and even then, only if it was confirmed alive the last time we actually
-  // reached the API. A key that has never been confirmed is not worth a mint.
-  //
-  // The check is against the probe result from BEFORE this pass, not against
-  // remaining_calls: a timeout reads no headers, so it stores -1 and would
-  // disqualify every key that ever timed out — including one that has been
-  // serving mints for days.
-  const best = usable.length > 0
-    ? usable[0]
-    : probed
-        .filter((e) => {
-          if (e.last_probe !== "timeout") return false;
-          const before = prior.get(e.api_key);
-          return before?.last_probe === "alive" || before?.last_probe === "alive_but_exhausted";
-        })
-        .sort((a, b) => b.score - a.score)[0] ?? null;
-  return { pool: probed, best };
+  let best: KeyPoolEntry | null = null;
+  let fallback: KeyPoolEntry | null = null;
+
+  for (const candidate of ranked) {
+    const age = candidate.last_probe_at
+      ? now - new Date(candidate.last_probe_at).getTime()
+      : Infinity;
+    const fresh = age <= PROBE_TTL_MS;
+
+    // A fresh, non-dead verdict needs no probe at all.
+    if (fresh && candidate.last_probe !== "dead" && candidate.last_probe !== "timeout") {
+      if (candidate.last_probe === "alive" || candidate.last_probe === "alive_but_exhausted") {
+        best = candidate;
+        break;
+      }
+      if (!fallback) fallback = candidate; // throttled / server_error
+      continue;
+    }
+
+    if (budget() < 500) break;
+    const probedEntry = await probeOne(candidate);
+    refreshed.set(probedEntry.api_key, probedEntry);
+
+    if (
+      probedEntry.last_probe === "alive" ||
+      probedEntry.last_probe === "alive_but_exhausted"
+    ) {
+      best = probedEntry;
+      break;
+    }
+    // "server_error" stays usable: a 5xx or Cloudflare 403 is the API's fault,
+    // and the key is known-valid from earlier probes.
+    if (
+      !fallback &&
+      (probedEntry.last_probe === "throttled" || probedEntry.last_probe === "server_error")
+    ) {
+      fallback = probedEntry;
+    }
+  }
+
+  // "timeout" is NOT usable while any key has a real answer, but it is the
+  // last resort when nothing else exists — and even then only if it was
+  // confirmed alive the last time we actually reached the API.
+  if (!best) best = fallback;
+  return { pool: [...refreshed.values()], best };
 }
 
 // ── Pick the best key (probes pool, returns winner) ──────────────────────
@@ -545,18 +574,42 @@ export function addKeyToPool(
 export const KEY_MAX_AGE_DAYS = 3;
 const KEY_MAX_AGE_MS = KEY_MAX_AGE_DAYS * 86_400_000;
 
-/** True when a single key has outlived KEY_MAX_AGE_DAYS. */
+/**
+ * True when a single key has outlived KEY_MAX_AGE_DAYS.
+ *
+ * A DISPLAY hint only — nothing mints or deletes on it. It used to drive a
+ * whole-pool replacement: once every key passed 3 days the pool minted 2 fresh
+ * ones and deleted the rest, discarding keys that had just probed alive and
+ * capping the fleet at ~6 (2 creations/day × 3 days).
+ */
 export function isKeyStale(entry: KeyPoolEntry): boolean {
   const born = entry.minted_at ? new Date(entry.minted_at).getTime() : NaN;
   return isNaN(born) || Date.now() - born > KEY_MAX_AGE_MS;
 }
 
 /**
- * True when the pool is non-empty and EVERY key is older than KEY_MAX_AGE_DAYS.
- * A single fresh key means the pool is still serviceable.
+ * How many keys the pool should hold.
+ *
+ * A key is a CREDENTIAL, not capacity: the rate-limit budget belongs to the
+ * IP, so ten wallets on one key and ten wallets on five keys spend the same.
+ * Extra keys buy redundancy (a key can be revoked or start returning 403) and
+ * hedge against a per-key burst limit — not quota. Three is enough that one
+ * dying does not empty the pool, and cheap enough to keep probe spend low.
  */
-export function poolIsStale(pool: KeyPoolEntry[]): boolean {
-  return pool.length > 0 && pool.every(isKeyStale);
+export const KEY_TARGET_USABLE = 3;
+
+/**
+ * How long a probe verdict is trusted before the key is re-probed.
+ *
+ * Probing is itself quota: a full census costs one call per key, every run, to
+ * learn what probing the winner would have told you. Within this window a
+ * cached verdict is good enough.
+ */
+export const PROBE_TTL_MS = 10 * 60 * 1000;
+
+/** True when the pool can still supply this key — i.e. it is not known dead. */
+export function canSupplyKey(status: KeyPoolEntry["last_probe"]): boolean {
+  return status !== "dead";
 }
 
 // ── .env integration ──────────────────────────────────────────────────────
@@ -707,10 +760,64 @@ const mintFreeKey = async (
   }
 };
 
-// ── Main entry point: get a valid key, probing pool first ────────────────
+// ── Budget gauge ──────────────────────────────────────────────────────────
+
+/** OpenSea calls a run makes per wallet: the payload fetch and the cap recheck. */
+export const CALLS_PER_WALLET = 2;
+
+/**
+ * The run's remaining read budget, as the last probe saw it.
+ *
+ * Under a per-IP quota every key reports the same number, so the lowest value
+ * across the pool is the budget. Under a per-key quota the minimum is still the
+ * safe estimate — it is the key that runs out first.
+ *
+ * null means "unknown": no key has a quota reading.
+ */
+export function remainingBudget(pool: KeyPoolEntry[] = loadKeyPool()): number | null {
+  const known = pool
+    .filter((e) => e.last_probe !== "dead" && e.remaining_calls >= 0)
+    .map((e) => e.remaining_calls);
+  return known.length > 0 ? Math.min(...known) : null;
+}
+
+/** Estimated OpenSea calls a run of `wallets` wallets will make. */
+export function estimateRunNeed(wallets: number): number {
+  return Math.max(1, Math.round(wallets)) * CALLS_PER_WALLET;
+}
+
+/**
+ * Record one OpenSea call against the key that made it.
+ *
+ * `remaining_calls` is a CACHE of the server's counter, refreshed on probe.
+ * Without this the cache drifts: a 10-wallet run makes ~20 calls and records 1,
+ * so the next run's budget gate understates what was spent by N-1.
+ *
+ * This is an estimate, not the truth — the probe overwrites it with the
+ * authoritative header value on the next pass.
+ */
+export function noteKeyCall(apiKey: string): void {
+  const pool = loadKeyPool();
+  let changed = false;
+  const next = pool.map((e) => {
+    if (e.api_key !== apiKey) return e;
+    changed = true;
+    const updated: KeyPoolEntry = {
+      ...e,
+      times_used: e.times_used + 1,
+      last_used_at: new Date().toISOString(),
+    };
+    if (updated.remaining_calls > 0) updated.remaining_calls -= 1;
+    updated.score = computeScore(updated);
+    return updated;
+  });
+  if (changed) saveKeyPool(next);
+}
+
+// ── Main entry point: get a valid key, probing pool first ──────────────────
 
 export async function getValidApiKey(
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; wallets?: number }
 ): Promise<{ api_key: string; source: string } | null> {
   // Honour the caller's deadline. The parameter was previously ignored (_opts),
   // so a caller asking for an 8s budget could wait far longer when the pool
@@ -726,34 +833,54 @@ export async function getValidApiKey(
 
   let pool = loadKeyPool();
 
-  // 0. Refresh an aged pool before probing. A key older than KEY_MAX_AGE_DAYS
-  //    is replaced rather than trusted, even if it still probes alive — an old
-  //    key can carry an exhausted quota that remaining_calls no longer reflects.
-  //    If the mint fails the old keys stay as a fallback, so this can never
-  //    leave the pool empty.
-  if (poolIsStale(pool)) {
+  // Pre-flight budget gate. Minting more keys cannot fix a shortfall when the
+  // quota belongs to the IP, so this warns rather than reaching for the mint
+  // path below. It runs before probing, so it reads the cached counter; the
+  // probe that follows refines it.
+  if (opts?.wallets && opts.wallets > 0) {
+    const budget = remainingBudget(pool);
+    const need = estimateRunNeed(opts.wallets);
+    if (budget != null && budget < need) {
+      console.log(
+        chalk.yellow(
+          `  ⚠ OpenSea budget: ~${budget} call(s) left, this run needs ~${need} for ${opts.wallets} wallet(s).`
+        )
+      );
+      console.log(
+        chalk.gray(`    Minting more keys will not help — the quota belongs to the IP, not the key.`)
+      );
+    }
+  }
+
+  // 0. Mint only when the pool cannot supply enough keys — never on a calendar.
+  //    The old trigger replaced every key once all of them passed 3 days, which
+  //    discarded keys that had just probed alive and capped the fleet at ~6
+  //    (2 creations/day × 3 days). A key is a credential, not capacity: the
+  //    budget belongs to the IP, so wallets share one freely.
+  const supplyable = pool.filter((e) => canSupplyKey(e.last_probe)).length;
+  if (supplyable < KEY_TARGET_USABLE) {
+    const need = KEY_TARGET_USABLE - supplyable;
     console.log(
-      chalk.yellow(
-        `  ⚠ Pool keys are all older than ${KEY_MAX_AGE_DAYS} days — minting fresh key(s) to replace them.`
+      chalk.gray(
+        `  OpenSea: ${supplyable} usable key(s) in pool — minting up to ${need} (target ${KEY_TARGET_USABLE}).`
       )
     );
-    const fresh = await mintFreshKeys(2);
+    const fresh = await mintFreshKeys(need);
     if (fresh.length > 0) {
       // Re-read rather than trust the pre-mint snapshot: minting mutates the
       // pool, and a snapshot would let the same key appear twice.
-      const freshKeys = new Set(fresh.map((e) => e.api_key));
-      const kept = loadKeyPool().filter((e) => !isKeyStale(e) && !freshKeys.has(e.api_key));
-      saveKeyPool([...fresh, ...kept]);
       pool = loadKeyPool();
-      console.log(chalk.green(`  ✓ Pool refreshed: ${fresh.length} new key(s), ${kept.length} retained.`));
-    } else {
-      console.log(chalk.yellow("  ⚠ Refresh failed (quota or network) — keeping the existing keys as fallback."));
+      console.log(
+        chalk.green(
+          `  ✓ Pool: ${fresh.length} new key(s), ${pool.filter((e) => canSupplyKey(e.last_probe)).length} usable total.`
+        )
+      );
     }
   }
 
   // 1. If pool has keys, probe and pick the best — NON-BLOCKING (≤3s)
   if (pool.length > 0) {
-    console.log(chalk.gray(`  OpenSea: probing ${pool.length} key(s) in pool...`));
+    console.log(chalk.gray(`  OpenSea: ranking ${pool.length} key(s) in pool (cached verdicts, verifying the best)...`));
     const result = await pickBestKey(pool, probeTimeout);
     if (result) {
       // Increment usage counter for the chosen key

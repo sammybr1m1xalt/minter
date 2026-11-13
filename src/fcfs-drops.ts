@@ -20,6 +20,7 @@ import {
 } from "./opensea-gql";
 import { resolveChain } from "./chains";
 import { mintableFromCap } from "./mint-cap";
+import { noteKeyCall } from "./opensea-key";
 
 const OPENSEA_BASE = "https://api.opensea.io";
 
@@ -951,6 +952,10 @@ export async function getPhaseEligibility(args: {
     }
 
     if (gql && gql.authed) {
+      // One OpenSea call spent. Counted here so the pool's cached counter stays
+      // close to reality between probes — the eligibility pass is the largest
+      // burst a run makes before T-0.
+      if (apiKey) noteKeyCall(apiKey);
       const scoped = scopeStages(gql.stages, matchUuid, (s) => s.uuid);
       if (scoped) {
         // A stage naming a DIFFERENT wallet is not about us. Ignore it — but do

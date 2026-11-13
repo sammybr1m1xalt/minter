@@ -42,6 +42,7 @@ export { isPayloadBoundToWallet } from "./seadrop-calldata";
 import { SEADROP_ADDRESS, OPENSEA_FEE_RECIPIENT } from "./seadrop-public";
 import { ConfirmedTx } from "./rpc-health";
 import { buildOpenseaMint, OpenseaMintTx, parsePriceField, parsePriceToWei } from "./opensea-gql";
+import { noteKeyCall } from "./opensea-key";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
 import { autoGasBounded } from "./auto-gas";
 import { withDeadlineOrThrow } from "./deadline";
@@ -1486,7 +1487,12 @@ export async function fetchSignedPayloadForWallet(
       // mintData/signature is not for this wallet, reject it.
       // The mintData calldata encodes the recipient; we check it here.
       // Verify the payload is bound to the requested wallet address before using it.
-      if (isPayloadBoundToWallet(payload, walletAddress)) return payload;
+      if (isPayloadBoundToWallet(payload, walletAddress)) {
+        // The T-0 burst spends this key once per wallet; recording it here is
+        // what keeps the pool's budget gate honest for the next run.
+        noteKeyCall(apiKey);
+        return payload;
+      }
       // Not bound to this wallet — reject it, but do NOT give up. The session
       // path below asks OpenSea for a payload bound to THIS wallet, and
       // returning null here dropped the wallet outright.
@@ -1502,6 +1508,7 @@ export async function fetchSignedPayloadForWallet(
       nftContract, quantity, session, apiKey, { timeoutMs, slug: opts.slug, walletAddress, chainKey: opts.chainKey }
     );
     if (payload && isPayloadBoundToWallet(payload, walletAddress)) {
+      if (apiKey) noteKeyCall(apiKey);
       return payload;
     }
   }

@@ -210,7 +210,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
   console.log(chalk.bold.white("\nOpenSea API key"));
   console.log(chalk.gray("  Checking for a usable key..."));
 
-  const keyResult = await getValidApiKey({ timeoutMs: 8000 });
+  const keyResult = await getValidApiKey({ timeoutMs: 8000, wallets: walletKeys.length });
   const apiKey = keyResult?.api_key || undefined;
   console.log(chalk.gray(`  Key source: ${keyResult?.source || "none"}`));
 

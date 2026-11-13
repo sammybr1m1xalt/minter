@@ -343,7 +343,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/contract-verify.ts`](src/contract-verify.ts) | The gate that makes the scanner safe — checks a candidate really is a contract |
 | [`src/sell-after-mint.ts`](src/sell-after-mint.ts) | Offer ranking, net-proceeds guard, Seaport calldata, sale orchestration |
 | [`src/seaport-abi.ts`](src/seaport-abi.ts) | Verified Seaport 1.5 / 1.6 ABIs (from Sourcify) |
-| [`src/opensea-key.ts`](src/opensea-key.ts) | API key pool — auto-mint, probe, rank, 3-day refresh |
+| [`src/opensea-key.ts`](src/opensea-key.ts) | API key pool — lazy probe, state-based retirement, budget gate |
 | [`src/opensea-session.ts`](src/opensea-session.ts) | SIWE session cookies per wallet |
 | [`src/session-store.ts`](src/session-store.ts) | Single source of truth for the on-disk session paths |
 | [`src/opensea-gql.ts`](src/opensea-gql.ts) | GraphQL queries and response parsing |
@@ -393,6 +393,29 @@ to ask what the contract is:
 
 Warnings never silently become part of the transaction. A contract that only
 warns is mintable; one that refuses or cannot be read is not.
+
+### API key pool
+
+The pool holds a handful of free OpenSea keys. It exists for **availability**, not
+capacity: the rate-limit budget belongs to the IP, so ten wallets on one key and
+ten wallets on five keys spend the same. Extra keys buy redundancy (a key can be
+revoked or start returning 403) and hedge against a per-key burst limit.
+
+Three rules follow from that:
+
+- **Probe lazily.** A verdict is trusted for 10 minutes; only the key about to be
+  used is verified. A full census of the pool costs one call per key, every run,
+  spent learning what one call would have told you — and probing draws on the same
+  budget as minting.
+- **Mint only when the pool cannot supply a key** (fewer than 3 usable), never on a
+  calendar. The old trigger replaced every key once all of them passed 3 days,
+  discarding keys that had just probed alive and capping the fleet at ~6.
+- **Retire on evidence.** A key is dropped when a probe says `dead`, never because
+  it is old. Age only makes a verdict decay in the ranking.
+
+Before a run the tool compares the remaining budget against the run's estimated
+call count (about 2 per wallet) and warns when it is short. Minting cannot fix
+that — the quota is the IP's, not the key's.
 
 ### Doctor
 
