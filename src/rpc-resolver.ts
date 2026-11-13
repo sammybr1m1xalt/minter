@@ -142,7 +142,42 @@ interface RpcPlan {
 export function isBenignProbeError(message: string | undefined): boolean {
   return /not allowed|does not exist|not supported|method not found|not enabled|unsupported/i.test(message ?? "");
 }
-async function probe(rpcUrl: string, timeoutMs = 8000): Promise<{ chainId: number | null; error?: string; timedOut?: boolean }> {
+
+/**
+ * True when a probe failure means the request never reached the endpoint, or
+ * the connection could not be established — as opposed to the endpoint
+ * answering with an error.
+ *
+ * Undici wraps every socket-level failure in a generic `TypeError: fetch
+ * failed` and puts the real code on `.cause` (`UND_ERR_CONNECT_TIMEOUT`,
+ * `UND_ERR_SOCKET`, `ETIMEDOUT`, `ECONNREFUSED`, …). Only our own AbortSignal
+ * produces an AbortError.
+ *
+ * This distinction is load-bearing: treating "fetch failed" as evidence the
+ * endpoint is broken makes `planRpcs` DROP a working endpoint from the blast
+ * set during a bad network minute — removing the only inclusion path, and
+ * doing it silently.
+ */
+export function isTransportProbeError(
+  message: string | null | undefined,
+  causeCode?: string | null
+): boolean {
+  if (!message) return false;
+  if (message === "timed out" || message === "fetch failed") return true;
+  return /UND_ERR_|ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH/i.test(
+    `${message} ${causeCode ?? ""}`
+  );
+}
+
+/**
+ * Probe one endpoint. `unreachable` covers BOTH our own timeout and a
+ * transport failure: in both cases the endpoint did not answer, so no verdict
+ * about it is possible.
+ */
+async function probe(
+  rpcUrl: string,
+  timeoutMs = 8000
+): Promise<{ chainId: number | null; error?: string; unreachable?: boolean }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -163,14 +198,13 @@ async function probe(rpcUrl: string, timeoutMs = 8000): Promise<{ chainId: numbe
     if (json.error?.message) return { chainId: null, error: json.error.message };
     return { chainId: null, error: `HTTP ${res.status}` };
   } catch (err: unknown) {
-    // Distinguish "we could not tell" (aborted) from "the endpoint answered
-    // with an error". Only the second is evidence the endpoint is broken.
+    // Distinguish "we could not tell" from "the endpoint answered with an
+    // error". Only the second is evidence the endpoint is broken.
     const aborted = err instanceof Error && (err.name === "AbortError" || /abort/i.test(err.message));
-    return {
-      chainId: null,
-      error: aborted ? "timed out" : err instanceof Error ? err.message : String(err),
-      timedOut: aborted,
-    };
+    const message = aborted ? "timed out" : err instanceof Error ? err.message : String(err);
+    const causeCode = (err as { cause?: { code?: string } })?.cause?.code;
+    const unreachable = aborted || isTransportProbeError(message, causeCode);
+    return { chainId: null, error: unreachable ? "unreachable" : message, unreachable };
   } finally {
     clearTimeout(timer);
   }
@@ -206,7 +240,7 @@ export async function planRpcs(urls: string[], expectedChainId: number): Promise
   // not tell", so it stays.
   const broken = new Set(
     probes
-      .filter((p) => p.chainId === null && p.error && !p.timedOut && !isBenignProbeError(p.error))
+      .filter((p) => p.chainId === null && p.error && !p.unreachable && !isBenignProbeError(p.error))
       .map((p) => p.url)
   );
   const sendOnly = probes

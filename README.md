@@ -153,6 +153,7 @@ explicitly confirm.
 | `npm start -- --help` | Print all CLI flags |
 | `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
 | `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases, whether your wallet can target each, and how many tokens it can mint |
+| `npm start -- --doctor` | Read-only health report — config, wallets, key pool, SIWE sessions, and RPC latency/chain-id per chain. Exits 1 if anything will stop a run |
 
 ### Flags
 
@@ -172,6 +173,7 @@ passed to `--fcfs`.
 npm start -- --fcfs de-bots
 npm start -- --fcfs de-bots --at "in 5m" --max-price 0.01
 npm start -- --eligibility 0x8d80efb61341e4b8459fbb52b213d5c25a1af179
+npm start -- --doctor
 npm start -- --fcfs 0xabc… on base --quantity 3 --wallets all
 ```
 
@@ -321,7 +323,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 
 ## Architecture
 
-42 TypeScript modules, ~24.4k lines. The important ones:
+43 TypeScript modules, ~25k lines. The important ones:
 
 | Module | Role |
 |---|---|
@@ -357,6 +359,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/scatter.ts`](src/scatter.ts) | Scatter.art collections and mint calldata |
 | [`src/price-protection.ts`](src/price-protection.ts) | Price-cap parsing and enforcement |
 | [`src/logger.ts`](src/logger.ts) | Per-run log files in `.minter-logs/` |
+| [`src/doctor.ts`](src/doctor.ts) | `--doctor` — one read-only health report: config, wallets, key pool, sessions, RPC per chain |
 
 ### The two mint paths
 
@@ -390,6 +393,23 @@ to ask what the contract is:
 
 Warnings never silently become part of the transaction. A contract that only
 warns is mintable; one that refuses or cannot be read is not.
+
+### Doctor
+
+`npm start -- --doctor` prints one health report: config presence, loaded wallets,
+the OpenSea key pool (live-probing the best key), per-wallet SIWE session
+validity, and every chain's RPC endpoints with latency and chain-id
+verification. It exits 1 when something will stop a run.
+
+It is read-only — it never logs in, never writes a file, and never moves funds —
+so it is safe to run on a machine with no wallet. It prints no secrets: keys are
+shown by name and fingerprint, endpoints by hostname only.
+
+Two verdicts it deliberately does not give. An endpoint that does not answer is
+`unknown`, not broken — a timeout or a socket failure says nothing about the
+endpoint, so it stays in the blast set rather than being dropped. And a chain
+where no endpoint answered with the right chain id is a warning, not a blocker:
+firing is still possible, only the reads (nonce, gas, simulation) are unverified.
 
 ### How the fire reaches the chain
 

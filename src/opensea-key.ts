@@ -93,7 +93,7 @@ export interface KeyPoolEntry {
  * human-readable; the fingerprint distinguishes two same-named keys without
  * revealing key material.
  */
-function keyLabel(entry: { api_key: string; name?: string }): string {
+export function keyLabel(entry: { api_key: string; name?: string }): string {
   const name = entry.name?.trim();
   const fp = require("node:crypto")
     .createHash("sha256")

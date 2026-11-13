@@ -86,6 +86,41 @@ function loadPersistedSessions(): void {
   }
 }
 
+// ── Read-only inspection (doctor) ────────────────────────────────────────────
+
+export interface StoredSessionStatus {
+  address: string;
+  /** Unix seconds. 0 when the token carried no expiry. */
+  exp: number;
+  expKnown: boolean;
+  expired: boolean;
+  tokenPresent: boolean;
+  cookieCount: number;
+}
+
+/**
+ * Report the persisted sessions without touching the network or creating one.
+ *
+ * Deliberately side-effect free apart from the one-time disk read: a doctor run
+ * must never trigger a login, because a login costs a wallet signature and a
+ * doctor run may have no wallet at all. An unreadable jar yields an empty list,
+ * which the caller reports as "no sessions" rather than as an error.
+ */
+export function inspectStoredSessions(): StoredSessionStatus[] {
+  loadPersistedSessions();
+  const now = Math.floor(Date.now() / 1000);
+  return [...sessions.entries()]
+    .map(([address, s]) => ({
+      address,
+      exp: s.exp,
+      expKnown: s.exp > 0,
+      expired: s.exp > 0 && s.exp <= now,
+      tokenPresent: !!s.token,
+      cookieCount: s.cookies.size,
+    }))
+    .sort((a, b) => a.address.localeCompare(b.address));
+}
+
 function persistSessions(): void {
   try {
     const payload: PersistedSiweSessions = { version: 1, sessions: {} };
