@@ -69,6 +69,22 @@ const T0_PAYLOAD_WINDOW_MS = 30_000;
 const T0_PAYLOAD_RETRY_MS = 2_000;
 const T0_PAYLOAD_MAX_ATTEMPTS = 15;
 
+// Pre-poll window: how far before T-0 to start trying to fetch signed payloads.
+//
+// A payload issued before its stage opens cannot be broadcast (the signed
+// mintParams carry startTime/endTime), but having it in hand removes the fetch
+// from the T-0 critical path. 30s is long enough to catch a signer that comes
+// up early, short enough that a payload found at the very start is still likely
+// to be the final one — and it is re-checked at T-0 regardless.
+const PREPOLL_LEAD_MS = 30_000;
+// 5s, not 2s. Every poll costs one API call per still-missing wallet, and the
+// free tier is ~120 calls/min. At 2s a 90s pre-poll window is 44 calls per
+// wallet — 6 wallets would be ~176/min and would rate-limit itself into the
+// exact failure this is meant to prevent. 5s is ~18 calls per wallet, and a
+// signer that comes up usually stays up, so 5s granularity does not meaningfully
+// delay discovery.
+const PREPOLL_INTERVAL_MS = 5_000;
+
 // ── OpenSea v2 shapes (read from the live response, not hardcoded magic) ──
 
 export interface SeaDropDropMeta {
@@ -1077,6 +1093,87 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
 
   // ══ WAIT ════════════════════════════════════════════════════════════════
   const delay = targetStart.getTime() - Date.now();
+
+  // ══ PRE-POLL (during the wait, before T-0) ═══════════════════════════════
+  //
+  // A signed payload cannot be broadcast before its stage opens — the signed
+  // mintParams carry startTime/endTime, so an early payload reverts on-chain.
+  // But OpenSea will often ISSUE a payload shortly before the window, and
+  // fetching it during the wait removes the fetch from the T-0 critical path
+  // entirely.
+  //
+  // This polls from T-minus-PREPOLL_LEAD_MS. A payload found here is held and
+  // re-checked at T-0; it is never broadcast early. If OpenSea does not sign
+  // until the window opens, the poll simply finds nothing and the existing T-0
+  // fetch behaves exactly as before — this can only help, never hurt.
+  if (pendingAtT0.length > 0 && delay > PREPOLL_LEAD_MS + 2_000) {
+    const prepollUntil = targetStart.getTime() - PREPOLL_LEAD_MS;
+    console.log(
+      chalk.gray(`  Pre-polling for signed payloads from ${new Date(prepollUntil).toISOString().slice(11, 19)} (T-${PREPOLL_LEAD_MS / 1000}s)...`)
+    );
+    const prepolled = new Map<number, FcfsSignedPayload>();
+    const pollStarted = Date.now();
+    while (Date.now() < prepollUntil) {
+      const remaining = prepollUntil - Date.now();
+      // Poll at most every 2s, and never past the deadline.
+      const budget = Math.min(PREPOLL_INTERVAL_MS, Math.max(0, remaining));
+      if (budget <= 0) break;
+      await new Promise((r) => setTimeout(r, budget));
+      if (Date.now() >= prepollUntil) break;
+      // Only poll wallets still missing a payload.
+      const want = pendingAtT0.filter((p) => !prepolled.has(p.walletIndex));
+      if (want.length === 0) break;
+      const got = await Promise.all(
+        want.map(async ({ walletIndex, addr }) => {
+          try {
+            const p = await fetchSignedPayloadForWallet(
+              nftContract,
+              fireQuantities.get(walletIndex) ?? quantity,
+              addr,
+              openSeaApiKey,
+              {
+                timeoutMs: 6000,
+                session: opts.sessions?.[walletIndex] ?? null,
+                slug,
+                chainKey,
+              },
+            );
+            return p ? { walletIndex, addr, payload: p } : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+      for (const g of got) {
+        if (!g) continue;
+        if (!isPayloadBoundToWallet(g.payload, g.addr)) continue;
+        prepolled.set(g.walletIndex, g.payload);
+        console.log(chalk.green(`    ✓ Payload in hand early for ${g.addr}`));
+      }
+    }
+    if (prepolled.size > 0) {
+      const secs = ((Date.now() - pollStarted) / 1000).toFixed(0);
+      console.log(chalk.gray(`  Pre-poll secured ${prepolled.size}/${pendingAtT0.length} payload(s) in ${secs}s.`));
+      // Move secured wallets from the T-0 set into ready, so the T-0 fetch only
+      // runs for the ones still missing.
+      for (let i = pendingAtT0.length - 1; i >= 0; i--) {
+        const p = pendingAtT0[i];
+        const payload = prepolled.get(p.walletIndex);
+        if (!payload) continue;
+        ready.push({
+          walletIndex: p.walletIndex,
+          addr: p.addr,
+          to: payload.seaDropAddress,
+          data: payload.mintData,
+          value: payload.value,
+          gasLimit: gasLimit || SIGNED_GAS_FLOOR,
+        });
+        pendingAtT0.splice(i, 1);
+      }
+    }
+  }
+
+  // ══ WAIT ════════════════════════════════════════════════════════════════
   if (delay > 0) {
     console.log(`  Waiting ${Math.round(delay / 1000)}s until target start...`);
     await waitWithKeepAlive(rpcUrls, delay);
