@@ -295,21 +295,52 @@ The scanner's ranking is where a silent bug is most expensive: a scoring change
 returns the wrong contract and nothing looks wrong. `fixtures/scanner/` holds
 saved inputs — a real OpenSea collection page and its API payload, a real
 webpack 5.94 build, a real SPA shell — plus small synthetic cases for individual
-rules (sentinel exclusion, key strength, nesting depth, chunk paths, API-path
-discovery). `npm run test:scanner` checks them.
+rules (sentinel exclusion, key strength, nesting depth, weak parent keys,
+shared infrastructure, chunk paths, API-path discovery, base64 payloads).
+`npm run test:scanner` checks them.
 
 No test framework is involved: the runner states an expectation per case and
-reports which failed. One case starts a local HTTP server to pin behaviour that
-only exists across requests — that the API scan does **not** stop at the first
-endpoint that answers. Stopping there lets a shared contract (a marketplace, a
-payment router) end the scan before the collection itself is fetched, and
-ranking cannot recover from data it never saw.
+reports which failed. Three cases start a local HTTP server to pin behaviour
+that only exists across requests:
 
-Chunk discovery covers both mechanisms: string literals (`import("./x.js")`,
-`new URL("./x.js", import.meta.url)`, quoted asset paths) and webpack's numeric
-ids, which are resolved through the runtime's own filename function. The two
-halves live in different files — the `.u` function in the runtime chunk, the
-`.e(480)` calls in the entry chunk — so that resolution needs two passes.
+- the API scan does **not** stop at the first endpoint that answers — stopping
+  there lets a shared contract (a marketplace, a payment router) end the scan
+  before the collection is fetched, and ranking cannot recover from data it
+  never saw;
+- duplicate response bodies are not counted twice, which would otherwise
+  multiply the frequency signal;
+- an API mounted at a subpath the page never links to is still found.
+
+### What the scanner looks at
+
+- **The shell HTML**, including `data-api` / `data-endpoint` / `<form action>`
+  paths, not just bundle text.
+- **Every script and chunk**, breadth-first. Literal paths (`import()`,
+  `new URL(..., import.meta.url)`, quoted assets) and webpack's numeric ids —
+  the latter resolved through the runtime's own filename function. The two
+  halves live in different files (`.u` in the runtime chunk, `.e(480)` in the
+  entry chunk), so that resolution needs two passes.
+- **Embedded base64 JSON** — `data:application/json;base64,…` is decoded first;
+  base64 never contains the characters of an address.
+- **API endpoints**, including absolute and protocol-relative URLs, re-anchored
+  at the app root derived from the page URL *and* from the page's own links.
+
+### Ranking
+
+Evidence is weighted: a mint control beats a strong JSON key, which beats a
+contracts list, which beats frequency, which beats a script blob, which beats
+bare text. Three corrections keep shared addresses from winning:
+
+- **Currency sentinels** (native identifier, wrapped native) are excluded.
+- **Shared infrastructure** — Seaport 1.1/1.5/1.6, the conduit controller,
+  OpenSea's fee recipient — is *demoted*, not excluded: they are real contracts,
+  so they stay on the list but cannot outrank the collection.
+- **Weak parent keys** — an address inside `paymentTokens` / `pricingCurrencies`
+  is a token even when its own key is the ambiguous `address`.
+
+Responses are capped at 5 MB and reported as truncated rather than silently
+incomplete, and the scan stops early only on a *decisive* signal — a strong body
+that names something which is not platform infrastructure.
 
 ### Things that will not work automatically
 

@@ -30,8 +30,13 @@ resolving numeric ids needs two passes.
 | `currency-noise.html` | Native-token sentinels (0x000…000, WETH) repeat more than the collection and must be excluded. |
 | `ambiguous-address.json` | `contractAddress` outranks `address`, which outranks `stageAddress`. |
 | `depth.json` | A collection-level object beats item objects nested inside it, same key name. |
+| `weak-parent.json` | An address under a plain `address` key *inside* `paymentTokens` is a token — the immediate key cannot tell, the enclosing one can. |
+| `shared-infrastructure.json` | Seaport is a real contract, so it is demoted rather than excluded. |
 | `vite-entry.js` | String-literal chunk paths: `import()`, `new URL(..., import.meta.url)`, quoted assets. |
+| `cross-origin-entry.js` | CDN chunks: `import()` and `new URL()` are code references, so cross-origin is allowed there; bare quoted paths stay same-origin. |
 | `api-paths.js` | Endpoint discovery, template-literal prefixes, and the static-asset denylist. |
+| `html-api-paths.html` | Endpoint paths in the shell — `data-api`, `data-endpoint`, `<form action>`. |
+| `base64-payload.html` | `data:application/json;base64,…` is decoded before scanning; the fixture contains no plaintext address at all. |
 
 ## Regenerating the live ones
 

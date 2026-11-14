@@ -46,6 +46,10 @@ export interface ScanResult {
 
 const ADDR_RE = /0x[a-fA-F0-9]{40}/g;
 
+/** Non-global form for one-off tests. A global regex carries `lastIndex`, so
+ *  calling .test() on it is stateful and alternates between matches. */
+const ADDR_TEST_RE = /0x[a-fA-F0-9]{40}/;
+
 /** Keys that strongly suggest the value is a collection contract. */
 const STRONG_KEYS = [
   "contractaddress",
@@ -107,6 +111,47 @@ export function extractAddressOccurrences(text: string): Map<string, number> {
   return counts;
 }
 
+// ── Embedded base64 payloads ────────────────────────────────────────────────
+
+/**
+ * Decode base64 to UTF-8 text.
+ *
+ * Uses the globals (atob + TextDecoder) rather than Buffer so this module stays
+ * environment-agnostic — it is pure and imports nothing.
+ */
+function base64ToUtf8(b64: string): string | null {
+  try {
+    const bin = atob(b64.replace(/\s+/g, ""));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Find embedded base64 JSON payloads and decode them.
+ *
+ * Some sites ship their config as a data: URI rather than plain JSON. Base64
+ * never contains the characters of a 0x address, so those payloads are
+ * invisible to a text scan until decoded.
+ *
+ * Only `data:application/json;base64,…` is recognised — an unambiguous marker.
+ * A bare base64-looking string is NOT decoded: guessing would turn every hash
+ * and every PNG on the page into candidate text.
+ */
+function extractBase64Json(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(/data:application\/json;base64,([A-Za-z0-9+/=\s]{40,40000})/g)) {
+    const decoded = base64ToUtf8(m[1]);
+    // Only keep payloads that actually carry an address — decoding a megabyte
+    // of unrelated data to find nothing is pure cost.
+    if (decoded && ADDR_TEST_RE.test(decoded)) out.push(decoded);
+  }
+  return out;
+}
+
 /** Pull out the bodies of every <script> tag. */
 export function scriptBodies(html: string): string[] {
   const bodies: string[] = [];
@@ -133,6 +178,31 @@ function extractKeyedAddresses(
 }
 
 /**
+ * The key of the object that directly encloses a position, or null.
+ *
+ * Looks back to the nearest `{`, then reads the nearest `"key":` before it.
+ * One level is enough for the case that matters: an address inside
+ * `"paymentTokens":[{"address":"0x…"}]` is a token, whatever its own key says.
+ */
+function enclosingKey(text: string, index: number): string | null {
+  const before = text.slice(0, index);
+  const brace = before.lastIndexOf("{");
+  if (brace < 0) return null;
+  const chunk = text.slice(Math.max(0, brace - 200), brace);
+  const matches = [...chunk.matchAll(/"([A-Za-z_][A-Za-z0-9_]*)"\s*:/g)];
+  return matches.length > 0 ? matches[matches.length - 1][1] : null;
+}
+
+/**
+ * Keys whose contents are currencies or payment tokens — never the collection.
+ *
+ * The immediate key cannot tell these apart: both use a plain "address". The
+ * enclosing key can, and an address under one of these is a token even when its
+ * own key is the ambiguous "address".
+ */
+const WEAK_PARENT_KEYS = ["paymenttokens", "pricingcurrencies", "currencies", "paymenttoken"];
+
+/**
  * Find addresses that appear under a recognisable JSON key, tagged with the
  * nesting depth of the object that holds them.
  *
@@ -147,8 +217,8 @@ function extractKeyedAddresses(
  */
 function extractKeyedAddressesWithDepth(
   text: string
-): { address: string; key: string; depth: number }[] {
-  const out: { address: string; key: string; depth: number }[] = [];
+): { address: string; key: string; depth: number; parent: string | null }[] {
+  const out: { address: string; key: string; depth: number; parent: string | null }[] = [];
   const re = /"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"(0x[a-fA-F0-9]{40})"/g;
 
   let depth = 0;
@@ -161,7 +231,12 @@ function extractKeyedAddressesWithDepth(
       else if (ch === "}") depth = Math.max(0, depth - 1);
     }
     cursor = m.index;
-    out.push({ address: m[2], key: m[1], depth: Math.max(0, depth) });
+    out.push({
+      address: m[2],
+      key: m[1],
+      depth: Math.max(0, depth),
+      parent: enclosingKey(text, m.index),
+    });
   }
   return out;
 }
@@ -272,6 +347,55 @@ export const CURRENCY_SENTINELS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Well-known shared infrastructure, per chain — the contracts a marketplace or
+ * launch platform uses for EVERY drop.
+ *
+ * Different from the currency sentinels: these ARE contracts, so they are
+ * DEMOTED rather than excluded. Dropping one outright would hide a genuine
+ * candidate if a site ever did point at it; demoting keeps it on the list while
+ * making clear it is not the collection being viewed.
+ *
+ * Only Ethereum mainnet is populated — those are addresses this project has
+ * already verified from its own ABIs (src/seaport-abi.ts, src/mint-generic.ts,
+ * src/sell-after-mint.ts). Other chains deploy their own copies at different
+ * addresses; add them once verified rather than guessing.
+ */
+export const SHARED_INFRASTRUCTURE: Readonly<Record<string, readonly string[]>> = {
+  ethereum: [
+    // Seaport — the marketplace every OpenSea sale settles through.
+    "0x00000000006c3852cbef3e08e8df289169ede581", // 1.1
+    "0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC", // 1.5
+    "0x0000000000000068F116a894984e2DB1123eB395", // 1.6
+    // Seaport conduit controller.
+    "0x00000000f9490004c11cef243f5400493c00ad63",
+    // OpenSea's fee recipient — repeated across every drop on the platform.
+    "0x0000a26b00c1F0DF003000390027140000fAa719",
+  ],
+};
+
+/** How far a shared-infrastructure address is demoted. Large enough to drop it
+ *  below a real collection, small enough to keep it on the list. */
+const SHARED_INFRASTRUCTURE_PENALTY = 25;
+
+function flattenSharedInfrastructure(
+  groups: Readonly<Record<string, readonly string[]>>
+): string[] {
+  const out: string[] = [];
+  for (const list of Object.values(groups)) out.push(...list);
+  return out;
+}
+
+/**
+ * Every known shared-infrastructure address, flattened. The default demotion
+ * set for callers that do not know which chain they are looking at.
+ */
+export const SHARED_INFRASTRUCTURE_SENTINELS: ReadonlySet<string> = new Set(
+  // Normalised: ranking compares lowercased addresses, and the source ABIs
+  // record these checksummed — an unnormalized entry would silently never match.
+  flattenSharedInfrastructure(SHARED_INFRASTRUCTURE).map((a) => a.toLowerCase())
+);
+
+/**
  * Rank candidates by evidence. The ordering reflects how trustworthy each
  * signal is:
  *
@@ -305,7 +429,18 @@ export function rankCandidates(
    * supported chain's native and wrapped-native token. Pass a chain-specific
    * set when the caller knows the network.
    */
-  currencySentinels: ReadonlySet<string> = CURRENCY_SENTINELS
+  currencySentinels: ReadonlySet<string> = CURRENCY_SENTINELS,
+  /**
+   * Shared-infrastructure addresses to demote. Defaults to
+   * SHARED_INFRASTRUCTURE_SENTINELS; pass an empty set to disable demotion.
+   */
+  sharedInfrastructure: ReadonlySet<string> = SHARED_INFRASTRUCTURE_SENTINELS,
+  /**
+   * Addresses sitting inside a currency/payment-token list, from
+   * extractKeyedAddressesWithDepth. Their own key is often the ambiguous
+   * "address", so the enclosing key is what identifies them as tokens.
+   */
+  weakParents?: ReadonlySet<string>
 ): AddressCandidate[] {
   const score = new Map<string, number>();
   const source = new Map<string, AddressCandidate["source"]>();
@@ -352,7 +487,7 @@ export function rankCandidates(
     const depth = depths?.get(address.toLowerCase()) ?? 0;
     const depthPenalty = Math.min(depth, 10);
 
-    if (WEAK_KEYS.includes(lowerKey)) {
+    if (WEAK_KEYS.includes(lowerKey) || weakParents?.has(address.toLowerCase())) {
       bump(address, 2, "json-key", key);
     } else if (STRONG_KEYS.includes(lowerKey)) {
       bump(address, Math.max(5, 40 - depthPenalty), "json-key", key);
@@ -400,8 +535,14 @@ export function rankCandidates(
   }
 
   const out: AddressCandidate[] = [];
-  for (const [addr, pts] of score) {
+  for (const [addr, raw] of score) {
     if (isPlaceholder(addr)) continue;
+    // Shared infrastructure is demoted, not excluded: it stays on the list so a
+    // site that genuinely points at one is still reported, but it cannot outrank
+    // the collection being viewed.
+    const pts = sharedInfrastructure.has(addr)
+      ? Math.max(0, raw - SHARED_INFRASTRUCTURE_PENALTY)
+      : raw;
     out.push({
       address: addr,
       score: pts,
@@ -431,12 +572,18 @@ export function scanHtml(
   html: string,
   currencySentinels: ReadonlySet<string> = CURRENCY_SENTINELS
 ): ScanResult {
-  const all = extractAddresses(html);
+  // Decode embedded base64 payloads and scan them alongside the markup: base64
+  // never contains the characters of an address, so those payloads would
+  // otherwise be invisible.
+  const decoded = extractBase64Json(html);
+  const text = decoded.length > 0 ? `${html}\n${decoded.join("\n")}` : html;
+
+  const all = extractAddresses(text);
   if (all.length === 0) {
     return { candidates: [], totalFound: 0, empty: true };
   }
 
-  const keyedWithDepth = extractKeyedAddressesWithDepth(html);
+  const keyedWithDepth = extractKeyedAddressesWithDepth(text);
   const keyed = keyedWithDepth.map(({ address, key }) => ({ address, key }));
   const depths = new Map<string, number>();
   for (const k of keyedWithDepth) {
@@ -447,10 +594,19 @@ export function scanHtml(
     const prev = depths.get(a);
     if (prev === undefined || k.depth < prev) depths.set(a, k.depth);
   }
-  const contractsBlock = extractContractsBlockAddresses(html);
-  const buttons = extractMintButtonAddresses(html);
+  const contractsBlock = extractContractsBlockAddresses(text);
+  const buttons = extractMintButtonAddresses(text);
 
-  const scripts = scriptBodies(html);
+  // Addresses inside a currency/payment-token list: their own key is usually the
+  // ambiguous "address", so the enclosing key is what gives them away.
+  const weakParents = new Set<string>();
+  for (const k of keyedWithDepth) {
+    if (k.parent && WEAK_PARENT_KEYS.includes(k.parent.toLowerCase())) {
+      weakParents.add(k.address.toLowerCase());
+    }
+  }
+
+  const scripts = scriptBodies(text);
   const scriptHits = new Set<string>();
   for (const body of scripts) {
     for (const a of extractAddresses(body)) scriptHits.add(a);
@@ -463,7 +619,9 @@ export function scanHtml(
     buttons,
     extractAddressOccurrences(html),
     depths,
-    currencySentinels
+    currencySentinels,
+    SHARED_INFRASTRUCTURE_SENTINELS,
+    weakParents
   );
 
   return { candidates, totalFound: all.length, empty: candidates.length === 0 };
@@ -523,17 +681,45 @@ const NON_DATA_PATH: RegExp[] = [
 ];
 
 export function isHighConfidenceApiPath(p: string): boolean {
-  return API_PREFIXES.some((pre) => p.startsWith(pre));
+  const path = pathOf(p);
+  return path !== null && API_PREFIXES.some((pre) => path.startsWith(pre));
 }
 
-/** Extract candidate data-endpoint paths referenced in a JS bundle. */
+/**
+ * Reduce a path or URL to the path portion the denylist can test.
+ *
+ * Absolute and protocol-relative endpoints are allowed, so the denylist has to
+ * look past the origin: `https://cdn.example.com/assets/x.js` should be denied
+ * by the same rule as `/assets/x.js`.
+ */
+function pathOf(p: string): string | null {
+  if (!/^(https?:)?\/\//i.test(p)) return p;
+  try {
+    return new URL(p, "https://placeholder.invalid").pathname;
+  } catch {
+    return null;
+  }
+}
+
+/** Extract candidate data-endpoint paths referenced in a JS bundle or page. */
 export function extractApiPaths(js: string, baseUrl: string): string[] {
   const out = new Set<string>();
-  const keep = (p: string): boolean =>
-    p.length >= 3 && !NON_DATA_PATH.some((re) => re.test(p));
+  const keep = (p: string): boolean => {
+    if (p.length < 3) return false;
+    const path = pathOf(p);
+    return path !== null && !NON_DATA_PATH.some((re) => re.test(path));
+  };
 
   // "/api/..." — absolute path from the app root.
   for (const m of js.matchAll(/["'`](\/[a-zA-Z][a-zA-Z0-9_\-\/]{2,60})["'`]/g)) {
+    if (keep(m[1])) out.add(m[1]);
+  }
+  // Absolute and protocol-relative endpoints: "https://api.other.com/v1/drops".
+  // Multi-domain setups — site on one host, API on api. — are common, and the
+  // path-only pass above cannot see them.
+  for (const m of js.matchAll(
+    /["'`]((?:(?:https?:)?\/\/)[a-zA-Z0-9._-]+(?:\/[a-zA-Z0-9_\-\/]{0,60})?)["'`]/g
+  )) {
     if (keep(m[1])) out.add(m[1]);
   }
   // Template literals: `/api/campaigns/drops/${...}`. The regex above stops at
@@ -579,6 +765,9 @@ export function expandApiPaths(
 
   for (const p of paths) {
     out.add(p);
+    // Absolute and protocol-relative URLs are already complete: there is no
+    // slug to substitute and no route suffix to walk.
+    if (/^(https?:)?\/\//i.test(p)) continue;
     if (!pageSlug) continue;
 
     const segs = p.split("/").filter(Boolean);
@@ -628,6 +817,58 @@ function deriveAppRoot(pageUrl: string): string | null {
   }
 }
 
+/**
+ * Derive the app root from the page's own URLs.
+ *
+ * `deriveAppRoot` guesses from the page URL's first segment. That is wrong for
+ * a site whose app is mounted at a subpath but linked from the root:
+ * fungolabs.org serves its launchpad at /launchpad/, and its bundle references
+ * `/api/config` — which only answers at `/launchpad/api/config`. The URL guess
+ * returns null, so the re-anchor never happens and the endpoint is missed.
+ *
+ * Same-origin URLs appear throughout the HTML (href/src) and the bundles. The
+ * first path segment that repeats across them is the mount point. A single
+ * mention is not evidence, so the winner has to appear at least twice.
+ */
+function deriveAppRootFromContent(
+  html: string,
+  bundleText: string,
+  pageUrl: string
+): string | null {
+  let origin: string;
+  try {
+    origin = new URL(pageUrl).origin;
+  } catch {
+    return null;
+  }
+
+  const counts = new Map<string, number>();
+  const re = /["']((?:\.{0,2}\/|\/)[a-zA-Z0-9_\-\/\.]{1,120})["']/g;
+  for (const text of [html, bundleText]) {
+    if (!text) continue;
+    for (const m of text.matchAll(re)) {
+      let u: URL;
+      try {
+        u = new URL(m[1], pageUrl);
+      } catch {
+        continue;
+      }
+      if (u.origin !== origin) continue;
+      const segs = u.pathname.split("/").filter(Boolean);
+      if (segs.length === 0) continue;
+      const first = segs[0];
+      // Skip file-looking segments, single characters, and framework internals.
+      if (first.length < 2 || !/^[a-z0-9_\-]+$/i.test(first) || /\.[a-z0-9]+$/i.test(first)) {
+        continue;
+      }
+      counts.set(first, (counts.get(first) ?? 0) + 1);
+    }
+  }
+  if (counts.size === 0) return null;
+  const [best, n] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
+  return n >= 2 ? `/${best}/` : null;
+}
+
 /** Extract <script src> and modulepreload href URLs from a shell page. */
 export function extractScriptUrls(html: string, baseUrl: string): string[] {
   const out = new Set<string>();
@@ -651,7 +892,73 @@ export function extractScriptUrls(html: string, baseUrl: string): string[] {
 export interface BundleScanResult {
   candidates: AddressCandidate[];
   /** API endpoints that were tried, with the outcome. */
-  apiCalls: { url: string; ok: boolean; addressesFound: number }[];
+  apiCalls: { url: string; ok: boolean; addressesFound: number; truncated?: boolean }[];
+}
+
+// ── Response reading ────────────────────────────────────────────────────────
+
+/** Largest response body read into memory. Addresses live in the head of a
+ *  payload; scanning a 50 MB file in full is cost without value. */
+const MAX_BODY_BYTES = 5_000_000;
+
+/**
+ * Read a response body, stopping at `cap` bytes.
+ *
+ * `res.text()` buffers the whole body with no limit. Truncation is reported so
+ * the caller can say the body was incomplete rather than implying it saw all of
+ * it — an API that answers with a huge payload should not read as a complete
+ * scan.
+ */
+async function readBodyWithCap(
+  res: Response,
+  cap: number
+): Promise<{ text: string; truncated: boolean }> {
+  if (!res.body) {
+    const text = await res.text();
+    return { text: text.slice(0, cap), truncated: text.length > cap };
+  }
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    total += value.byteLength;
+    if (total >= cap) {
+      truncated = true;
+      break;
+    }
+  }
+  if (truncated) {
+    // Release the connection instead of draining the rest of the body.
+    reader.cancel().catch(() => {});
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    merged.set(p, offset);
+    offset += p.byteLength;
+  }
+  return { text: new TextDecoder().decode(merged), truncated };
+}
+
+/**
+ * FNV-1a, 32-bit.
+ *
+ * Used only to recognise identical response bodies so the same payload is not
+ * counted twice in the occurrence signal — several endpoints returning the same
+ * shared contract would otherwise inflate its frequency. Not a security
+ * mechanism, so a small non-cryptographic hash is the right tool.
+ */
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
 }
 
 /**
@@ -691,20 +998,23 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: nu
 export function extractChunkUrls(js: string, bundleUrl: string): string[] {
   const out = new Set<string>();
   const base = new URL(bundleUrl);
-  const patterns = [
+  // `import()` and `new URL(..., import.meta.url)` are code references: a bundle
+  // that imports a CDN chunk is loading its own code, so cross-origin is
+  // legitimate there. Bare quoted paths are more often arbitrary assets or
+  // analytics scripts, so those stay same-origin only.
+  const patterns: { re: RegExp; allowCrossOrigin: boolean }[] = [
     // import("./chunk-x.js") / import("/abs/chunk.js")
-    /import\s*\(\s*["']([^"']+\.m?js)["']\s*\)/g,
+    { re: /import\s*\(\s*["']([^"']+\.m?js)["']\s*\)/g, allowCrossOrigin: true },
     // new URL("./chunk-x.js", import.meta.url)
-    /new\s+URL\s*\(\s*["']([^"']+\.m?js)["']/g,
+    { re: /new\s+URL\s*\(\s*["']([^"']+\.m?js)["']/g, allowCrossOrigin: true },
     // Quoted path literals: "/_next/static/chunks/x.js", "/assets/index-abc.js"
-    /["']((?:\.{0,2}\/|\/)[a-zA-Z0-9_\-\/\.]+\.m?js)["']/g,
+    { re: /["']((?:\.{0,2}\/|\/)[a-zA-Z0-9_\-\/\.]+\.m?js)["']/g, allowCrossOrigin: false },
   ];
-  for (const re of patterns) {
+  for (const { re, allowCrossOrigin } of patterns) {
     for (const m of js.matchAll(re)) {
       try {
         const u = new URL(m[1], base);
-        // Same-origin only: a CDN bundle is a different host with its own rules.
-        if (u.origin !== base.origin) continue;
+        if (!allowCrossOrigin && u.origin !== base.origin) continue;
         // Skip the bundle we are already reading.
         if (u.toString() === base.toString()) continue;
         out.add(u.toString());
@@ -908,6 +1218,19 @@ function isStrongSignal(body: string): boolean {
 }
 
 /**
+ * Whether a body is strong enough to end the scan on its own.
+ *
+ * A strong signal that names only shared infrastructure is NOT decisive — that
+ * is exactly the case that used to end the scan on a marketplace contract. The
+ * body has to describe something that is not a platform constant.
+ */
+function isDecisiveSignal(body: string, shared: ReadonlySet<string>): boolean {
+  if (!isStrongSignal(body)) return false;
+  const addresses = extractAddresses(body).map((a) => a.toLowerCase());
+  return addresses.some((a) => !shared.has(a));
+}
+
+/**
  * Follow a shell page's JS bundles and their API calls.
  *
  * Order: shell HTML → script bundles (and the chunks they reference) → API
@@ -924,7 +1247,7 @@ export async function scanWithBundles(
   url: string,
   timeoutMs = 15000,
   maxBundles = 8,
-  maxApiCalls = 40,
+  maxApiCalls = 20,
   currencySentinels: ReadonlySet<string> = CURRENCY_SENTINELS
 ): Promise<(ScanResult & { apiCalls: BundleScanResult["apiCalls"] }) | null> {
   const headers = {
@@ -943,7 +1266,8 @@ export async function scanWithBundles(
       signal: AbortSignal.timeout(Math.max(500, remaining)),
     });
     if (!res.ok) return null;
-    html = await res.text();
+    const body = await readBodyWithCap(res, MAX_BODY_BYTES);
+    html = body.text;
   } catch {
     return null;
   }
@@ -958,16 +1282,26 @@ export async function scanWithBundles(
     ? scanHtml(bundleText, currencySentinels)
     : { candidates: [], totalFound: 0, empty: true };
 
-  // Stage 3: follow the API endpoints the bundles reference.
+  // Stage 3: follow the API endpoints the page references.
   //
-  // The bundle's paths are relative to the APP root, not the site root. On
+  // Paths come from BOTH the shell and the bundles. `data-api`, `<form
+  // action>`, `data-endpoint` and friends live in the HTML; the bundle pass
+  // below only ever saw the JS.
+  //
+  // Bundle paths are relative to the APP root, not the site root. On
   // fungolabs.org the app lives at /launchpad/, so the bundle says `/api/drops/x`
   // but the real endpoint is `/launchpad/api/drops/x`. Resolving against the
   // site root returns 404. We try the site root first, then re-anchor at the
   // app root derived from the page URL.
   const base = new URL(url);
-  const appRoot = deriveAppRoot(url);
-  const apiPaths = expandApiPaths(extractApiPaths(bundleText, url), url)
+  // The URL's first segment is the cheap guess; the page's own URLs are the
+  // better one, and they are what make a root-linked subpath app discoverable.
+  const appRoot =
+    deriveAppRoot(url) ?? deriveAppRootFromContent(html, bundleText, url);
+  const apiPaths = expandApiPaths(
+    [...extractApiPaths(html, url), ...(bundleText ? extractApiPaths(bundleText, url) : [])],
+    url
+  )
     // Known data-endpoint prefixes first — a path we recognise is far more
     // likely to answer than an arbitrary route the bundle happens to link.
     // Then concrete slug-substituted paths before raw placeholders, then
@@ -985,50 +1319,92 @@ export async function scanWithBundles(
 
   const apiCalls: BundleScanResult["apiCalls"] = [];
   const apiBodies: string[] = [];
-  // Stop early only on a STRONG signal.
+  const seenBodies = new Set<string>();
+  // Stop early only on a DECISIVE signal.
   //
   // The previous rule stopped on the first path that returned ANY address. A
   // shared contract — Seaport, a marketplace, a payment router — answers on
   // most mint pages, so the scan ended on the first hit and the collection
   // itself was never fetched. Ranking cannot recover from data it never saw,
   // so this is a false positive no later stage can correct.
-  let strongFound = false;
+  //
+  // "Decisive" means the body carries a strong signal AND names something that
+  // is not platform infrastructure — a Seaport-only payload is not a reason to
+  // stop. Continuing past a non-decisive body is bounded by maxApiCalls.
+  let decisiveFound = false;
+
+  /**
+   * Subpath mounts an API can live under when the page never links to it.
+   *
+   * fungolabs.org serves its app at /launchpad/ while its bundle references
+   * `/api/config` — and the HTML contains no `/launchpad` path at all, so
+   * nothing on the page reveals the mount. Only tried for known data endpoints
+   * and only when the primary candidates answered nothing, so a site that works
+   * never pays for it.
+   */
+  const COMMON_APP_MOUNTS = ["/app/", "/launchpad/", "/mint/", "/drops/", "/launch/"];
+
+  /** Try one URL. Returns the number of addresses found (-1 = request failed). */
+  const tryUrl = async (apiUrl: string): Promise<number> => {
+    try {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return -1;
+      const r = await fetch(apiUrl, {
+        headers: { "user-agent": headers["user-agent"], accept: "application/json" },
+        signal: AbortSignal.timeout(Math.max(500, remaining)),
+      });
+      if (!r.ok) {
+        apiCalls.push({ url: apiUrl, ok: false, addressesFound: 0 });
+        return -1;
+      }
+      const { text: body, truncated } = await readBodyWithCap(r, MAX_BODY_BYTES);
+      const found = extractAddresses(body).length;
+      apiCalls.push({ url: apiUrl, ok: true, addressesFound: found, truncated });
+      if (found > 0) {
+        const hash = fnv1a(body);
+        if (!seenBodies.has(hash)) {
+          seenBodies.add(hash);
+          apiBodies.push(body);
+          if (isDecisiveSignal(body, SHARED_INFRASTRUCTURE_SENTINELS)) {
+            decisiveFound = true;
+          }
+        }
+      }
+      return found;
+    } catch {
+      apiCalls.push({ url: apiUrl, ok: false, addressesFound: 0 });
+      return -1;
+    }
+  };
 
   const workers = Array.from(
-    { length: Math.min(6, apiPaths.length) },
+    { length: Math.min(4, apiPaths.length) },
     async () => {
-      while (apiPaths.length > 0 && !strongFound) {
+      while (apiPaths.length > 0 && !decisiveFound) {
         const p = apiPaths.shift()!;
+        const isAbsolute = /^(https?:)?\/\//i.test(p);
         const candidates = [new URL(p, base).toString()];
-        if (appRoot) {
+        // Absolute URLs are already complete — re-anchoring them at the app root
+        // would mangle them.
+        if (appRoot && !isAbsolute) {
           const alt = new URL(appRoot + p.replace(/^\//, ""), base).toString();
           if (alt !== candidates[0]) candidates.push(alt);
         }
+
+        let best = 0;
         for (const apiUrl of candidates) {
-          if (strongFound) return;
-          try {
-            const remaining = deadline - Date.now();
-            if (remaining <= 0) return;
-            const r = await fetch(apiUrl, {
-              headers: { "user-agent": headers["user-agent"], accept: "application/json" },
-              signal: AbortSignal.timeout(Math.max(500, remaining)),
-            });
-            if (!r.ok) {
-              apiCalls.push({ url: apiUrl, ok: false, addressesFound: 0 });
-              continue;
-            }
-            const body = await r.text();
-            const found = extractAddresses(body).length;
-            apiCalls.push({ url: apiUrl, ok: true, addressesFound: found });
-            if (found > 0) {
-              // Keep every body that carries addresses: the merged scan ranks
-              // them together, which is what separates the collection from a
-              // shared contract that happened to answer first.
-              apiBodies.push(body);
-              if (isStrongSignal(body)) strongFound = true;
-            }
-          } catch {
-            apiCalls.push({ url: apiUrl, ok: false, addressesFound: 0 });
+          if (decisiveFound) return;
+          best = Math.max(best, await tryUrl(apiUrl));
+        }
+
+        // Mount fallback: only when the primary candidates yielded nothing, and
+        // only for a path we recognise as a data endpoint.
+        if (best === 0 && !isAbsolute && isHighConfidenceApiPath(p)) {
+          for (const mount of COMMON_APP_MOUNTS) {
+            if (decisiveFound) return;
+            if (deadline - Date.now() <= 0) return;
+            const alt = new URL(mount + p.replace(/^\//, ""), base).toString();
+            if ((await tryUrl(alt)) > 0) break;
           }
         }
       }

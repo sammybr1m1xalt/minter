@@ -1,0 +1,21 @@
+{
+  "_comment": "Synthetic, in the shape of a real launchpad config (fungolabs.org's /launchpad/api/config). The payment token sits under a plain \"address\" key inside \"paymentTokens\" — the immediate key cannot tell it apart from a collection, the enclosing key can.",
+  "name": "Fungo Labs Launchpad",
+  "chains": [
+    {
+      "id": 1,
+      "name": "Ethereum",
+      "factory": "0xe00caa2946fc5919bd8a9accdfa5954640d122aa",
+      "paymentTokens": [
+        {
+          "chainId": 1,
+          "address": "0x80cb147fd86dc6dee3eee7e4cee33d1397d98071",
+          "symbol": "cZAMA",
+          "name": "Confidential ZAMA",
+          "underlying": "0xa12cc123ba206d4031d1c7f6223d1c2ec249f4f3"
+        }
+      ]
+    }
+  ],
+  "collection": { "contractAddress": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd" }
+}

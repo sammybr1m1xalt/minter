@@ -135,6 +135,76 @@ check("spa shell: an empty page reports empty, not a guess", () => {
   assert(scan.empty, "scan must be marked empty");
 });
 
+check("api paths are mined from the html shell too", () => {
+  const paths = scanner.extractApiPaths(
+    read("html-api-paths.html"),
+    "https://example.com/launchpad/drop-1"
+  );
+  has(paths, "/api/drops/1", "data-api attribute");
+  has(paths, "/api/collections/2", "data-endpoint attribute");
+  has(paths, "/api/mint", "form action");
+});
+
+check("cross-domain api urls are discovered", () => {
+  const paths = scanner.extractApiPaths(
+    'fetch("https://api.other.com/v1/drops"); fetch("//cdn.other.com/v2/nfts");',
+    "https://site.com/"
+  );
+  has(paths, "https://api.other.com/v1/drops", "absolute url");
+  has(paths, "//cdn.other.com/v2/nfts", "protocol-relative url");
+  // An absolute URL must still sort as a known data endpoint, or it loses its
+  // place in the queue to arbitrary routes.
+  assert(
+    scanner.isHighConfidenceApiPath("https://api.other.com/v1/drops"),
+    "absolute url should rank as high-confidence"
+  );
+  // Absolute URLs are complete: expandApiPaths must not try to substitute a slug.
+  const expanded = scanner.expandApiPaths(paths, "https://site.com/drop-1");
+  has(expanded, "https://api.other.com/v1/drops", "absolute url survives expansion");
+});
+
+check("cross-origin code references are followed", () => {
+  const urls = scanner.extractChunkUrls(
+    read("cross-origin-entry.js"),
+    "https://example.com/entry.js"
+  );
+  has(urls, "https://cdn.example.com/chunk-xyz.js", "cross-origin import()");
+  has(urls, "https://cdn.example.com/worker-1.js", "cross-origin new URL()");
+  has(urls, "https://example.com/assets/local-2.js", "same-origin quoted path");
+});
+
+check("base64 payloads are decoded", () => {
+  const html = read("base64-payload.html");
+  // Sanity: the fixture must not carry a plaintext address, or the case proves
+  // nothing.
+  assert(!/0x[a-fA-F0-9]{40}/.test(html), "fixture must not contain a plaintext address");
+  eq(topOf(html), "0xabcabcabcabcabcabcabcabcabcabcabcabcabca", "top candidate");
+});
+
+check("shared infrastructure is demoted, not hidden", () => {
+  const scan = scanner.scanHtml(read("shared-infrastructure.json"));
+  const collection = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+  const seaport = "0x00000000000000adc04c56bf30ac9d3c0aaf14dc";
+  eq(topOf(read("shared-infrastructure.json")), collection, "top candidate");
+  // Seaport is a real contract, so it stays on the list — demoted, not dropped.
+  const demoted = scan.candidates.find((c) => c.address === seaport);
+  assert(demoted, "Seaport must remain a candidate");
+  assert(demoted.score < scan.candidates[0].score, "Seaport must not outrank the collection");
+});
+
+check("an address inside a payment-token list is a token", () => {
+  const json = read("weak-parent.json");
+  const scan = scanner.scanHtml(json);
+  eq(topOf(json), "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd", "top candidate");
+  const token = scan.candidates.find(
+    (c) => c.address === "0x80cb147fd86dc6dee3eee7e4cee33d1397d98071"
+  );
+  assert(token, "the payment token must still be listed");
+  // Its own key is the ambiguous "address"; without the enclosing-key check it
+  // scored 11 and beat everything on the page.
+  assert(token.score <= 2, `payment token should be scored as weak, got ${token.score}`);
+});
+
 // ── Live case: the API scan must not stop on the first answer ────────────────
 //
 // A shared contract (a marketplace, a payment router) answers on most mint
@@ -197,6 +267,74 @@ checkAsync("api scan: does not stop on the first endpoint that answers", () =>
       assert(
         tried.some((u) => u.endsWith("/api/collection")),
         `collection endpoint was never fetched; tried ${JSON.stringify(tried)}`
+      );
+    }
+  )
+);
+
+checkAsync("api scan: duplicate bodies are not counted twice", () =>
+  withServer(
+    (req, res) => {
+      const send = (body, type = "application/json") => {
+        res.writeHead(200, { "content-type": type });
+        res.end(body);
+      };
+      if (req.url === "/page") {
+        send('<html><body><script src="/bundle.js"></script></body></html>', "text/html");
+      } else if (req.url === "/bundle.js") {
+        send(
+          'fetch("/api/a");fetch("/api/b");fetch("/api/c");fetch("/api/collection");',
+          "text/javascript"
+        );
+      } else if (req.url === "/api/collection") {
+        send(`{"contracts":[{"address":"${COLLECTION}"}]}`);
+      } else if (/^\/api\/[abc]$/.test(req.url)) {
+        // Three endpoints, one identical body.
+        send(`{"address":"${SHARED}"}`);
+      } else {
+        res.writeHead(404).end();
+      }
+    },
+    async (base) => {
+      const result = await scanner.scanWithBundles(`${base}/page`, 10000, 8, 40);
+      const shared = result.candidates.find((c) => c.address === SHARED);
+      assert(shared, "shared contract must be a candidate");
+      // Occurrence is the strongest signal in the ranking. Counting the same body
+      // three times would let a shared contract outrank the collection.
+      eq(shared.occurrences, 1, "occurrences for a triplicated body");
+    }
+  )
+);
+
+checkAsync("api scan: a mounted api is found when the page never links to it", () =>
+  withServer(
+    (req, res) => {
+      const send = (body, type = "application/json") => {
+        res.writeHead(200, { "content-type": type });
+        res.end(body);
+      };
+      if (req.url === "/") {
+        send('<html><body><script src="/bundle.js"></script></body></html>', "text/html");
+      } else if (req.url === "/bundle.js") {
+        send('fetch("/api/config");', "text/javascript");
+      } else if (req.url === "/api/config") {
+        // Answers, but carries no addresses — the shape a site has when its API
+        // actually lives under a mount the page never references.
+        send('{"chains":[{"id":1}]}');
+      } else if (req.url === "/launchpad/api/config") {
+        send(`{"contracts":[{"address":"${COLLECTION}"}]}`);
+      } else {
+        res.writeHead(404).end();
+      }
+    },
+    async (base) => {
+      const result = await scanner.scanWithBundles(`${base}/`, 10000, 8, 20);
+      assert(result !== null, "scan must return a result");
+      eq(result.candidates[0]?.address ?? null, COLLECTION, "top candidate");
+      const tried = result.apiCalls.map((c) => c.url);
+      assert(
+        tried.some((u) => u.endsWith("/launchpad/api/config")),
+        `mounted endpoint was never tried: ${JSON.stringify(tried)}`
       );
     }
   )
