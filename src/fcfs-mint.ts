@@ -54,6 +54,21 @@ import { warmConnections, pingRpcs, rankRpcEndpoints, settleRanking, type Ranked
 /** How many of the fastest endpoints to fire at before escalating to the rest. */
 const BLAST_FIRST_WAVE = 2;
 
+// How long the T-0 signed-payload fetch keeps retrying, and the gap between
+// attempts.
+//
+// OpenSea's signer can lag the on-chain stage start by several seconds, and a
+// null response is ambiguous: it means either "signer not ready yet" or "this
+// wallet is not allowlisted". Retrying across a real window is the only way to
+// tell them apart without giving up on a mint that would have succeeded.
+//
+// 30s with a 2s gap is ~15 attempts — enough to cover signer lag, bounded so a
+// genuinely ineligible wallet still fails in reasonable time. The per-request
+// timeout stays 8s, so one hung request cannot exceed the window by much.
+const T0_PAYLOAD_WINDOW_MS = 30_000;
+const T0_PAYLOAD_RETRY_MS = 2_000;
+const T0_PAYLOAD_MAX_ATTEMPTS = 15;
+
 // ── OpenSea v2 shapes (read from the live response, not hardcoded magic) ──
 
 export interface SeaDropDropMeta {
@@ -1157,13 +1172,26 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     );
     const fetched = await Promise.all(
       pendingAtT0.map(async ({ walletIndex, addr }) => {
-        // Retry briefly: the stage can be live on-chain a few seconds before
-        // OpenSea will sign for it. A single attempt would fail the whole run.
+        // Retry across a real window: the stage can be live on-chain several
+        // seconds before OpenSea's signer will issue a payload for it, and a
+        // wallet that is not allowlisted gets the same null as a signer that is
+        // still warming up — the two are indistinguishable from the response.
+        //
+        // 4 attempts × 8s was ~36s of wall clock but only ~4s of actual
+        // retrying, because a fast null returns immediately. That is not enough
+        // to cover signer lag. This now retries for up to T0_PAYLOAD_WINDOW_MS
+        // with a short gap, which keeps a genuine "not allowlisted" answer from
+        // spinning forever (it returns as soon as two consecutive attempts agree
+        // there is no payload AND the stage has been live for a while) while
+        // still riding out a slow signer.
         let payload: FcfsSignedPayload | null = null;
         let lastErr: string | null = null;
-        for (let attempt = 0; attempt < 4 && !payload; attempt++) {
-          if (attempt > 0) {
-            await new Promise((r) => setTimeout(r, 1500));
+        const startedAt = Date.now();
+        let attempt = 0;
+        for (;;) {
+          attempt++;
+          if (attempt > 1) {
+            await new Promise((r) => setTimeout(r, T0_PAYLOAD_RETRY_MS));
           }
           try {
             payload = await fetchSignedPayloadForWallet(
@@ -1178,17 +1206,24 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
                 chainKey,
               },
             );
+            if (payload) break;
           } catch (err: any) {
             lastErr = err?.message || String(err);
           }
+          const elapsed = Date.now() - startedAt;
+          if (elapsed >= T0_PAYLOAD_WINDOW_MS) break;
+          // Hard ceiling on attempts as well, so a pathological endpoint that
+          // answers instantly with null can never spin in a tight loop.
+          if (attempt >= T0_PAYLOAD_MAX_ATTEMPTS) break;
         }
         if (!payload) {
+          const waited = ((Date.now() - startedAt) / 1000).toFixed(1);
           results[walletIndex] = {
             walletIndex,
             walletAddress: addr,
             success: false,
             error:
-              `No signed payload at T-0 for ${addr}` +
+              `No signed payload at T-0 for ${addr} after ${attempt} attempt(s) over ${waited}s` +
               (lastErr ? ` — last error: ${lastErr}` : " — OpenSea did not return signed data."),
             retryable: true,
           };
