@@ -561,8 +561,8 @@ export function rankCandidates(
 /**
  * Scan a page and return ranked candidate addresses.
  *
- * Pure function — the caller fetches the HTML. Keeping this separate from the
- * network means it can be tested against saved fixtures.
+ * Pure function — the caller fetches the HTML. No network and no chain calls, so
+ * the ranking can be exercised directly on any saved page.
  *
  * `currencySentinels` defaults to CURRENCY_SENTINELS; pass a chain-specific
  * set when the caller knows the network, or an empty set to disable the
@@ -1039,7 +1039,9 @@ export function extractChunkUrls(js: string, bundleUrl: string): string[] {
 // minified (`n`, `__webpack_require__`, anything at all), so this matches on
 // the PROPERTY name, not the object.
 //
-// Verified against webpack 5.94.0 output — see fixtures/scanner/webpack-runtime.js.
+// Verified against a real webpack 5.94.0 build (runtimeChunk: "single", two
+// dynamic imports): the runtime object is minified, the hash map is inlined, and
+// `.u` plus `.e(480)` land in different chunks.
 
 /**
  * Read a JS expression starting at `start`, stopping at a top-level `,` or `;`,

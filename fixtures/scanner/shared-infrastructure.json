@@ -1,5 +1,0 @@
-{
-  "_comment": "Synthetic. Seaport is a real contract, so it is DEMOTED rather than excluded: it must stay on the list but cannot outrank the collection being viewed.",
-  "contracts": [{"address": "0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC"}],
-  "collection": {"contractAddress": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"}
-}

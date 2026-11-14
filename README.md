@@ -289,29 +289,7 @@ currency address is never mistaken for a collection contract. Add an entry if
 your chain's native token has a contract of its own (as Arc's USDC does) or if it
 has a wrapped native token.
 
-### 5. Site-scanner regression fixtures
-
-The scanner's ranking is where a silent bug is most expensive: a scoring change
-returns the wrong contract and nothing looks wrong. `fixtures/scanner/` holds
-saved inputs — a real OpenSea collection page and its API payload, a real
-webpack 5.94 build, a real SPA shell — plus small synthetic cases for individual
-rules (sentinel exclusion, key strength, nesting depth, weak parent keys,
-shared infrastructure, chunk paths, API-path discovery, base64 payloads).
-`npm run test:scanner` checks them.
-
-No test framework is involved: the runner states an expectation per case and
-reports which failed. Three cases start a local HTTP server to pin behaviour
-that only exists across requests:
-
-- the API scan does **not** stop at the first endpoint that answers — stopping
-  there lets a shared contract (a marketplace, a payment router) end the scan
-  before the collection is fetched, and ranking cannot recover from data it
-  never saw;
-- duplicate response bodies are not counted twice, which would otherwise
-  multiply the frequency signal;
-- an API mounted at a subpath the page never links to is still found.
-
-### What the scanner looks at
+### 5. What the site scanner looks at
 
 - **The shell HTML**, including `data-api` / `data-endpoint` / `<form action>`
   paths, not just bundle text.
@@ -325,7 +303,7 @@ that only exists across requests:
 - **API endpoints**, including absolute and protocol-relative URLs, re-anchored
   at the app root derived from the page URL *and* from the page's own links.
 
-### Ranking
+### 6. How candidates are ranked
 
 Evidence is weighted: a mint control beats a strong JSON key, which beats a
 contracts list, which beats frequency, which beats a script blob, which beats
@@ -608,8 +586,8 @@ None of these block a mint.
 3. **Sell-after-mint broadcast is unverified.** See above.
 4. **Soneium ABI lookups depend on Sourcify alone** — Etherscan V2 rejects chain
    ID 1868.
-5. **No test suite is committed.** The test harness and fixtures were removed;
-   `npm test` is no longer defined in `package.json`. Typecheck
+5. **No test suite is committed.** The test harness and page fixtures were
+   removed, and no test script is defined in `package.json`. Typecheck
    (`npm run typecheck`) and build (`npm run build`) are the remaining gates.
 
 ---
