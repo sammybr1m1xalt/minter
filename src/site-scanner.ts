@@ -1338,13 +1338,12 @@ export async function scanWithBundles(
   /**
    * Subpath mounts an API can live under when the page never links to it.
    *
-   * fungolabs.org serves its app at /launchpad/ while its bundle references
-   * `/api/config` — and the HTML contains no `/launchpad` path at all, so
-   * nothing on the page reveals the mount. Only tried for known data endpoints
-   * and only when the primary candidates answered nothing, so a site that works
-   * never pays for it.
+   * Generic app nouns only — the scanner is not tuned to any one site, so a
+   * mount that belongs to a particular platform is not listed here. Only tried
+   * for known data endpoints and only when the primary candidates answered
+   * nothing, so a site that works never pays for it.
    */
-  const COMMON_APP_MOUNTS = ["/app/", "/launchpad/", "/mint/", "/drops/", "/launch/"];
+  const COMMON_APP_MOUNTS = ["/app/", "/mint/", "/drops/", "/launch/", "/platform/"];
 
   /** Try one URL. Returns the number of addresses found (-1 = request failed). */
   const tryUrl = async (apiUrl: string): Promise<number> => {
