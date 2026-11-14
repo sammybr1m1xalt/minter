@@ -7,6 +7,7 @@ import { formatEther, JsonRpcProvider, Wallet } from "ethers";
 import { ChainProfile } from "./chains";
 import { askChoice, askNumber, askYesNo } from "./prompt";
 import { toIST } from "./time-format";
+import { SIGNED_GAS_FLOOR } from "./auto-gas";
 import {
   executeSellAfterMint,
   fetchUsdPrice,
@@ -52,7 +53,7 @@ export async function promptGasGwei(
   rpcUrls: string[],
   envMaxFeeOverride?: number,
   envPriorityOverride?: number,
-): Promise<{ maxFeePerGasWei: bigint; maxPriorityFeePerGasWei: bigint; defaultGasLimit: number }> {
+): Promise<{ maxFeePerGasWei: bigint; maxPriorityFeePerGasWei: bigint; defaultGasLimit: number; maxGasLimit: number }> {
   console.log(chalk.bold.white("\nGas"));
 
   const envMaxFee = envMaxFeeOverride ?? Number(process.env.MAX_FEE_PER_GAS || (chainProfile.key === "ethereum" ? 80 : 2));
@@ -78,6 +79,12 @@ export async function promptGasGwei(
     maxFeePerGasWei: gweiToWei(gf),
     maxPriorityFeePerGasWei: gweiToWei(pr),
     defaultGasLimit,
+    // A configured GAS_LIMIT is a user ceiling for PUBLIC mints. Signed and
+    // allowlist stages carry a mintParams struct and (for merkle stages) a
+    // variable-length proof, so a 250k ceiling that is fine for publicMint
+    // reverts on out-of-gas for them — and an out-of-gas revert at T-0 is
+    // unrecoverable. The caller raises this to the signed floor when needed.
+    maxGasLimit: Math.max(defaultGasLimit, SIGNED_GAS_FLOOR),
   };
 }
 

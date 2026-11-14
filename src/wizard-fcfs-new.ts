@@ -568,7 +568,10 @@ export async function runFcfsBranch(
       const gas = await promptGasGwei(chainProfile, rpcUrls);
       maxFeePerGas = gas.maxFeePerGasWei;
       maxPriorityFeePerGas = gas.maxPriorityFeePerGasWei;
-      gasLimit = gas.defaultGasLimit || 250_000;
+      // maxGasLimit, not defaultGasLimit: this branch is allowlist/FCFS, whose
+      // transactions carry a mintParams struct and possibly a merkle proof. A
+      // public-mint GAS_LIMIT ceiling reverts on out-of-gas at T-0.
+      gasLimit = gas.maxGasLimit;
     }
   }
 

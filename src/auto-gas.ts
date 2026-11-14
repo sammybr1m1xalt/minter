@@ -15,6 +15,17 @@
 import { JsonRpcProvider } from "ethers";
 import { isIndeterminateRpcError } from "./simulate";
 
+// Fallback gas limit for signed / allowlist stages when neither OpenSea nor a
+// live estimate supplies one.
+//
+// Higher than the 250k public-mint floor because these transactions carry a
+// mintParams struct and, for merkle stages, a proof whose length varies with the
+// tree. 250k is comfortable for publicMint and a genuine under-estimate for
+// proof-bearing stages — which then revert on out-of-gas at T-0 with no way to
+// recover. Shared by fcfs-mint.ts and wizard-helpers.ts so the floor cannot drift
+// between the plan builder and the wizard's configured ceiling.
+export const SIGNED_GAS_FLOOR = 400_000;
+
 export interface AutoGasRequest {
   to: string;
   from?: string;

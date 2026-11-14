@@ -44,7 +44,7 @@ import { ConfirmedTx } from "./rpc-health";
 import { buildOpenseaMint, OpenseaMintTx, parsePriceField, parsePriceToWei } from "./opensea-gql";
 import { noteKeyCall } from "./opensea-key";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
-import { autoGasBounded } from "./auto-gas";
+import { autoGasBounded, SIGNED_GAS_FLOOR } from "./auto-gas";
 import { withDeadlineOrThrow } from "./deadline";
 import { assertPriceProtection } from "./price-protection";
 import { reconcileQuantity } from "./mint-cap";
@@ -53,12 +53,6 @@ import { warmConnections, pingRpcs, rankRpcEndpoints, settleRanking, type Ranked
 
 /** How many of the fastest endpoints to fire at before escalating to the rest. */
 const BLAST_FIRST_WAVE = 2;
-
-// Fallback gas limit for signed / allowlist stages when neither OpenSea nor a
-// live estimate provides one. Higher than the public-mint floor because these
-// transactions carry a mintParams struct and (for allowlist stages) a merkle
-// proof whose length varies with the tree.
-const SIGNED_GAS_FLOOR = 400_000;
 
 // ── OpenSea v2 shapes (read from the live response, not hardcoded magic) ──
 

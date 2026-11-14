@@ -826,7 +826,10 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         rpcUrls,
         maxFeePerGas: gas.maxFeePerGasWei,
         maxPriorityFeePerGas: gas.maxPriorityFeePerGasWei,
-        gasLimit: gas.defaultGasLimit,
+        // Signed/allowlist stages need the higher floor. A GAS_LIMIT set in .env
+        // (250000 here) is a public-mint ceiling; passing it verbatim to a
+        // merkle-proof mint reverts on out-of-gas at T-0, unrecoverably.
+        gasLimit: gas.maxGasLimit,
         targetStart: targetStart || new Date(selectedDrop.startTime * 1000),
         plan: mintPlan,
         payloads: preFetched,
@@ -873,6 +876,47 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
               ? "SUCCESS"
               : "FAILED"),
       }));
+    }
+
+    // ── 16b. Report the outcome ──────────────────────────────────────────────
+    //
+    // mintOutcomes was previously assigned and then only handed to the sell step,
+    // which ignores it. A mint that failed silently therefore produced NO output
+    // at all: the run printed the last progress line ("Phase is live — fetching
+    // signed payloads…") and then ended, looking like an abort with no cause.
+    //
+    // Every wallet must be accounted for, including the ones that never got a
+    // result object (those are reported as NOT SENT below).
+    {
+      const reported = new Map(mintOutcomes.map((o) => [o.walletIndex, o]));
+      console.log(chalk.bold.white("\n──────── MINT OUTCOME ────────"));
+      let anySent = false;
+      let anySuccess = false;
+      for (let i = 0; i < walletKeys.length; i++) {
+        const w = new Wallet(walletKeys[i]);
+        const o = reported.get(i);
+        if (!o) {
+          console.log(chalk.gray(`  [W${i}] ${w.address} — NOT SENT (no result)`));
+          continue;
+        }
+        if (o.txHash) {
+          anySent = true;
+          const ok = o.status === "SUCCESS";
+          if (ok) anySuccess = true;
+          console.log(
+            ok
+              ? chalk.green(`  [W${i}] ${w.address} — ${o.status} — ${o.txHash}`)
+              : chalk.yellow(`  [W${i}] ${w.address} — ${o.status} — ${o.txHash}`)
+          );
+        } else {
+          console.log(chalk.red(`  [W${i}] ${w.address} — ${o.status} (no tx hash)`));
+        }
+      }
+      if (!anySent) {
+        console.log(chalk.red("\n  No transaction was broadcast for any wallet."));
+      } else if (!anySuccess) {
+        console.log(chalk.yellow("\n  Transactions were broadcast but none confirmed successful."));
+      }
     }
 
     // ── 17. Sell after mint ──────────────────────────────────────────────────
