@@ -1,0 +1,11 @@
+{
+  "_comment": "Synthetic. Exercises the depth penalty: the collection-level object is shallower than the item objects nested inside it, so the collection's own contractAddress must win even though every item carries the same key name.",
+  "collection": {
+    "contractAddress": "0x5555555555555555555555555555555555555555"
+  },
+  "items": [
+    { "token": { "contractAddress": "0x6666666666666666666666666666666666666666" } },
+    { "token": { "contractAddress": "0x7777777777777777777777777777777777777777" } },
+    { "token": { "contractAddress": "0x8888888888888888888888888888888888888888" } }
+  ]
+}

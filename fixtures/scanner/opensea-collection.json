@@ -1,0 +1,67 @@
+{
+  "collection" : "gloombles",
+  "name" : "gloombles",
+  "description" : "unbothered by design \n",
+  "image_url" : "https://i2c.seadn.io/collection/gloombles-558562907/image_type_logo/d819226f53c7f6f043bfc13430cb6b/05d819226f53c7f6f043bfc13430cb6b.png",
+  "banner_image_url" : "https://i2c.seadn.io/collection/gloombles-558562907/image_type_hero_desktop/fd31c72f4b56e6ddb6bff9b44fb20e/84fd31c72f4b56e6ddb6bff9b44fb20e.png",
+  "owner" : "0xa20beb377b1c0326c62d0af7f5a1a79f1df54abc",
+  "safelist_status" : "verified",
+  "category" : "pfps",
+  "is_disabled" : false,
+  "is_nsfw" : false,
+  "trait_offers_enabled" : false,
+  "collection_offers_enabled" : true,
+  "opensea_url" : "https://opensea.io/collection/gloombles",
+  "project_url" : "https://gloombles.com/",
+  "wiki_url" : "",
+  "discord_url" : "",
+  "telegram_url" : "",
+  "twitter_username" : "Gloombles",
+  "instagram_username" : "",
+  "contracts" : [ {
+    "address" : "0x64c32eb3a4b4c33dc6cf94e89a5542dd30c99b3a",
+    "chain" : "ethereum"
+  } ],
+  "editors" : [ "0xa20beb377b1c0326c62d0af7f5a1a79f1df54abc" ],
+  "fees" : [ {
+    "fee" : 1.0,
+    "recipient" : "0x0000a26b00c1f0df003000390027140000faa719",
+    "required" : true
+  }, {
+    "fee" : 5.0,
+    "recipient" : "0xa20beb377b1c0326c62d0af7f5a1a79f1df54abc",
+    "required" : false
+  } ],
+  "rarity" : {
+    "calculated_at" : "2026-11-14T09:33:01.696475",
+    "max_rank" : 1980,
+    "total_supply" : 1980,
+    "strategy_id" : "openrarity",
+    "strategy_version" : "1.0"
+  },
+  "total_supply" : 1980,
+  "unique_item_count" : 1980,
+  "created_date" : "2026-07-22",
+  "pricing_currencies" : {
+    "listing_currency" : {
+      "symbol" : "ETH",
+      "address" : "0x0000000000000000000000000000000000000000",
+      "chain" : "ethereum",
+      "image" : "https://raw2.seadn.io/currency_logos/ETH.svg",
+      "name" : "Ethereum",
+      "decimals" : 18,
+      "eth_price" : "1",
+      "usd_price" : "1904.62"
+    },
+    "offer_currency" : {
+      "symbol" : "WETH",
+      "address" : "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "chain" : "ethereum",
+      "image" : "https://raw2.seadn.io/currency_logos/WETH.svg",
+      "name" : "Wrapped Ethereum",
+      "decimals" : 18,
+      "eth_price" : "0.998939420986863521",
+      "usd_price" : "1902.6"
+    }
+  }
+}

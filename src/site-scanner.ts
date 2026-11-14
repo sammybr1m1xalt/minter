@@ -91,6 +91,22 @@ export function extractAddresses(html: string): string[] {
   return [...found];
 }
 
+/**
+ * Count address occurrences in the raw text, REPEATS INCLUDED.
+ *
+ * Separate from extractAddresses because that one dedupes: a page that mentions
+ * the collection 161 times and a stage address once must not look identical to
+ * the ranking. Keys are lowercased so `0xABC…` and `0xabc…` count together.
+ */
+export function extractAddressOccurrences(text: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const m of text.matchAll(ADDR_RE)) {
+    const a = m[0].toLowerCase();
+    counts.set(a, (counts.get(a) ?? 0) + 1);
+  }
+  return counts;
+}
+
 /** Pull out the bodies of every <script> tag. */
 export function scriptBodies(html: string): string[] {
   const bodies: string[] = [];
@@ -273,7 +289,15 @@ export function rankCandidates(
   contractsBlock: string[],
   scriptHits: string[],
   buttonHits: string[],
-  allAddresses: string[],
+  /**
+   * Occurrence counts from the RAW text, repeats included — build them with
+   * extractAddressOccurrences.
+   *
+   * This is deliberately NOT extractAddresses' output: that function dedupes,
+   * so feeding it here made every count 1 and silently disabled the frequency
+   * signal the ranking is built around.
+   */
+  occurrences: Map<string, number>,
   /** Optional per-address nesting depth, from extractKeyedAddressesWithDepth. */
   depths?: Map<string, number>,
   /**
@@ -283,11 +307,6 @@ export function rankCandidates(
    */
   currencySentinels: ReadonlySet<string> = CURRENCY_SENTINELS
 ): AddressCandidate[] {
-  const occurrences = new Map<string, number>();
-  for (const a of allAddresses) {
-    occurrences.set(a, (occurrences.get(a) ?? 0) + 1);
-  }
-
   const score = new Map<string, number>();
   const source = new Map<string, AddressCandidate["source"]>();
   const keyName = new Map<string, string>();
@@ -442,7 +461,7 @@ export function scanHtml(
     contractsBlock,
     [...scriptHits],
     buttons,
-    all,
+    extractAddressOccurrences(html),
     depths,
     currencySentinels
   );
@@ -664,11 +683,10 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: nu
  * Following `<script src>` alone therefore misses exactly the pages that need
  * the scanner most.
  *
- * Only string-literal references are resolved — `import("./chunk-x.js")`,
+ * String-literal references are resolved here — `import("./chunk-x.js")`,
  * `new URL("./x.js", import.meta.url)`, and quoted paths ending in .js/.mjs.
- * Webpack's numeric chunk ids (`__webpack_require__.e("chunk-3")`) cannot be
- * resolved without the runtime's filename template, so they are skipped rather
- * than guessed.
+ * Webpack's numeric ids are a separate mechanism with its own resolver; see
+ * extractWebpackChunkUrls.
  */
 export function extractChunkUrls(js: string, bundleUrl: string): string[] {
   const out = new Set<string>();
@@ -679,7 +697,7 @@ export function extractChunkUrls(js: string, bundleUrl: string): string[] {
     // new URL("./chunk-x.js", import.meta.url)
     /new\s+URL\s*\(\s*["']([^"']+\.m?js)["']/g,
     // Quoted path literals: "/_next/static/chunks/x.js", "/assets/index-abc.js"
-    /["']((?:\.{0,2}\/|\/)[a-zA-Z0-9_\-\/.]+\.m?js)["']/g,
+    /["']((?:\.{0,2}\/|\/)[a-zA-Z0-9_\-\/\.]+\.m?js)["']/g,
   ];
   for (const re of patterns) {
     for (const m of js.matchAll(re)) {
@@ -698,6 +716,108 @@ export function extractChunkUrls(js: string, bundleUrl: string): string[] {
   return [...out];
 }
 
+// ── Webpack numeric chunk ids ────────────────────────────────────────────────
+//
+// A webpack app loads lazy chunks by NUMBER — `__webpack_require__.e(480)` —
+// which means nothing on its own. The runtime in the same app carries the
+// filename function that maps it:
+//
+//   n.u = e => "static/js/" + e + "." + {480:"cbafb9", 544:"04bb7c"}[e] + ".js"
+//   n.p = ""                                    // public path
+//
+// So the URL is computable rather than guessable. The runtime object is
+// minified (`n`, `__webpack_require__`, anything at all), so this matches on
+// the PROPERTY name, not the object.
+//
+// Verified against webpack 5.94.0 output — see fixtures/scanner/webpack-runtime.js.
+
+/**
+ * Read a JS expression starting at `start`, stopping at a top-level `,` or `;`,
+ * or at the close of the bracket the expression opens. String literals are
+ * skipped so a separator inside quotes does not end the read.
+ */
+function readJsExpression(js: string, start: number): string | null {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = start; i < js.length; i++) {
+    const c = js[i];
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      quote = c;
+    } else if (c === "{" || c === "(" || c === "[") {
+      depth++;
+    } else if (c === "}" || c === ")" || c === "]") {
+      if (depth === 0) return js.slice(start, i);
+      depth--;
+    } else if ((c === "," || c === ";") && depth === 0) {
+      return js.slice(start, i);
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve webpack's numeric chunk ids to URLs using the runtime's own filename
+ * function.
+ *
+ * Returns [] when the text is not a webpack runtime, or when the filename
+ * function cannot be evaluated — a build that references the runtime object
+ * itself instead of inlining its hash map is not resolvable from text alone.
+ * Skipping is correct: an invented URL is worse than none.
+ *
+ * `baseUrl` should be the PAGE url, not the bundle url: webpack's publicPath is
+ * page-relative.
+ */
+export function extractWebpackChunkUrls(js: string, baseUrl: string): string[] {
+  const out = new Set<string>();
+  const uMatch = js.match(/(\w+)\.u\s*=\s*/);
+  if (!uMatch || uMatch.index === undefined) return [];
+
+  const expr = readJsExpression(js, uMatch.index + uMatch[0].length);
+  if (!expr || expr.length === 0 || expr.length > 800) return [];
+
+  // The public path the runtime prepends to every chunk filename.
+  let publicPath = "";
+  const pMatch = js.match(new RegExp(`${uMatch[1]}\\.p\\s*=\\s*("[^"]*"|'[^']*')`));
+  if (pMatch) publicPath = pMatch[1].slice(1, -1);
+
+  // Every numeric chunk id the text loads. `.e=` (the definition) does not
+  // match, because the regex requires an opening parenthesis.
+  const ids = new Set<string>();
+  for (const m of js.matchAll(/\.e\s*\(\s*["']?(\d+)["']?\s*\)/g)) ids.add(m[1]);
+  if (ids.size === 0) return [];
+
+  let filenameFor: (id: string) => unknown;
+  try {
+    const fn = new Function(`return (${expr})`)();
+    if (typeof fn !== "function") return [];
+    filenameFor = fn;
+  } catch {
+    return [];
+  }
+
+  for (const id of ids) {
+    let filename: unknown;
+    try {
+      filename = filenameFor(id);
+    } catch {
+      continue;
+    }
+    if (typeof filename !== "string" || filename.length === 0) continue;
+    try {
+      const ref = /^https?:\/\//.test(filename) ? filename : publicPath + filename;
+      out.add(new URL(ref, baseUrl).toString());
+    } catch {
+      // Malformed reference — skip.
+    }
+  }
+  return [...out];
+}
+
 /**
  * Fetch a page's bundles breadth-first, following chunk references.
  *
@@ -707,7 +827,8 @@ export function extractChunkUrls(js: string, bundleUrl: string): string[] {
 async function fetchBundlesBfs(
   entryUrls: string[],
   deadline: number,
-  maxBundles: number
+  maxBundles: number,
+  pageUrl: string
 ): Promise<string> {
   const userAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -715,32 +836,75 @@ async function fetchBundlesBfs(
   const queue = [...entryUrls];
   const chunks: string[] = [];
 
-  while (queue.length > 0 && seen.size < maxBundles) {
-    const batch = queue.splice(0, Math.min(4, maxBundles - seen.size));
-    const texts = await mapLimit(batch, 4, async (u) => {
-      if (seen.has(u)) return "";
-      seen.add(u);
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) return "";
-      try {
-        const r = await fetch(u, {
-          headers: { "user-agent": userAgent },
-          signal: AbortSignal.timeout(Math.max(500, remaining)),
-        });
-        return r.ok ? await r.text() : "";
-      } catch {
-        return "";
+  const drain = async (): Promise<void> => {
+    while (queue.length > 0 && seen.size < maxBundles) {
+      const batch = queue.splice(0, Math.min(4, maxBundles - seen.size));
+      const texts = await mapLimit(batch, 4, async (u) => {
+        if (seen.has(u)) return "";
+        seen.add(u);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return "";
+        try {
+          const r = await fetch(u, {
+            headers: { "user-agent": userAgent },
+            signal: AbortSignal.timeout(Math.max(500, remaining)),
+          });
+          return r.ok ? await r.text() : "";
+        } catch {
+          return "";
+        }
+      });
+      for (let i = 0; i < texts.length; i++) {
+        const text = texts[i];
+        if (!text) continue;
+        chunks.push(text);
+        // Chunk references are resolved against the bundle they appear in.
+        for (const ref of extractChunkUrls(text, batch[i])) queue.push(ref);
       }
-    });
-    for (let i = 0; i < texts.length; i++) {
-      const text = texts[i];
-      if (!text) continue;
-      chunks.push(text);
-      // Chunk references are resolved against the bundle they appear in.
-      for (const ref of extractChunkUrls(text, batch[i])) queue.push(ref);
     }
+  };
+
+  await drain();
+
+  // Webpack resolves lazy chunks by number, and the two halves live in
+  // DIFFERENT files: the filename function is in the runtime chunk, the
+  // `.e(480)` calls are in the entry chunk. Neither is resolvable alone, so
+  // this runs once over everything read so far and any chunks it reveals are
+  // fetched in a second pass.
+  //
+  // Resolved against the PAGE, not a bundle: webpack's publicPath is
+  // page-relative.
+  for (const u of extractWebpackChunkUrls(chunks.join("\n"), pageUrl)) {
+    if (!seen.has(u)) queue.push(u);
   }
+  await drain();
+
   return chunks.join("\n");
+}
+
+/**
+ * Whether a response body identifies the collection strongly enough to stop
+ * scanning.
+ *
+ * "Any address" is not enough: shared contracts (Seaport, a marketplace, a
+ * payment router) appear on most mint pages and would otherwise end the scan on
+ * the first hit, before the collection itself is fetched. Three signals say a
+ * body describes the thing being viewed:
+ *
+ *   - a dedicated `"contracts":[…]` list,
+ *   - a mint control pointing at an address,
+ *   - an address under an unambiguous key ("contractAddress", "nftContract", …).
+ *
+ * Deliberately cheap: this runs per response body, so it reuses the extractors
+ * rather than running the full ranking.
+ */
+function isStrongSignal(body: string): boolean {
+  if (extractContractsBlockAddresses(body).length > 0) return true;
+  if (extractMintButtonAddresses(body).length > 0) return true;
+  for (const { key } of extractKeyedAddresses(body)) {
+    if (STRONG_KEYS.includes(key.toLowerCase())) return true;
+  }
+  return false;
 }
 
 /**
@@ -789,7 +953,7 @@ export async function scanWithBundles(
 
   // Stage 2: follow the bundles, breadth-first through their chunk references.
   const scriptUrls = extractScriptUrls(html, url).slice(0, maxBundles);
-  const bundleText = await fetchBundlesBfs(scriptUrls, deadline, maxBundles);
+  const bundleText = await fetchBundlesBfs(scriptUrls, deadline, maxBundles, url);
   const bundleScan = bundleText
     ? scanHtml(bundleText, currencySentinels)
     : { candidates: [], totalFound: 0, empty: true };
@@ -820,16 +984,20 @@ export async function scanWithBundles(
     .slice(0, maxApiCalls);
 
   const apiCalls: BundleScanResult["apiCalls"] = [];
-  let apiText = "";
-  // Set as soon as any path yields addresses. Every later call would be spent
-  // on a question already answered — the old code broke only the INNER loop and
-  // kept walking every remaining path.
-  let foundAny = false;
+  const apiBodies: string[] = [];
+  // Stop early only on a STRONG signal.
+  //
+  // The previous rule stopped on the first path that returned ANY address. A
+  // shared contract — Seaport, a marketplace, a payment router — answers on
+  // most mint pages, so the scan ended on the first hit and the collection
+  // itself was never fetched. Ranking cannot recover from data it never saw,
+  // so this is a false positive no later stage can correct.
+  let strongFound = false;
 
   const workers = Array.from(
     { length: Math.min(6, apiPaths.length) },
     async () => {
-      while (apiPaths.length > 0 && !foundAny) {
+      while (apiPaths.length > 0 && !strongFound) {
         const p = apiPaths.shift()!;
         const candidates = [new URL(p, base).toString()];
         if (appRoot) {
@@ -837,7 +1005,7 @@ export async function scanWithBundles(
           if (alt !== candidates[0]) candidates.push(alt);
         }
         for (const apiUrl of candidates) {
-          if (foundAny) return;
+          if (strongFound) return;
           try {
             const remaining = deadline - Date.now();
             if (remaining <= 0) return;
@@ -853,9 +1021,11 @@ export async function scanWithBundles(
             const found = extractAddresses(body).length;
             apiCalls.push({ url: apiUrl, ok: true, addressesFound: found });
             if (found > 0) {
-              apiText += "\n" + body;
-              foundAny = true;
-              return;
+              // Keep every body that carries addresses: the merged scan ranks
+              // them together, which is what separates the collection from a
+              // shared contract that happened to answer first.
+              apiBodies.push(body);
+              if (isStrongSignal(body)) strongFound = true;
             }
           } catch {
             apiCalls.push({ url: apiUrl, ok: false, addressesFound: 0 });
@@ -866,8 +1036,8 @@ export async function scanWithBundles(
   );
   await Promise.all(workers);
 
-  const apiScan = apiText
-    ? scanHtml(apiText, currencySentinels)
+  const apiScan = apiBodies.length
+    ? scanHtml(apiBodies.join("\n"), currencySentinels)
     : { candidates: [], totalFound: 0, empty: true };
 
   // Merge and re-rank.

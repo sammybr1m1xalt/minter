@@ -1,0 +1,10 @@
+{
+  "_comment": "Synthetic. Exercises key strength: an unambiguous 'contractAddress' must outrank an ambiguous 'address', and both must outrank a known-weak 'stageAddress'.",
+  "drop": {
+    "stageAddress": "0x2222222222222222222222222222222222222222",
+    "address": "0x3333333333333333333333333333333333333333"
+  },
+  "collection": {
+    "contractAddress": "0x4444444444444444444444444444444444444444"
+  }
+}

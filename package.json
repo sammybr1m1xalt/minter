@@ -11,7 +11,8 @@
     "postbuild": "chmod +x dist/index.js",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:scanner": "npm run build --silent && node scripts/check-scanner-fixtures.mjs"
   },
   "keywords": [
     "nft",

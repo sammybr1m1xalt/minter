@@ -289,6 +289,28 @@ currency address is never mistaken for a collection contract. Add an entry if
 your chain's native token has a contract of its own (as Arc's USDC does) or if it
 has a wrapped native token.
 
+### 5. Site-scanner regression fixtures
+
+The scanner's ranking is where a silent bug is most expensive: a scoring change
+returns the wrong contract and nothing looks wrong. `fixtures/scanner/` holds
+saved inputs — a real OpenSea collection page and its API payload, a real
+webpack 5.94 build, a real SPA shell — plus small synthetic cases for individual
+rules (sentinel exclusion, key strength, nesting depth, chunk paths, API-path
+discovery). `npm run test:scanner` checks them.
+
+No test framework is involved: the runner states an expectation per case and
+reports which failed. One case starts a local HTTP server to pin behaviour that
+only exists across requests — that the API scan does **not** stop at the first
+endpoint that answers. Stopping there lets a shared contract (a marketplace, a
+payment router) end the scan before the collection itself is fetched, and
+ranking cannot recover from data it never saw.
+
+Chunk discovery covers both mechanisms: string literals (`import("./x.js")`,
+`new URL("./x.js", import.meta.url)`, quoted asset paths) and webpack's numeric
+ids, which are resolved through the runtime's own filename function. The two
+halves live in different files — the `.u` function in the runtime chunk, the
+`.e(480)` calls in the entry chunk — so that resolution needs two passes.
+
 ### Things that will not work automatically
 
 - **OpenSea must list the chain.** Check `GET /api/v2/chains`. If OpenSea does

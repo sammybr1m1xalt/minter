@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+  Synthetic, not captured: built to exercise the currency-sentinel exclusion.
+
+  The native-token identifier (0x000…000) and WETH repeat far more often than
+  the collection address. Before the sentinels were excluded, the zero address
+  won these pages — it appears under a plain "address" key in every pricing
+  payload on the page.
+-->
+<html>
+<body>
+  <script id="__NEXT_DATA__" type="application/json">
+    {"props":{"pageProps":{
+      "pricingCurrencies":[
+        {"address":"0x0000000000000000000000000000000000000000","symbol":"ETH"},
+        {"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","symbol":"WETH"},
+        {"address":"0x0000000000000000000000000000000000000000","symbol":"ETH"},
+        {"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","symbol":"WETH"}
+      ],
+      "collection":{"contractAddress":"0x1111111111111111111111111111111111111111"}
+    }}}
+  </script>
+  <!-- The same two sentinels again in the rendered body. -->
+  <div data-payment="0x0000000000000000000000000000000000000000"></div>
+  <div data-payment="0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"></div>
+</body>
+</html>
