@@ -50,6 +50,70 @@ const ADDR_RE = /0x[a-fA-F0-9]{40}/g;
  *  calling .test() on it is stateful and alternates between matches. */
 const ADDR_TEST_RE = /0x[a-fA-F0-9]{40}/;
 
+// ── Junk that wears an address's shape ───────────────────────────────────────
+//
+// A 40-hex window slides over bytecode, hashes and arithmetic constants as
+// readily as over addresses, so matching the shape is not evidence of being
+// one. Three patterns are cheap and unambiguous.
+
+/** First bytes of Solidity-deployed code: PUSH1 0x80 PUSH1 0x40 MSTORE. */
+const BYTECODE_PROLOGUES = ["6080604052", "6060604052"];
+
+/**
+ * Longest run of one nibble we still treat as an address.
+ *
+ * A real address is uniform: 16 identical leading nibbles occur by chance
+ * 16^-16 times. A run that long is a mask or a constant window, not an address.
+ */
+const MAX_SAME_NIBBLE_RUN = 16;
+
+/** Longest block period we test for, in nibbles. */
+const MAX_REPEAT_PERIOD = 20;
+
+/**
+ * True when a 40-hex string cannot be a contract address.
+ *
+ *   - all one nibble: 0xffff…ff is uint256 max, 0x0000…00 the null address;
+ *   - a long run of one nibble: 0xffff…febaaedce6 is a window of the
+ *     secp256k1 group order, not an address;
+ *   - a block repeated to fill the window: 0x8e38e38e… is a test constant;
+ *   - the Solidity prologue, i.e. the head of a bytecode blob.
+ *
+ * Deliberately NOT a list of known placeholder addresses. A vanity address
+ * such as 0xca11bde0… ("caller") is indistinguishable from a real one by shape
+ * alone, and hardcoding one site's constants is not a general rule — the
+ * ranking already demotes what it cannot positively identify.
+ */
+export function isJunkAddress(address: string): boolean {
+  const hex = address.toLowerCase().replace(/^0x/, "");
+  if (hex.length !== 40) return false;
+  let run = 1;
+  for (let i = 1; i < 40; i++) {
+    if (hex[i] === hex[i - 1]) {
+      run++;
+      if (run >= MAX_SAME_NIBBLE_RUN) return true;
+    } else {
+      run = 1;
+    }
+  }
+  // Any block period up to half the window, not only divisors of 40: the
+  // constant above is "8e3" repeated, and 3 does not divide 40.
+  for (let p = 1; p <= MAX_REPEAT_PERIOD; p++) {
+    let periodic = true;
+    for (let i = p; i < 40; i++) {
+      if (hex[i] !== hex[i - p]) {
+        periodic = false;
+        break;
+      }
+    }
+    if (periodic) return true;
+  }
+  for (const prologue of BYTECODE_PROLOGUES) {
+    if (hex.startsWith(prologue)) return true;
+  }
+  return false;
+}
+
 /** Keys that strongly suggest the value is a collection contract. */
 const STRONG_KEYS = [
   "contractaddress",
@@ -90,6 +154,7 @@ const WEAK_KEYS = [
 export function extractAddresses(html: string): string[] {
   const found = new Set<string>();
   for (const m of html.matchAll(ADDR_RE)) {
+    if (isJunkAddress(m[0])) continue;
     found.add(m[0]);
   }
   return [...found];
@@ -105,6 +170,7 @@ export function extractAddresses(html: string): string[] {
 export function extractAddressOccurrences(text: string): Map<string, number> {
   const counts = new Map<string, number>();
   for (const m of text.matchAll(ADDR_RE)) {
+    if (isJunkAddress(m[0])) continue;
     const a = m[0].toLowerCase();
     counts.set(a, (counts.get(a) ?? 0) + 1);
   }
@@ -246,7 +312,10 @@ function extractContractsBlockAddresses(text: string): string[] {
   const out: string[] = [];
   const re = /"contracts"\s*:\s*\[([^\]]{0,4000})\]/g;
   for (const m of text.matchAll(re)) {
-    for (const a of m[1].matchAll(ADDR_RE)) out.push(a[0]);
+    for (const a of m[1].matchAll(ADDR_RE)) {
+      if (isJunkAddress(a[0])) continue;
+      out.push(a[0]);
+    }
   }
   return out;
 }
@@ -455,14 +524,15 @@ export function rankCandidates(
   };
 
   // Addresses that are never a collection contract. Two independent rules:
-  //   1. an all-zero address is not a contract on ANY chain;
+  //   1. junk that only wears an address's shape — the all-zero address, a
+  //      bytecode head, a repeated constant (see isJunkAddress);
   //   2. a native-token sentinel (see NATIVE_TOKEN_SENTINELS) is a per-chain
   //      convention meaning "this chain's currency", never a contract.
   // Both repeat across marketplace payloads under a plain "address" key and so
   // outscore the real collection unless they are excluded.
   const isPlaceholder = (addr: string): boolean => {
     const a = addr.toLowerCase();
-    if (/^0x0+$/.test(a)) return true;
+    if (isJunkAddress(a)) return true;
     return currencySentinels.has(a);
   };
 

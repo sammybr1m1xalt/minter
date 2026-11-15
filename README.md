@@ -316,6 +316,13 @@ bare text. Three corrections keep shared addresses from winning:
 - **Weak parent keys** — an address inside `paymentTokens` / `pricingCurrencies`
   is a token even when its own key is the ambiguous `address`.
 
+Separately, junk that only wears an address's shape is dropped before ranking. A
+40-hex window slides over bytecode and arithmetic constants as readily as over
+addresses, so bytecode prologues (`6080604052`), long single-nibble runs
+(`0xffff…`, `0x8e38e38e…`) and repeated blocks are not candidates at all. A
+vanity address is deliberately *not* filtered — it is indistinguishable from a
+real one by shape, and the ranking already demotes what it cannot identify.
+
 Responses are capped at 5 MB and reported as truncated rather than silently
 incomplete, and the scan stops early only on a *decisive* signal — a strong body
 that names something which is not platform infrastructure.
