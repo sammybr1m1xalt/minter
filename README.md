@@ -417,6 +417,15 @@ nothing about the contract, the bytecode is probed for a known mint selector
 (ERC721/ERC1155, Manifold, Zora, Scatter, bespoke) and calldata is built from the
 verified ABI.
 
+**Which contract gets minted.** OpenSea can name two different contracts for one
+drop: the collection record and the drop record. The collection pointer goes
+stale — on `lagrange-bend-by-jiwa` the collection record named a 90-byte proxy
+with no drop, while the drop's own `contract_address` named the contract that
+actually holds it. The drop's contract wins, and the mismatch is printed rather
+than applied silently (`contract_reconciled` in the run log). Both a bare
+contract address and a slug go through this check, because a slug resolves
+through the same collection metadata.
+
 Before any calldata is built, the generic path **screens the contract**
 (`screenMintContract` in `mint-generic.ts`). This is the only adapter that mints
 into a contract we did not positively identify, so it is the only one that needs

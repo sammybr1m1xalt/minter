@@ -59,29 +59,30 @@ export interface LocalMintPlan {
  * TCP/TLS setups and two sequential round trips for data that is always read
  * together.
  */
+// Throws on a revert or an RPC failure. Those are different answers from "this
+// contract has no public drop", and the blanket catch that used to be here
+// collapsed all four (revert, unset mapping, dead endpoint, timeout) into one
+// null — which is why a dead RPC read as "no drop". `null` now means only
+// "the mapping is unset", the one case the caller cannot infer for itself.
 async function readPublicDrop(
   provider: JsonRpcProvider,
   nftContract: string
 ): Promise<PublicDrop | null> {
-  try {
-    const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
-    const raw = await seadrop.getPublicDrop(nftContract);
-    const drop: PublicDrop = {
-      mintPrice: BigInt(raw.mintPrice),
-      startTime: Number(raw.startTime),
-      endTime: Number(raw.endTime),
-      maxTotalMintableByWallet: Number(raw.maxTotalMintableByWallet),
-      feeBps: Number(raw.feeBps),
-      restrictFeeRecipients: Boolean(raw.restrictFeeRecipients),
-    };
-    // An unset mapping entry decodes to all zeros rather than reverting.
-    if (drop.startTime === 0 && drop.endTime === 0 && drop.maxTotalMintableByWallet === 0) {
-      return null;
-    }
-    return drop;
-  } catch {
+  const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
+  const raw = await seadrop.getPublicDrop(nftContract);
+  const drop: PublicDrop = {
+    mintPrice: BigInt(raw.mintPrice),
+    startTime: Number(raw.startTime),
+    endTime: Number(raw.endTime),
+    maxTotalMintableByWallet: Number(raw.maxTotalMintableByWallet),
+    feeBps: Number(raw.feeBps),
+    restrictFeeRecipients: Boolean(raw.restrictFeeRecipients),
+  };
+  // An unset mapping entry decodes to all zeros rather than reverting.
+  if (drop.startTime === 0 && drop.endTime === 0 && drop.maxTotalMintableByWallet === 0) {
     return null;
   }
+  return drop;
 }
 
 // Returns null when this contract has no public drop on the SeaDrop singleton —
@@ -99,6 +100,10 @@ export async function fetchPublicDrop(
       timeoutMs,
       "read the public drop"
     );
+  } catch {
+    // Convenience wrapper: null here means "no drop OR the read failed". Use
+    // buildLocalMintPlanAttempt when the difference matters — it reports which.
+    return null;
   } finally {
     destroyProvider(provider);
   }
@@ -245,39 +250,90 @@ export function encodeMintPublic(
   ]);
 }
 
+/**
+ * Build a public mint plan, reporting WHY when it cannot.
+ *
+ * `buildLocalMintPlan` returns null for every failure, which is what produced
+ * "Could not build local mint plan for public phase" with no cause — a revert, an
+ * unset drop, a dead endpoint and a timeout all read the same. This variant
+ * carries the cause so the caller can say which one it hit.
+ */
+export async function buildLocalMintPlanAttempt(
+  rpcUrl: string,
+  nftContract: string,
+  quantity: number,
+  timeoutMs: number = DEFAULT_READ_TIMEOUT_MS
+): Promise<{ plan: LocalMintPlan | null; reason: string }> {
+  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+  let drop: PublicDrop | null;
+  let fee: { address: string; source: string } | null;
+  const rpc = safeHost(rpcUrl);
+  try {
+    try {
+      drop = await withRpcTimeout(
+        readPublicDrop(provider, nftContract),
+        timeoutMs,
+        "read the public drop"
+      );
+    } catch (e: any) {
+      return {
+        plan: null,
+        reason: `reading the public drop from ${rpc} failed: ${e?.shortMessage || e?.message || e}`,
+      };
+    }
+    if (!drop) {
+      return {
+        plan: null,
+        reason: `no public drop is set on the SeaDrop singleton for ${nftContract}`,
+      };
+    }
+    try {
+      fee = await withRpcTimeout(
+        readFeeRecipient(provider, nftContract, drop.restrictFeeRecipients),
+        timeoutMs,
+        "read the fee recipient"
+      );
+    } catch (e: any) {
+      return {
+        plan: null,
+        reason: `reading the fee recipient from ${rpc} failed: ${e?.shortMessage || e?.message || e}`,
+      };
+    }
+    if (!fee) {
+      return {
+        plan: null,
+        reason: `${nftContract} restricts fee recipients and none is allowed — no public mint can be built`,
+      };
+    }
+  } finally {
+    destroyProvider(provider);
+  }
+
+  return {
+    plan: {
+      to: SEADROP_ADDRESS,
+      data: encodeMintPublic(nftContract, fee.address, quantity),
+      value: drop.mintPrice * BigInt(quantity),
+      drop,
+      feeRecipient: fee.address,
+    },
+    reason: "",
+  };
+}
+
+function safeHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "the endpoint";
+  }
+}
+
 export async function buildLocalMintPlan(
   rpcUrl: string,
   nftContract: string,
   quantity: number,
   timeoutMs: number = DEFAULT_READ_TIMEOUT_MS
 ): Promise<LocalMintPlan | null> {
-  // One provider for both reads: the drop and its fee recipient are always
-  // needed together, and two providers meant two connections for one plan.
-  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
-  let drop: PublicDrop | null;
-  let fee: { address: string; source: string } | null;
-  try {
-    drop = await withRpcTimeout(
-      readPublicDrop(provider, nftContract),
-      timeoutMs,
-      "read the public drop"
-    );
-    if (!drop) return null;
-    fee = await withRpcTimeout(
-      readFeeRecipient(provider, nftContract, drop.restrictFeeRecipients),
-      timeoutMs,
-      "read the fee recipient"
-    );
-    if (!fee) return null;
-  } finally {
-    destroyProvider(provider);
-  }
-
-  return {
-    to: SEADROP_ADDRESS,
-    data: encodeMintPublic(nftContract, fee.address, quantity),
-    value: drop.mintPrice * BigInt(quantity),
-    drop,
-    feeRecipient: fee.address,
-  };
+  return (await buildLocalMintPlanAttempt(rpcUrl, nftContract, quantity, timeoutMs)).plan;
 }

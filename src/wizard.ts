@@ -49,7 +49,7 @@ import {
   fetchOnChainDrops,
   fetchSingleOnChainDrop,
 } from "./seadrop-onchain";
-import { buildLocalMintPlan } from "./seadrop-public";
+import { buildLocalMintPlan, buildLocalMintPlanAttempt } from "./seadrop-public";
 import { localPublicSnipe } from "./local-mint";
 import { reconcileQuantity } from "./mint-cap";
 import { askChoice, askHidden, askNumber, askText, askYesNo, closePrompts } from "./prompt";
@@ -558,6 +558,28 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     const walletEligibility = walletEligibilities[walletIndex];
     const phaseEligibility = walletEligibility.phaseReports[phaseIndex];
 
+    // ── 11a. The drop's own contract outranks the collection's metadata ──────
+    // OpenSea can name two different contracts for one drop: the collection
+    // record and the drop record. The collection pointer goes stale — verified
+    // on lagrange-bend-by-jiwa, where /collections/… named a 90-byte proxy with
+    // no drop while /drops/… named the contract that actually holds it. The
+    // drop's contract_address is the one its mint is configured on, so it wins;
+    // the mismatch is reported rather than applied silently.
+    let mintContract = nftInput;
+    const dropContract = selectedDrop.nftContract;
+    if (dropContract && dropContract.toLowerCase() !== nftInput.toLowerCase()) {
+      console.log(
+        chalk.yellow(
+          `\n  ⚠ Collection metadata says ${nftInput}, but this drop's contract is ${dropContract}.`
+        )
+      );
+      console.log(
+        chalk.gray(`    Minting ${dropContract} — the contract the drop is configured on.`)
+      );
+      log.field("contract_reconciled", `${nftInput} -> ${dropContract}`);
+      mintContract = dropContract;
+    }
+
     // ── 11b. Reconcile the quantity with what this phase allows ────────────
     // The eligibility probe ran before this point, so the cap is already known.
     // Asking here (rather than at the quantity prompt) is what makes the answer
@@ -648,10 +670,25 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     // Determine required funds based on mint mode
     let valuePerWallet: bigint;
     if (phaseEligibility.mode === "public") {
-      // Public mint — price from on-chain
-      const localPlan = await buildLocalMintPlan(rpcUrls[0], nftInput, quantity);
-      if (!localPlan) throw new Error("Could not build local mint plan for public phase.");
-      valuePerWallet = localPlan.value;
+      // Public mint — price from on-chain. The attempt variant names which read
+      // failed; a bare null here is what produced a cause-free refusal.
+      const attempt = await buildLocalMintPlanAttempt(rpcUrls[0], mintContract, quantity);
+      if (!attempt.plan) {
+        // The affordability verdict below can never run once the plan is gone,
+        // so surface the balances now — an underfunded wallet is the most likely
+        // reason the user reached this screen at all.
+        const held = balances
+          .map((b, i) =>
+            b == null
+              ? `${wallets[i].address.slice(0, 10)}… balance unreadable`
+              : `${wallets[i].address.slice(0, 10)}… ${formatEther(b)} ${symbol}`,
+          )
+          .join("; ");
+        throw new Error(
+          `Could not build a local mint plan for ${mintContract}: ${attempt.reason}. Balances — ${held}.`,
+        );
+      }
+      valuePerWallet = attempt.plan.value;
     } else {
       // Signed/allowlist mint — price from payload
       valuePerWallet = phaseEligibility.signedPayload?.value || selectedDrop.mintPrice * BigInt(quantity);
@@ -664,7 +701,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       rpcUrls,
       wallets,
       balances,
-      nftContract: nftInput,
+      nftContract: mintContract,
       quantity,
       valuePerWallet,
       required,
@@ -731,13 +768,14 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
 
     if (phaseEligibility.mode === "public") {
       // Public phase — on-chain calldata, no OpenSea needed
-      const localPlan = await buildLocalMintPlan(rpcUrls[0], nftInput, quantity);
-      if (!localPlan) {
-        throw new Error("Could not build local mint plan for public phase.");
+      const attempt = await buildLocalMintPlanAttempt(rpcUrls[0], mintContract, quantity);
+      if (!attempt.plan) {
+        throw new Error(`Could not build a local mint plan for ${mintContract}: ${attempt.reason}`);
       }
+      const localPlan = attempt.plan;
 
       mintOutcomes = (await localPublicSnipe({
-        nftContract: nftInput,
+        nftContract: mintContract,
         quantity,
         walletKeys,
         rpcUrls,
@@ -804,7 +842,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
           const w = new Wallet(walletKeys[i]);
           try {
             const p = await fetchSignedPayloadForWallet(
-              nftInput,
+              mintContract,
               quantity,
               w.address,
               apiKey,
@@ -820,7 +858,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       );
 
       const snipeResults = await executeFcfsSnipe({
-        nftContract: nftInput,
+        nftContract: mintContract,
         quantity,
         walletKeys,
         rpcUrls,
@@ -924,7 +962,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       await runSellAfterMint({
         sellPlan,
         walletKeys,
-        contract: nftInput,
+        contract: mintContract,
         slug: slug!,
         chainKey,
         apiKey: apiKey!,
