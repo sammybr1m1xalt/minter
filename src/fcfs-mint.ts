@@ -204,7 +204,7 @@ export async function fetchSignedPayload(
   nftContract: string,
   quantity: number,
   apiKey?: string | null,
-  opts: { timeoutMs?: number; walletAddress?: string; slug?: string; chainKey?: string } = {},
+  opts: { timeoutMs?: number; walletAddress?: string; slug?: string; chainKey?: string; accessToken?: string | null } = {},
 ): Promise<FcfsSignedPayload | null> {
   const timeoutMs = opts.timeoutMs ?? 10000;
   const { slug, walletAddress, chainKey } = opts;
@@ -239,8 +239,16 @@ export async function fetchSignedPayload(
   // ── Fallback: REST /api/v2/drops/{slug}/mint ─────────────────────────────
   // Only reached if no slug, no walletAddress, or GraphQL failed.
   // This POST endpoint returns per-wallet signed data when the slug is known.
+  //
+  // accessToken is the wallet JWT. The endpoint is wallet-scoped, so a
+  // signed/presale stage is refused without it — but the call still goes out
+  // (it is the only REST attempt this path makes) and postMintRequest logs
+  // the refusal instead of collapsing it to a silent null.
   if (slug && walletAddress) {
-    const restPayload = await postMintTxFallback(slug, walletAddress, quantity, apiKey, timeoutMs, chainKey || "ethereum", nftContract);
+    const restPayload = await postMintTxFallback(
+      slug, walletAddress, quantity, apiKey, timeoutMs, chainKey || "ethereum", nftContract,
+      opts.accessToken ?? null,
+    );
     if (restPayload) return restPayload;
   }
 
@@ -427,7 +435,16 @@ async function postMintRequest(
           body: JSON.stringify({ minter: walletAddress, quantity, skip_balance_check: true }),
         },
       );
-      return { status: res.status, json: await res.json().catch(() => null) };
+      const json: any = await res.json().catch(() => null);
+      if (res.status !== 200) {
+        // Every caller collapses a non-200 to null, so without this line a
+        // refusal is indistinguishable from "REST never ran" — which is how a
+        // missing JWT and an unparsed body both passed unnoticed.
+        const first = json?.errors?.[0];
+        const why = json?.code ?? (typeof first === "string" ? first : (first?.code ?? ""));
+        console.log(chalk.gray(`    REST mint ${slug}: ${res.status}${why ? ` — ${why}` : ""}`));
+      }
+      return { status: res.status, json };
     } finally {
       clearTimeout(timer);
     }
@@ -1602,11 +1619,16 @@ export async function fetchSignedPayloadForWallet(
   opts: { timeoutMs?: number; session?: StoredSession | null; slug?: string; chainKey?: string } = {},
 ): Promise<FcfsSignedPayload | null> {
   const timeoutMs = opts.timeoutMs ?? 15000;
+  // Resolved once, then shared with both paths: the API-key path's REST
+  // fallback needs the same wallet JWT the session path sends. Resolving it per
+  // path meant the first REST attempt always went out with only the API key.
+  const session = opts.session ?? await loadStoredSession();
 
   // Try API-key-only path first
   if (apiKey && apiKey.trim()) {
     const payload = await fetchSignedPayload(nftContract, quantity, apiKey, {
-      timeoutMs, slug: opts.slug, walletAddress, chainKey: opts.chainKey
+      timeoutMs, slug: opts.slug, walletAddress, chainKey: opts.chainKey,
+      accessToken: session?.accessToken ?? null,
     });
     if (payload) {
       // OpenSea binds mintSignature to a wallet. If the returned payload's
@@ -1625,10 +1647,7 @@ export async function fetchSignedPayloadForWallet(
     }
   }
 
-  // Fall back to session-based fetch.
-  // Use the per-wallet session if provided (from warmAllSessions),
-  // otherwise fall back to loading a stored session from disk.
-  const session = opts.session ?? await loadStoredSession();
+  // Fall back to session-based fetch, using the session resolved above.
   if (session && session.accessToken) {
     const payload = await fetchSignedPayloadWithSession(
       nftContract, quantity, session, apiKey, { timeoutMs, slug: opts.slug, walletAddress, chainKey: opts.chainKey }
