@@ -49,6 +49,7 @@ import { withDeadlineOrThrow } from "./deadline";
 import { assertPriceProtection } from "./price-protection";
 import { reconcileQuantity } from "./mint-cap";
 import { sessionDir, legacySessionFile, legacyHomeSessionFile } from "./session-store";
+import { say } from "./logger";
 import { warmConnections, pingRpcs, rankRpcEndpoints, settleRanking, type RankedEndpoint } from "./connection-warmer";
 
 /** How many of the fastest endpoints to fire at before escalating to the rest. */
@@ -102,6 +103,12 @@ export interface FcfsGasData {
   maxPriorityFeePerGas: bigint; // wei
 }
 
+/** Which OpenSea surface produced a signed payload. */
+export type PayloadSource =
+  | "gql"     // GraphQL MintActionTimelineQuery
+  | "rest"    // POST /api/v2/drops/{slug}/mint
+  | "local";  // assembled from a drop object already in hand
+
 export interface FcfsSignedPayload {
   seaDropAddress: string;   // who we send the mint tx to (usually the SeaDrop singleton)
   nftContract: string;      // the token contract
@@ -111,6 +118,12 @@ export interface FcfsSignedPayload {
   value: bigint;            // mintPrice × quantity
   drop: SeaDropDropMeta;
   gasData?: FcfsGasData;   // optional — OpenSea sometimes recommends gas fields
+  /**
+   * Which leg produced this payload. Reported per wallet so a run says what it
+   * actually used — a payload that came back through the REST fallback looks
+   * exactly like a GraphQL one downstream.
+   */
+  source?: PayloadSource;
 }
 
 export interface FcfsMintPlan {
@@ -260,6 +273,9 @@ export async function fetchSignedPayload(
     if (onChainDrops.length > 0) {
       return extractActiveDropFromOnChain(onChainDrops, nftContract, quantity, apiKey);
     }
+    // Silent here reads as "this contract has no phases", which is a different
+    // claim from "we could not ask the chain".
+    say(`    on-chain discovery found no phases for ${nftContract}`, "warn");
   }
 
   return null;
@@ -297,6 +313,7 @@ function openseaMintTxToSignedPayload(
   return {
     seaDropAddress: tx.to,
     nftContract,
+    source: "gql",
     feeRecipient: "0x0000000000000000000000000000000000000000", // fee recipient is in calldata for seaDrop
     mintData: tx.data,
     mintSignature: isSigned ? "0x0000000000000000000000000000000000000000000000000000000000000000" : "0x", // embedded in calldata
@@ -339,7 +356,15 @@ export function mintResponseToPayload(
   quantity: number,
 ): FcfsSignedPayload | null {
   const mintData = json?.data || json?.mintData || null;
-  if (!mintData) return null;
+  if (!mintData) {
+    // A 200 with no calldata means the response shape changed. Say what actually
+    // came back — a bare null here reads as "this drop has no signed phase".
+    say(
+      `    REST mint returned no calldata — keys: ${Object.keys(json ?? {}).join(", ") || "(none)"}`,
+      "warn",
+    );
+    return null;
+  }
   const mintSignature = json?.mint_signature || json?.mintSignature || null;
   const seaDropAddress = json?.to || json?.seaDropAddress || json?.contract || SEADROP_ADDRESS;
   const value = json?.value != null ? parsePriceField(json.value) : 0n;
@@ -350,6 +375,7 @@ export function mintResponseToPayload(
   return {
     seaDropAddress,
     nftContract: collection,
+    source: "rest",
     feeRecipient: json?.fee_recipient || json?.feeRecipient || "0x0000000000000000000000000000000000000000",
     mintData,
     mintSignature: mintSignature || "0x",
@@ -442,7 +468,10 @@ async function postMintRequest(
         // missing JWT and an unparsed body both passed unnoticed.
         const first = json?.errors?.[0];
         const why = json?.code ?? (typeof first === "string" ? first : (first?.code ?? ""));
-        console.log(chalk.gray(`    REST mint ${slug}: ${res.status}${why ? ` — ${why}` : ""}`));
+        const level = res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500
+          ? "warn"
+          : "info";
+        say(`    REST mint ${slug}: ${res.status}${why ? ` — ${why}` : ""}`, level);
       }
       return { status: res.status, json };
     } finally {
@@ -530,10 +559,24 @@ export async function fetchSignedPayloadWithSession(
   return null;
 }
 
-// ── Shared: turn whatever v2 returns into a FcfsSignedPayload ────────────
+// ── Shared: turn whatever v2 returns into a FcfsSignedPayload ──────────────
 //
-// The exact field names here are whatever OpenSea v2 actually hands back for
-// an FCFS/allowlist stage's signed mint payload. Adapt to the live response.
+// Field names verified against the live endpoint on 2026-11-15 (collectr, base,
+// public_sale, quantity 1):
+//
+//   {
+//     "to": "0x00005ea00ac477b1030ce78506496e8c2de24bf5",   // SeaDrop singleton
+//     "data": "0x161ac21f…",                                 // the signed calldata
+//     "value": "5600000000000000",                           // wei, TOTAL
+//     "chain": "base",
+//     "stage_uuid": "…", "stage_type": "public_sale",
+//     "stage_start_time": "2026-11-01T00:00:00Z",
+//     "stage_end_time": "2026-12-01T00:00:00Z"
+//   }
+//
+// There is no mint_signature field — the signature is inside `data`. There is
+// also no fee_recipient or per-wallet cap, so those read as unknown rather than
+// being invented.
 //
 // NOTE: mintData is per-wallet for mintSigned — the OpenSea API binds the
 // signature to a specific wallet address. For multi-wallet sniping, each wallet
@@ -586,6 +629,7 @@ export async function buildSignedPayloadFromDrop(
   return {
     seaDropAddress,
     nftContract,
+    source: "local",
     feeRecipient: feeRecipient || OPENSEA_FEE_RECIPIENT,
     mintData,
     mintSignature,
@@ -1010,7 +1054,10 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
           walletIndex: i,
           walletAddress: addr,
           success: false,
-          error: `No signed payload for ${addr} — OpenSea may not have a signed phase for this contract`,
+          // Which surfaces were tried — and why each refused — was already
+          // logged by fetchSignedPayloadForWallet. The old text guessed ("may not
+          // have a signed phase"), which is wrong far more often than not.
+          error: `No signed payload for ${addr}`,
         };
         return;
       }
@@ -1619,6 +1666,8 @@ export async function fetchSignedPayloadForWallet(
   opts: { timeoutMs?: number; session?: StoredSession | null; slug?: string; chainKey?: string } = {},
 ): Promise<FcfsSignedPayload | null> {
   const timeoutMs = opts.timeoutMs ?? 15000;
+  const short = `${walletAddress.slice(0, 10)}…${walletAddress.slice(-4)}`;
+  const tried: string[] = [];
   // Resolved once, then shared with both paths: the API-key path's REST
   // fallback needs the same wallet JWT the session path sends. Resolving it per
   // path meant the first REST attempt always went out with only the API key.
@@ -1626,6 +1675,7 @@ export async function fetchSignedPayloadForWallet(
 
   // Try API-key-only path first
   if (apiKey && apiKey.trim()) {
+    tried.push("api-key");
     const payload = await fetchSignedPayload(nftContract, quantity, apiKey, {
       timeoutMs, slug: opts.slug, walletAddress, chainKey: opts.chainKey,
       accessToken: session?.accessToken ?? null,
@@ -1639,6 +1689,7 @@ export async function fetchSignedPayloadForWallet(
         // The T-0 burst spends this key once per wallet; recording it here is
         // what keeps the pool's budget gate honest for the next run.
         noteKeyCall(apiKey);
+        say(`  ${short}  payload via ${payload.source ?? "unknown"}`);
         return payload;
       }
       // Not bound to this wallet — reject it, but do NOT give up. The session
@@ -1649,15 +1700,22 @@ export async function fetchSignedPayloadForWallet(
 
   // Fall back to session-based fetch, using the session resolved above.
   if (session && session.accessToken) {
+    tried.push("session");
     const payload = await fetchSignedPayloadWithSession(
       nftContract, quantity, session, apiKey, { timeoutMs, slug: opts.slug, walletAddress, chainKey: opts.chainKey }
     );
     if (payload && isPayloadBoundToWallet(payload, walletAddress)) {
       if (apiKey) noteKeyCall(apiKey);
+      say(`  ${short}  payload via ${payload.source ?? "unknown"}`);
       return payload;
     }
   }
 
+  // Nothing produced a payload. "No payload" on its own reads as "this drop has
+  // no signed phase", which is usually wrong — say which surfaces were tried.
+  const surfaces = tried.length > 0 ? tried.join(" + ") : "none (no API key, no session)";
+  const slugNote = opts.slug ? "" : "; no drop slug, so OpenSea could not be addressed";
+  say(`  ${short}  no payload — surfaces tried: ${surfaces}${slugNote}`, "warn");
   return null;
 }
 

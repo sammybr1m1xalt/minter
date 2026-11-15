@@ -37,6 +37,7 @@ import { JsonRpcProvider, Interface } from "ethers";
 import type { DropPhase } from "./fcfs-drops";
 import { CHAINS } from "./chains";
 import { OPENSEA_FEE_RECIPIENT, SEADROP_ADDRESS } from "./seadrop-public";
+import { say } from "./logger";
 
 // ── Minimal ABI: only the read functions we actually call ──────────────────
 const ABI = [
@@ -406,7 +407,12 @@ export async function fetchOnChainDrops(
   const provider = await getProvider(chainKey, () =>
     Math.max(200, Math.min(4000, discoveryDeadline - Date.now()))
   );
-  if (!provider) return [];
+  if (!provider) {
+    // An empty result is indistinguishable from "this contract has no phases",
+    // so say which one it was.
+    say(`    on-chain discovery: no provider for ${chainKey ?? "ethereum"} — skipped`, "warn");
+    return [];
+  }
 
   // timeoutMs must bound the whole discovery. The individual eth_calls carry
   // no signal, so race the batch against a timer; the provider is destroyed in

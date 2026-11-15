@@ -165,6 +165,8 @@ explicitly confirm.
 | `--wallets <spec>` | `all` \| `N` \| `1,3,4` — default is the single primary wallet |
 | `--chain <key>` | `ethereum` \| `base` \| `robinhood` \| `arc` \| `soneium` |
 | `--quantity <n>` | NFTs per wallet (default 1) |
+| `--doctor` | Health report: config, wallets, key pool, sessions, RPC per chain (read-only, exits 1 on a blocker) |
+| `--logger [file]` | Read a run log as a digest — newest, a file, or `-` for stdin |
 
 A target may also be given positionally (`npm start -- <target>`) when it is not
 passed to `--fcfs`.
@@ -174,6 +176,7 @@ npm start -- --fcfs de-bots
 npm start -- --fcfs de-bots --at "in 5m" --max-price 0.01
 npm start -- --eligibility 0x8d80efb61341e4b8459fbb52b213d5c25a1af179
 npm start -- --doctor
+npm start -- --logger
 npm start -- --fcfs 0xabc… on base --quantity 3 --wallets all
 ```
 
@@ -511,6 +514,26 @@ Two verdicts it deliberately does not give. An endpoint that does not answer is
 endpoint, so it stays in the blast set rather than being dropped. And a chain
 where no endpoint answered with the right chain id is a warning, not a blocker:
 firing is still possible, only the reads (nonce, gas, simulation) are unverified.
+
+### Reading a run log (`--logger`)
+
+Every run writes a complete record to `.minter-logs/run-<timestamp>-<pid>-<label>.log`
+— header, run fields, every message, diagnostics, masked environment. That file is
+a dump, so `--logger` renders it as a digest:
+
+    npm start -- --logger              newest run log
+    npm start -- --logger <file>       a specific log
+    npm start -- --logger -            read stdin (pipe a run's output)
+
+It prints the run fields, every warning and error in full, the diagnostics count
+and the masked environment. Input that is not a run log — a piped stdout, an older
+file — is digested generically: flagged lines first, then the lines grouped by the
+wallets they mention, then the tail.
+
+The events worth reading are written by `say()` in `logger.ts`, which puts one
+line on the console *and* in the run log. The payload path uses it to report which
+leg produced each wallet's payload (`payload via gql` / `via rest`) and, when
+nothing did, which surfaces were tried — so "no payload" is never a bare verdict.
 
 ### How the fire reaches the chain
 

@@ -16,6 +16,7 @@
 import fs from "fs";
 import { Wallet } from "ethers";
 import { sessionDir, siweSessionsFile } from "./session-store";
+import { say } from "./logger";
 
 /**
  * A live SIWE login. Deliberately NOT the same type as the stored session in
@@ -537,7 +538,12 @@ export async function getWalletJwt(address: string): Promise<WalletToken | null>
   loadPersistedSessions();
   const key = address.toLowerCase();
   const cached = sessions.get(key);
-  if (!cached) return null;
+  if (!cached) {
+    // The reason REST eligibility cannot run. Silent, this looked exactly like
+    // "OpenSea answered, and the answer was no".
+    say(`    ${address.slice(0, 10)}… no wallet JWT — no stored session for this wallet`, "warn");
+    return null;
+  }
 
   const now = Math.floor(Date.now() / 1000);
   if (cached.jwt && (cached.jwtExp ?? 0) > now + JWT_MARGIN_SEC) {
@@ -556,9 +562,15 @@ export async function getWalletJwt(address: string): Promise<WalletToken | null>
   }
 
   const pat = await createScopedToken(cookieHeader(cached.cookies));
-  if (!pat) return null;
+  if (!pat) {
+    say(`    ${address.slice(0, 10)}… could not mint a PAT from the stored session`, "warn");
+    return null;
+  }
   const exchanged = await exchangeForWalletJwt(pat.token);
-  if (!exchanged) return null;
+  if (!exchanged) {
+    say(`    ${address.slice(0, 10)}… PAT minted but the JWT exchange was refused`, "warn");
+    return null;
+  }
   cacheWalletToken(key, exchanged, pat);
   return exchanged;
 }

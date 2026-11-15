@@ -9,6 +9,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import chalk from "chalk";
 
 // Resolved lazily rather than at module load, so a caller that changes
 // process.cwd() (tests, embedders) still lands in the directory it expects.
@@ -31,6 +32,39 @@ export interface RunLogger {
   field(key: string, value: string | number | boolean): void;
   dumpError(err: unknown, context?: Record<string, string>): void;
   end(): void;
+}
+
+// ── Active run logger ───────────────────────────────────────────────────────
+//
+// The CLI creates one run logger per invocation, but the fetch paths that have
+// something worth recording live several modules away from it, and threading it
+// through every signature would change far more code than it explains. A single
+// active logger is the pragmatic middle: createRunLogger publishes it and say()
+// writes through it.
+
+let activeRunLogger: RunLogger | null = null;
+
+export function setActiveRunLogger(logger: RunLogger | null): void {
+  activeRunLogger = logger;
+}
+
+/**
+ * Write one line to both the live console and the run log.
+ *
+ * The console copy is what the operator reads while the run is in flight; the
+ * run-log copy is what `--logger` reads afterwards. Emitting only to the log
+ * hides it live, and only to the console loses it when the terminal scrolls.
+ *
+ * With an active run logger, warnings and errors are printed by the logger's
+ * own stderr mirror — printing them here as well would show every refusal
+ * twice. Without one (an embedder, a script), everything goes to stdout.
+ */
+export function say(msg: string, level: "info" | "warn" | "error" = "info"): void {
+  const logger = activeRunLogger;
+  if (logger) logger[level](msg);
+  if (!logger || level === "info") {
+    console.log(level === "error" ? chalk.red(msg) : level === "warn" ? chalk.yellow(msg) : chalk.gray(msg));
+  }
 }
 
 export function createRunLogger(opts: { mode: string; label?: string }): RunLogger {
@@ -61,7 +95,7 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
     }
   };
 
-  return {
+  const logger: RunLogger = {
     info(msg) { push("INFO", msg); },
     warn(msg) { push("WARN", msg); },
     error(msg) { push("ERROR", msg); },
@@ -73,6 +107,8 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
       push("DIAG", `FATAL: ${msg}\n${stack}`);
     },
     end() {
+      // No late say() may land in a logger that has already been flushed.
+      activeRunLogger = null;
       const elapsed = ((Date.now() - start) / 1000).toFixed(2);
       let out = "";
       out += `═══════════════════════════════════════════════════════════════\n`;
@@ -147,6 +183,8 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
       }
     },
   };
+  activeRunLogger = logger;
+  return logger;
 }
 
 /**
