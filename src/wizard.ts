@@ -259,7 +259,12 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     log.field("chain_override", `${chainProfile.key} -> ${targetProfile.key}`);
   }
   chainProfile = targetProfile;
+  // `nftInput` is the RESOLVED contract, not necessarily what was typed: a pasted
+  // slug resolves through OpenSea's collection metadata, which can be stale (it
+  // named an unrelated proxy for lagrange-bend-by-jiwa). Record the slug too, or
+  // the run log cannot show where the address came from.
   log.field("nft_input", nftInput);
+  if (target.resolved?.slug) log.field("nft_slug", target.resolved.slug);
   log.field("label", target.label);
   log.field("platform", target.resolved?.platform ?? "unknown");
 
