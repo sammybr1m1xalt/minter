@@ -549,7 +549,7 @@ nothing did, which surfaces were tried — so "no payload" is never a bare verdi
 Every endpoint is measured in parallel with a plain `eth_chainId` and ordered
 fastest-first; one that does not answer in time is sorted last, not dropped. The
 fire then sends the signed transaction to the **two quickest** endpoints first,
-and escalates to the rest only if neither accepts within 600 ms.
+and escalates to the rest only if neither accepts within 350 ms.
 
 The measurement runs during signing (public phase) or while the OpenSea payload
 is fetched (signed phase), and the fire path **never waits for it**. If the
@@ -559,7 +559,8 @@ endpoint costs you the ordering, never the mint.
 
 The same signed transaction goes to every endpoint. Only one can include it, so
 a second wave is a re-send of an identical transaction, not a competing one; it
-cannot consume the nonce twice. Nonces are re-read after the wait, and only the
+cannot consume the nonce twice. Nonces are pre-read during the wait, walking
+every endpoint in turn on a best-effort basis, and re-read after it; only the
 wallets whose nonce actually moved are re-signed.
 
 ### Per-wallet caps
