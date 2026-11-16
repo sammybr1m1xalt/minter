@@ -995,29 +995,44 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   //
   // This is a pure latency optimisation — the T-0 read remains authoritative.
   const prewarmedNonces = new Map<number, number>();
+  // One provider per endpoint, created up front. Each wallet then walks the
+  // list until one answers: pinning every wallet to rpcUrls[0] meant a single
+  // dead endpoint left the whole run with no prewarm at all, and the T-0 read
+  // below would then have no fallback value. Wallets stay parallel, so a slow
+  // first endpoint costs one deadline, not one per wallet.
+  const prewarmProviders = rpcUrls.map(
+    (url) => new JsonRpcProvider(url, chainId, { staticNetwork: true, pollingInterval: 4000 })
+  );
   try {
-    const nonceProvider = new JsonRpcProvider(rpcUrls[0], chainId, {
-      staticNetwork: true,
-      pollingInterval: 4000,
-    });
     await Promise.all(
       walletKeys.map(async (key, i) => {
-        try {
-          const addr = new Wallet(key).address;
-          const n = await withDeadlineOrThrow(
-            nonceProvider.getTransactionCount(addr, "pending"),
-            3_000,
-            `prewarm nonce for ${addr}`
-          );
-          prewarmedNonces.set(i, n);
-        } catch {
-          // Non-fatal: phase 2 reads it again with a full budget.
+        const addr = new Wallet(key).address;
+        for (const provider of prewarmProviders) {
+          try {
+            const n = await withDeadlineOrThrow(
+              provider.getTransactionCount(addr, "pending"),
+              3_000,
+              `prewarm nonce for ${addr}`
+            );
+            prewarmedNonces.set(i, n);
+            return;
+          } catch {
+            // Try the next endpoint. Non-fatal either way: phase 2 reads it
+            // again with a full budget.
+          }
         }
       })
     );
-    nonceProvider.destroy();
   } catch {
     // Provider setup failed — phase 2 reads nonces itself.
+  } finally {
+    for (const provider of prewarmProviders) {
+      try {
+        provider.destroy();
+      } catch {
+        // Already destroyed.
+      }
+    }
   }
   if (prewarmedNonces.size > 0) {
     console.log(chalk.gray(`  Pre-read nonces for ${prewarmedNonces.size}/${walletKeys.length} wallet(s).`));
