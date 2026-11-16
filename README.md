@@ -119,6 +119,38 @@ npm start
 The wizard walks you through everything. Nothing is broadcast until you
 explicitly confirm.
 
+### Running it from anywhere
+
+The package declares a `bin`, so a symlink on your `PATH` turns `minter` into a
+normal command:
+
+```bash
+mkdir -p ~/.local/bin
+ln -s "$PWD/dist/index.js" ~/.local/bin/minter
+
+# only if ~/.local/bin is not on your PATH yet
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+```bash
+cd ~/somewhere-else
+minter --doctor
+```
+
+`npm link` does the same thing through npm instead of a hand-made symlink.
+
+Where the config is read from stays predictable, so running it elsewhere
+neither loses your keys nor scatters logs:
+
+- `.env` — the **repo**, with a `.env` in the working directory overriding it.
+- run logs — always the repo's `.minter-logs/`.
+- `wallets.json` — the **working directory**, or `WALLETS_FILE`. This is the one
+  exception: invoke it from the repo, or point `WALLETS_FILE` at the file, or
+  pass keys through `PRIVATE_KEY` / `PRIVATE_KEYS`. Run from an unrelated
+  directory with none of those set and the wizard simply has no keys to load —
+  it will say so rather than minting with nothing.
+
 ### The wizard, step by step
 
 | Step | What it wants |
