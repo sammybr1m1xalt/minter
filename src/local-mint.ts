@@ -13,7 +13,7 @@ import { blastToAll, parseRpcEndpoints, prepareBlast, waitForReceipt, PreparedBl
 import { warmConnections, rankRpcEndpoints, settleRanking, type RankedEndpoint } from "./connection-warmer";
 import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
-import { LocalMintPlan, buildLocalMintPlan } from "./seadrop-public";
+import { LocalMintPlan, buildLocalMintPlan, buildLocalMintPlanOnAnyRpc } from "./seadrop-public";
 import { simulateTx, classifyRevert, isIndeterminateRpcError, type SimulateResult } from "./simulate";
 import { autoGasBounded } from "./auto-gas";
 import { assertPriceProtection } from "./price-protection";
@@ -458,11 +458,13 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
     // This is a read, not a transaction, so it cannot disturb the nonce.
     let activePlan = plan;
     try {
-      const freshPlan = await buildLocalMintPlan(rpcUrls[0], nftContract, quantity);
+      const fresh = await buildLocalMintPlanOnAnyRpc(rpcUrls, nftContract, quantity);
+      const freshPlan = fresh.plan;
       if (freshPlan) {
         const limit = freshPlan.drop.maxTotalMintableByWallet;
         if (limit > 0 && quantity > limit) {
-          const reduced = await buildLocalMintPlan(rpcUrls[0], nftContract, limit);
+          const reducedAttempt = await buildLocalMintPlanOnAnyRpc(rpcUrls, nftContract, limit);
+          const reduced = reducedAttempt.plan;
           if (reduced) {
             console.log(
               chalk.yellow(

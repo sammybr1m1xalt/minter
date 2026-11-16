@@ -337,3 +337,30 @@ export async function buildLocalMintPlan(
 ): Promise<LocalMintPlan | null> {
   return (await buildLocalMintPlanAttempt(rpcUrl, nftContract, quantity, timeoutMs)).plan;
 }
+
+/**
+ * Build a local mint plan, trying each RPC in order until one answers.
+ *
+ * Every caller used to pass `rpcUrls[0]`, so one dead endpoint meant no plan —
+ * and therefore no mint — on the very path whose purpose is redundancy: the
+ * fire itself fans out across the whole set. The plan is built during the wait,
+ * so trying them in order costs nothing but a few unmetered chain reads.
+ */
+export async function buildLocalMintPlanOnAnyRpc(
+  rpcUrls: readonly string[],
+  nftContract: string,
+  quantity: number,
+  timeoutMs: number = DEFAULT_READ_TIMEOUT_MS
+): Promise<{ plan: LocalMintPlan | null; reason: string; rpcUrl: string | null }> {
+  const urls = (rpcUrls || []).filter(Boolean);
+  if (urls.length === 0) {
+    return { plan: null, reason: "no RPC endpoint is configured for this chain", rpcUrl: null };
+  }
+  let last = "";
+  for (const url of urls) {
+    const attempt = await buildLocalMintPlanAttempt(url, nftContract, quantity, timeoutMs);
+    if (attempt.plan) return { plan: attempt.plan, reason: "", rpcUrl: url };
+    last = attempt.reason;
+  }
+  return { plan: null, reason: `every RPC endpoint failed — last: ${last}`, rpcUrl: null };
+}

@@ -49,7 +49,7 @@ import {
   fetchOnChainDrops,
   fetchSingleOnChainDrop,
 } from "./seadrop-onchain";
-import { buildLocalMintPlan, buildLocalMintPlanAttempt } from "./seadrop-public";
+import { buildLocalMintPlanOnAnyRpc } from "./seadrop-public";
 import { localPublicSnipe } from "./local-mint";
 import { reconcileQuantity } from "./mint-cap";
 import { askChoice, askHidden, askNumber, askText, askYesNo, closePrompts } from "./prompt";
@@ -675,9 +675,10 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     // Determine required funds based on mint mode
     let valuePerWallet: bigint;
     if (phaseEligibility.mode === "public") {
-      // Public mint — price from on-chain. The attempt variant names which read
-      // failed; a bare null here is what produced a cause-free refusal.
-      const attempt = await buildLocalMintPlanAttempt(rpcUrls[0], mintContract, quantity);
+      // Public mint — price from on-chain. The plan is tried across every RPC in
+      // order and names which read failed; a bare null here is what produced a
+      // cause-free refusal.
+      const attempt = await buildLocalMintPlanOnAnyRpc(rpcUrls, mintContract, quantity);
       if (!attempt.plan) {
         // The affordability verdict below can never run once the plan is gone,
         // so surface the balances now — an underfunded wallet is the most likely
@@ -773,7 +774,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
 
     if (phaseEligibility.mode === "public") {
       // Public phase — on-chain calldata, no OpenSea needed
-      const attempt = await buildLocalMintPlanAttempt(rpcUrls[0], mintContract, quantity);
+      const attempt = await buildLocalMintPlanOnAnyRpc(rpcUrls, mintContract, quantity);
       if (!attempt.plan) {
         throw new Error(`Could not build a local mint plan for ${mintContract}: ${attempt.reason}`);
       }
