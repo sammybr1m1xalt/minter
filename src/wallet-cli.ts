@@ -138,11 +138,14 @@ async function decrypt(): Promise<number> {
 
 const USAGE = [
   "",
-  "minter wallets — manage the wallet file",
+  "minter wallet — manage the wallet file",
   "",
-  "  wallets status      show whether the file is plaintext or encrypted",
-  "  wallets encrypt     wrap the file in an scrypt + AES-256-GCM envelope",
-  "  wallets decrypt     write the file back as plaintext",
+  "  wallet status      show whether the file is plaintext or encrypted",
+  "  wallet encrypt     wrap the file in an scrypt + AES-256-GCM envelope",
+  "  wallet decrypt     write the file back as plaintext",
+  "",
+  "  `wallets` (plural) is accepted as an alias, but `--wallets` is the mint",
+  "  flag that selects which wallets to mint with — the two are not the same.",
   "",
   "  The file is taken from WALLETS_FILE, else wallets.json in the working",
   "  directory. The passphrase is asked once per interactive session, or read",

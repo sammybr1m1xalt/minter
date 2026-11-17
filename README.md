@@ -186,7 +186,7 @@ neither loses your keys nor scatters logs:
 | `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
 | `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases, whether your wallet can target each, and how many tokens it can mint |
 | `npm start -- --doctor` | Read-only health report — config, wallets, key pool, SIWE sessions, and RPC latency/chain-id per chain. Exits 1 if anything will stop a run |
-| `npm start -- wallets <cmd>` | `status` \| `encrypt` \| `decrypt` the wallet file — see [Encrypting the wallet file](#encrypting-the-wallet-file) |
+| `npm start -- wallet <cmd>` | `status` \| `encrypt` \| `decrypt` the wallet file — see [Encrypting the wallet file](#encrypting-the-wallet-file) |
 
 ### Flags
 
@@ -664,15 +664,20 @@ waiting for a receipt that will never exist.
 
 ### Encrypting the wallet file
 
-`npm start -- wallets encrypt` wraps the file in an authenticated envelope:
+`npm start -- wallet encrypt` wraps the file in an authenticated envelope:
 scrypt derives a key from a passphrase (2^17 × r=8, the OWASP recommendation),
 and AES-256-GCM encrypts the previous contents unchanged. The plaintext format
 and the encrypted one have the same shape underneath, so an old unencrypted
-file keeps loading and `wallets decrypt` restores it byte-for-byte.
+file keeps loading and `wallet decrypt` restores it byte-for-byte.
 
-    npm start -- wallets status      # plaintext / encrypted / absent
-    npm start -- wallets encrypt
-    npm start -- wallets decrypt
+    npm start -- wallet status      # plaintext / encrypted / absent
+    npm start -- wallet encrypt
+    npm start -- wallet decrypt
+```
+
+`wallets` (plural) is accepted as an alias. It is not the same as `--wallets`,
+which is the mint flag that selects *which* wallets to mint with — that one is
+dashed and takes `all | N | 1,3,4`.
 
 The file holds keys in any of these shapes — a bare array, or an object with a
 `wallets` array whose entries are either strings or `{ "pk": ... }` /
@@ -686,7 +691,7 @@ The file holds keys in any of these shapes — a bare array, or an object with a
 ```
 
 Keys are `0x`-prefixed 32-byte hex. Duplicates are dropped by address. An entry
-that is not a valid key is reported by `wallets status` rather than silently
+that is not a valid key is reported by `wallet status` rather than silently
 skipped. The file is read from the working directory, or from `WALLETS_FILE`.
 The passphrase is asked once per interactive session, or read from
 `WALLETS_PASSPHRASE` for headless runs. It is never stored, never printed, and

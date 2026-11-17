@@ -278,7 +278,7 @@ function walletSection(): Section {
       state === "encrypted"
         ? "wallet file is encrypted and no passphrase is available — set WALLETS_PASSPHRASE"
         : state === "malformed"
-          ? "wallet file is not readable — run `minter wallets status`"
+          ? "wallet file is not readable — run `minter wallet status`"
           : "none loaded — set PRIVATE_KEY, PRIVATE_KEYS, or WALLETS_FILE (the wizard can paste one)";
     checks.push({ level: "warn", label: "wallets", detail });
     return { title: "WALLETS", checks };
