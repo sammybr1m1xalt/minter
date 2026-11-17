@@ -28,6 +28,7 @@ import { loadKeyPool, isKeyStale, keyLabel, probeKey } from "./opensea-key";
 import { inspectStoredSessions } from "./opensea-session";
 import { sessionDir, siweSessionsFile, legacySessionFile } from "./session-store";
 import { loadEnvKeys } from "./wizard";
+import { walletFileState } from "./wallet-file";
 
 type Level = "ok" | "warn" | "fail" | "info";
 
@@ -270,11 +271,16 @@ function walletSection(): Section {
   // report may be able to reach them.
   const wallets = loadEnvKeys();
   if (wallets.length === 0) {
-    checks.push({
-      level: "warn",
-      label: "wallets",
-      detail: "none loaded — set PRIVATE_KEY, PRIVATE_KEYS, or WALLETS_FILE (the wizard can paste one)",
-    });
+    // Say WHY none loaded. "none loaded" over an encrypted file reads as a
+    // missing configuration when the real problem is a missing passphrase.
+    const state = walletFileState(process.env.WALLETS_FILE || "wallets.json");
+    const detail =
+      state === "encrypted"
+        ? "wallet file is encrypted and no passphrase is available — set WALLETS_PASSPHRASE"
+        : state === "malformed"
+          ? "wallet file is not readable — run `minter wallets status`"
+          : "none loaded — set PRIVATE_KEY, PRIVATE_KEYS, or WALLETS_FILE (the wizard can paste one)";
+    checks.push({ level: "warn", label: "wallets", detail });
     return { title: "WALLETS", checks };
   }
   const sources = [

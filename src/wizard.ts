@@ -16,7 +16,6 @@
 import chalk from "chalk";
 import dotenv from "dotenv";
 import path from "path";
-import fs from "fs";
 
 // Load .env so process.env has RPC_URL_*, OPENSEA_API_KEY, etc.
 // Must happen before any imported module reads process.env.
@@ -24,7 +23,8 @@ import fs from "fs";
 // `minter` from anywhere and the .env lives next to the project.
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
 
-import { RunLogger } from "./logger";
+import { RunLogger, say } from "./logger";
+import { loadKeysFromFile, readWalletFile, readWalletFilePath } from "./wallet-file";
 import { JsonRpcProvider, Wallet, formatEther } from "ethers";
 import { CHAINS, ChainProfile, resolveChain } from "./chains";
 import { parseNftLink } from "./nft-link";
@@ -1656,6 +1656,10 @@ async function promptWalletAndPhase(
 export async function promptKeys(log: RunLogger, spec?: string | null): Promise<string[]> {
   console.log(chalk.bold.white("Private keys"));
 
+  // Before the loader runs: an encrypted wallet file needs its passphrase, and
+  // this is the interactive path — a headless run uses WALLETS_PASSPHRASE.
+  await promptWalletPassphrase();
+
   // A --wallets spec with a PRIVATE_KEY in the environment means the user has
   // already supplied keys non-interactively. Load them rather than prompting,
   // which is what makes a headless run possible.
@@ -1742,6 +1746,33 @@ export interface LoadedWallet {
   privateKey: string;
 }
 
+// ── Wallet-file passphrase ───────────────────────────────────────────────────
+// An encrypted wallet file is asked for ONCE per interactive session, here,
+// rather than inside the synchronous loader: `--doctor` calls that loader and
+// must never prompt, and a headless run reads WALLETS_PASSPHRASE instead.
+let sessionWalletPassphrase: string | null = process.env.WALLETS_PASSPHRASE ?? null;
+
+export function walletFilePath(): string {
+  return process.env.WALLETS_FILE || "wallets.json";
+}
+
+/**
+ * Ask for the wallet file's passphrase if — and only if — the file is encrypted
+ * and no passphrase is already available. Safe to call repeatedly.
+ */
+export async function promptWalletPassphrase(): Promise<void> {
+  const file = walletFilePath();
+  const text = readWalletFilePath(file);
+  if (text == null) return;
+  try {
+    if (readWalletFile(text).kind !== "encrypted") return;
+  } catch {
+    return; // A malformed file is reported by the loader, not here.
+  }
+  if (sessionWalletPassphrase) return;
+  sessionWalletPassphrase = await askHidden(`Passphrase for ${file}: `);
+}
+
 export function loadEnvKeys(): LoadedWallet[] {
   const list: LoadedWallet[] = [];
   const seen = new Set<string>();
@@ -1761,15 +1792,21 @@ export function loadEnvKeys(): LoadedWallet[] {
   add(process.env.PRIVATE_KEY);
   (process.env.PRIVATE_KEYS || "").split(",").forEach(add);
 
-  const file = process.env.WALLETS_FILE || "wallets.json";
-  try {
-    if (fs.existsSync(file)) {
-      const j = JSON.parse(fs.readFileSync(file, "utf8"));
-      const arr = Array.isArray(j) ? j : j.wallets || [];
-      for (const e of arr) add(typeof e === "string" ? e : e.pk || e.privateKey);
+  const file = walletFilePath();
+  const text = readWalletFilePath(file);
+  if (text != null) {
+    const loaded = loadKeysFromFile(file, text, process.env.WALLETS_PASSPHRASE ?? sessionWalletPassphrase);
+    for (const k of loaded.keys) add(k);
+    // Never silently load nothing: an encrypted file with no passphrase is a
+    // state the user must be told about, not a quiet zero wallets.
+    if (loaded.status === "encrypted-locked") {
+      say(
+        `${file} is encrypted and no passphrase is available — set WALLETS_PASSPHRASE, or run interactively to be asked. Keys from the environment are still loaded.`,
+        "warn"
+      );
+    } else if (loaded.status === "malformed") {
+      say(`${file} could not be read: ${loaded.detail}. Keys from the environment are still loaded.`, "warn");
     }
-  } catch {
-    // A malformed wallets file is not fatal — fall back to the env keys.
   }
 
   return list;

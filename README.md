@@ -186,6 +186,7 @@ neither loses your keys nor scatters logs:
 | `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
 | `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases, whether your wallet can target each, and how many tokens it can mint |
 | `npm start -- --doctor` | Read-only health report — config, wallets, key pool, SIWE sessions, and RPC latency/chain-id per chain. Exits 1 if anything will stop a run |
+| `npm start -- wallets <cmd>` | `status` \| `encrypt` \| `decrypt` the wallet file — see [Encrypting the wallet file](#encrypting-the-wallet-file) |
 
 ### Flags
 
@@ -645,9 +646,14 @@ waiting for a receipt that will never exist.
 
 ## Security
 
-- Private keys are pasted at run time, kept in memory, and **never written to
-  disk or transmitted anywhere** except as a locally-signed transaction.
-- `.env`, `wallets/` and `*.key` are all git-ignored.
+- Private keys are pasted at run time and kept in memory. They are **never
+  transmitted anywhere** except as a locally-signed transaction, and never
+  printed — not to the console, not to a run log.
+- The one optional at-rest store is the wallet file (`wallets.json`, or
+  `WALLETS_FILE`), and it can be encrypted — see below. `.env`, `wallets/`,
+  `wallets.json` (including the `.tmp-*` a write renames into place) and
+  `*.key` are git-ignored. A `WALLETS_FILE` pointed somewhere else is only as
+  ignored as you make it — check with `git check-ignore -v <path>`.
 - Every piece of runtime state lives inside the project and is git-ignored:
   `.minter-cache/` (API key pool), `.minter-session/` (SIWE sessions) and
   `.minter-logs/` (per-run logs). All three are created automatically on first
@@ -655,6 +661,35 @@ waiting for a receipt that will never exist.
 - Use dedicated hot wallets funded with only what you intend to spend.
 - Read [`src/local-mint.ts`](src/local-mint.ts) if you want to verify exactly what
   gets signed and sent.
+
+### Encrypting the wallet file
+
+`npm start -- wallets encrypt` wraps the file in an authenticated envelope:
+scrypt derives a key from a passphrase (2^17 × r=8, the OWASP recommendation),
+and AES-256-GCM encrypts the previous contents unchanged. The plaintext format
+and the encrypted one have the same shape underneath, so an old unencrypted
+file keeps loading and `wallets decrypt` restores it byte-for-byte.
+
+    npm start -- wallets status      # plaintext / encrypted / absent
+    npm start -- wallets encrypt
+    npm start -- wallets decrypt
+
+The passphrase is asked once per interactive session, or read from
+`WALLETS_PASSPHRASE` for headless runs. It is never stored, never printed, and
+never taken as a command-line flag — a flag would sit in your shell history and
+in `ps` output for the life of the process.
+
+What it buys you, stated plainly: the file is unreadable if it leaks on its own
+— a backup, a stray `scp`, an accidental commit. A passphrase written in `.env`
+next to the file does **not** protect against anyone who already has your home
+directory. And it does not cover `PRIVATE_KEY` / `PRIVATE_KEYS` in `.env` itself
+— those are read raw, so move them into an encrypted wallet file rather than
+keeping both.
+
+An encrypted file with no passphrase available is reported rather than silently
+yielding zero wallets: the run log says so, `--doctor` says "wallet file is
+encrypted and no passphrase is available" instead of "none loaded", and the
+keys supplied through the environment still load.
 
 ---
 
