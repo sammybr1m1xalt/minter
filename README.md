@@ -85,7 +85,7 @@ nodes.
 | `RPC_URL_ETHEREUM` / `RPC_URL_BASE` / `RPC_URL_ROBINHOOD` / `RPC_URL_ARC` / `RPC_URL_SONEIUM` | Private RPC for that chain. Overrides the built-in public endpoints. | _(empty — public nodes)_ |
 | `RPC_URL` | A single endpoint, used when `CHAIN` matches the chain you pick. | _(empty)_ |
 | `EXTRA_RPC_URLS` | Comma-separated extra endpoints, any chain. | _(empty)_ |
-| `CHAIN` | Chain highlighted in the wizard menu, and the default for the FCFS branch. | `base` |
+| `CHAIN` | Chain highlighted in the wizard menu, and the default for the FCFS branch. **The chain you settle on is written back here**, so a mint on one chain does not leave the next run aimed at the last one. | `base` |
 | `MAX_FEE_PER_GAS` | Max-fee ceiling, in gwei. Pre-filled at the prompt. | `2` |
 | `MAX_PRIORITY_FEE` | Tip, in gwei. Pre-filled at the prompt. | `0.05` |
 | `GAS_LIMIT` | Gas limit per mint transaction. | `250000` |

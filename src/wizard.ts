@@ -25,6 +25,7 @@ dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
 
 import { RunLogger, say } from "./logger";
 import { loadKeysFromFile, readWalletFile, readWalletFilePath } from "./wallet-file";
+import { rememberChain } from "./env-file";
 import { JsonRpcProvider, Wallet, formatEther } from "ethers";
 import { CHAINS, ChainProfile, resolveChain } from "./chains";
 import { parseNftLink } from "./nft-link";
@@ -192,6 +193,11 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
     );
   }
   log.field("chain", chainKey);
+  // Remember the choice. CHAIN in .env is a default for the prompt, never a
+  // bypass, so the user is always asked — but the answer used to die with the
+  // run, and the next run silently used the stale value.
+  rememberChain(chainKey);
+  console.log(chalk.gray(`  CHAIN=${chainKey} saved to .env`));
   let chainProfile = resolveChain(chainKey)!;
 
   // ── 3. Quantity ───────────────────────────────────────────────────────
@@ -257,6 +263,9 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       )
     );
     log.field("chain_override", `${chainProfile.key} -> ${targetProfile.key}`);
+    // The target moved us to another chain; remember that too, or the next run
+    // starts from the chain we just learned is wrong.
+    rememberChain(targetProfile.key);
   }
   chainProfile = targetProfile;
   // `nftInput` is the RESOLVED contract, not necessarily what was typed: a pasted

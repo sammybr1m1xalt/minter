@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import { Wallet, formatEther } from "ethers";
 import { ChainProfile, CHAINS, resolveChain } from "./chains";
+import { rememberChain } from "./env-file";
 import { planRpcs, resolveRpcsForChain } from "./rpc-resolver";
 import { RunLogger } from "./logger";
 import {
@@ -1013,6 +1014,9 @@ export async function runFcfsBranchCli(
   }
   const chainProfile = resolveChain(chainKey);
   if (!chainProfile) throw new Error(`Unknown chain "${chainKey}"`);
+  // Remember an explicit choice. A `--chain` that differs from a stale CHAIN in
+  // .env is exactly the case that used to be forgotten by the next run.
+  rememberChain(chainProfile.key);
 
   const envRpcs = (process.env[`RPC_URL_${chainKey.toUpperCase()}`] || "").split(",").filter(Boolean);
   const { urls: candidateRpcs } = await resolveRpcsForChain(chainKey, envRpcs);
