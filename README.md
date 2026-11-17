@@ -195,7 +195,7 @@ neither loses your keys nor scatters logs:
 | `--at <time>` | ISO 8601, unix seconds/ms, `"in 5m"`, `"30s"`, or `"HH:MM"` (HH:MM is read in IST, matching the times the wizard prints) |
 | `--when-open` | Poll the chain and fire the moment the stage opens |
 | `--max-price <price>` | Max total price in ETH, `"free"`, `"0.05/unit"`, `"0.05total"`, or `"any"` (no cap) |
-| `--wallets <spec>` | `all` \| `N` \| `1,3,4` — default is the single primary wallet |
+| `--wallets <spec>` | `all` \| `N` \| `1,3,4` — 1-based. An unknown spec, an out-of-range index, a duplicate or `0` is **refused** naming the problem, not clamped or silently narrowed. Indices are applied in wallet order however you type them |
 | `--chain <key>` | `ethereum` \| `base` \| `robinhood` \| `arc` \| `soneium` |
 | `--quantity <n>` | NFTs per wallet (default 1) |
 | `--doctor` | Health report: config, wallets, key pool, sessions, RPC per chain (read-only, exits 1 on a blocker) |

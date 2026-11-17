@@ -1814,20 +1814,48 @@ export function loadEnvKeys(): LoadedWallet[] {
 
 /**
  * Select a subset by spec: all | * | N | 1,3,4 (1-based).
+ *
+ * Strict on purpose. A silent fallback here is how a typo (`--wallets al`)
+ * quietly mints from one wallet instead of all, and how `--wallets 1,1` mints
+ * the same wallet twice with the same nonce. Anything that does not name real,
+ * distinct wallets throws and names the problem — a refused spec costs a
+ * re-run, a wrong one costs a mint.
  */
 export function selectFromLoaded(all: LoadedWallet[], spec: string): LoadedWallet[] {
   if (!all.length) return [];
-  const s = String(spec).trim().toLowerCase();
-  if (s === "all" || s === "*") return all;
-  if (/^\d+$/.test(s)) return all.slice(0, Math.max(1, Math.min(Number(s), all.length)));
-  if (/^[0-9,\s]+$/.test(s)) {
-    const idx = s
-      .split(",")
-      .map((x) => Number(x.trim()) - 1)
-      .filter((i) => Number.isInteger(i) && i >= 0 && i < all.length);
-    if (idx.length) return idx.map((i) => all[i]);
+  const count = all.length;
+  const raw = String(spec ?? "").trim().toLowerCase();
+  const bad = (msg: string): never => {
+    throw new Error(`invalid --wallets "${spec}": ${msg}`);
+  };
+
+  if (raw === "all" || raw === "*") return all;
+  if (!raw) bad(`expected all | N | 1,3,4 (${count} wallet(s) loaded)`);
+
+  // A lone number is a count: the first N wallets.
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    if (n < 1) bad("a count must be at least 1");
+    if (n > count) bad(`${n} requested but only ${count} wallet(s) loaded`);
+    return all.slice(0, n);
   }
-  return [all[0]];
+
+  // Otherwise a comma-separated list of 1-based indices.
+  if (!/^[0-9,\s]+$/.test(raw)) bad(`expected all | N | 1,3,4 (${count} wallet(s) loaded)`);
+  const parts = raw.split(",").map((x) => x.trim());
+  if (parts.some((p) => p === "")) bad("empty entry in the list");
+  const idx = parts.map((p) => Number(p));
+  if (idx.some((n) => !Number.isInteger(n) || n < 1)) bad("indices are 1-based positive integers");
+  for (const n of idx) {
+    if (n > count) bad(`index ${n} is out of range (only ${count} wallet(s) loaded)`);
+  }
+  const seen = new Set<number>();
+  for (const n of idx) {
+    if (seen.has(n)) bad(`duplicate index ${n} — each wallet can appear only once`);
+    seen.add(n);
+  }
+  // Wallet order is preserved however the indices were typed.
+  return [...seen].sort((a, b) => a - b).map((n) => all[n - 1]);
 }
 
 async function promptQuantity(walletCount: number): Promise<number> {
