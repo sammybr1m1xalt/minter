@@ -186,7 +186,7 @@ neither loses your keys nor scatters logs:
 | `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
 | `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases, whether your wallet can target each, and how many tokens it can mint |
 | `npm start -- --doctor` | Read-only health report — config, wallets, key pool, SIWE sessions, and RPC latency/chain-id per chain. Exits 1 if anything will stop a run |
-| `npm start -- wallet <cmd>` | `status` \| `encrypt` \| `decrypt` the wallet file — see [Encrypting the wallet file](#encrypting-the-wallet-file) |
+| `npm start -- wallet <cmd>` | `status` \| `encrypt` \| `decrypt` the wallet file (`--wallet` also works) — see [Encrypting the wallet file](#encrypting-the-wallet-file) |
 
 ### Flags
 
@@ -675,9 +675,9 @@ file keeps loading and `wallet decrypt` restores it byte-for-byte.
     npm start -- wallet decrypt
 ```
 
-`wallets` (plural) is accepted as an alias. It is not the same as `--wallets`,
-which is the mint flag that selects *which* wallets to mint with — that one is
-dashed and takes `all | N | 1,3,4`.
+`wallets` (plural) and `--wallet` (dashed) are both accepted. Neither is
+`--wallets`, which is the mint flag that selects *which* wallets to mint with
+and takes `all | N | 1,3,4`.
 
 The file holds keys in any of these shapes — a bare array, or an object with a
 `wallets` array whose entries are either strings or `{ "pk": ... }` /
