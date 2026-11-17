@@ -40,6 +40,7 @@ dotenv.config({ path: path.resolve(process.cwd(), ".env"), override: true });
 import { createRunLogger } from "./logger";
 import { runLoggerCli } from "./log-reader";
 import { runWalletCli } from "./wallet-cli";
+import { recordInvocationEnd, recordInvocationStart } from "./invocation-log";
 import { runDoctor } from "./doctor";
 import { runWizard, runFcfsBranchCli, runEligibilityCheck } from "./wizard";
 import { closePrompts } from "./prompt";
@@ -166,6 +167,12 @@ function validateFlags(flags: CliFlags): string | null {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+
+  // Record the invocation BEFORE anything can fail. Runs that die early --
+  // a wallet-file command, --doctor, or an abort at the passphrase prompt --
+  // never reach the run logger, and without this they leave no trace at all.
+  recordInvocationStart(args);
+  process.on("exit", (code) => recordInvocationEnd(code));
 
   // Wallet-file management runs alone, like --doctor: it is a file operation,
   // not a mint mode, and combining it with a mint would either be ignored or

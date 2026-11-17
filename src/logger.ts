@@ -201,7 +201,7 @@ const CREDENTIAL_FIELD = /key|token|secret|private|rpc|auth|password|seed|mnemon
  * that records only the PARSED result cannot answer "why did it target that" —
  * the arguments are the first thing needed.
  */
-function redactArgv(args: string[]): string[] {
+export function redactArgv(args: string[]): string[] {
   return args.map((a) => (/^0x[0-9a-fA-F]{64}$/.test(a) ? "0x<redacted>" : a));
 }
 

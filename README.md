@@ -577,6 +577,17 @@ line on the console *and* in the run log. The payload path uses it to report whi
 leg produced each wallet's payload (`payload via gql` / `via rest`) and, when
 nothing did, which surfaces were tried — so "no payload" is never a bare verdict.
 
+### Runs that leave no run log
+
+The run logger attaches after flag parsing, so some invocations never produce a
+run log at all: `wallet …` / `--wallet …`, `--doctor`, `--eligibility`, and any
+run that aborts at a prompt. Every invocation is therefore also recorded in
+`.minter-logs/invocations.log` — one `START` line with the arguments as typed
+(redacted for anything key-shaped) and one `EXIT` line with the status. It only
+ever grows, it is git-ignored, and `--logger` can read it like any other file.
+
+    npm start -- --logger .minter-logs/invocations.log
+
 ### How the fire reaches the chain
 
 Every endpoint is measured in parallel with a plain `eth_chainId` and ordered
