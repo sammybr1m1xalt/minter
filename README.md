@@ -674,6 +674,20 @@ file keeps loading and `wallets decrypt` restores it byte-for-byte.
     npm start -- wallets encrypt
     npm start -- wallets decrypt
 
+The file holds keys in any of these shapes — a bare array, or an object with a
+`wallets` array whose entries are either strings or `{ "pk": ... }` /
+`{ "privateKey": ... }`:
+
+```json
+["0xabc…", "0xdef…"]
+```
+```json
+{ "wallets": [{ "pk": "0xabc…" }, { "privateKey": "0xdef…" }] }
+```
+
+Keys are `0x`-prefixed 32-byte hex. Duplicates are dropped by address. An entry
+that is not a valid key is reported by `wallets status` rather than silently
+skipped. The file is read from the working directory, or from `WALLETS_FILE`.
 The passphrase is asked once per interactive session, or read from
 `WALLETS_PASSPHRASE` for headless runs. It is never stored, never printed, and
 never taken as a command-line flag — a flag would sit in your shell history and
