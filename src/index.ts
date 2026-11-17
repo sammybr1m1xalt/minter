@@ -120,6 +120,17 @@ function parseFlags(argv: string[]): CliFlags {
       }
       out.quantity = n;
     } else if (a.startsWith("-") && a.length > 1) {
+      // The wallet-file command is a bare word, not a flag. `--wallet` and
+      // `--wallet-file` are the spellings people reach for, and a bare
+      // "unknown option" sends them to --help without saying what to type.
+      const near = a.toLowerCase().replace(/[^a-z]/g, "");
+      if (near === "wallet" || near === "wallets" || near === "walletfile") {
+        throw new Error(
+          `"${a}" is not a flag. The wallet-file command is a bare word — ` +
+            `npm start -- wallet status | encrypt | decrypt. ` +
+            `Dashed --wallets is the mint flag that selects which wallets to mint with (all | N | 1,3,4).`
+        );
+      }
       // An unrecognised flag used to fall into `rest` and become the mint
       // target, so a typo like `--typo` ran a snipe against a target named
       // "--typo". Refuse it instead.
