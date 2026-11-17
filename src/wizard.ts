@@ -45,6 +45,7 @@ import {
   assessDropEligibility,
   getPhaseEligibility,
   sortByStartTime,
+  formatDropPrice,
 } from "./fcfs-drops";
 import {
   fetchOnChainDrops,
@@ -1472,7 +1473,7 @@ function printEligibilityReport(
               : chalk.yellow("⚠ UNKNOWN — could not verify");
 
       console.log(chalk.gray(`    └─ Phase ${pIdx}: ${drop.name || "unnamed"} ${modeBadge} ${liveBadge} ${eligBadge}`));
-      console.log(chalk.gray(`       type: ${drop.type || "unknown"} | price: ${formatEther(drop.mintPrice)} ETH`));
+      console.log(chalk.gray(`       type: ${drop.type || "unknown"} | price: ${formatDropPrice(drop)} ETH`));
       console.log(
         report.walletMintable == null
           ? chalk.gray(`       you can mint: unknown`)

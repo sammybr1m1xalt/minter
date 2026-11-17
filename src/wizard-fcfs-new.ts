@@ -14,6 +14,7 @@ import {
   recommendGasSettings,
   printGasRecommendation,
   gasChoiceAssessment,
+  formatDropPrice,
 } from "./fcfs-drops";
 import {
   fetchOnChainDrops,
@@ -513,7 +514,7 @@ export async function runFcfsBranch(
     console.log(chalk.gray(`    Fee recipient: ${payload.feeRecipient}`));
     console.log(
       chalk.gray(
-        `    Price:         ${formatEther(drop.mintPrice)} × ${quantity} = ${formatEther(payload.value)} per wallet`,
+        `    Price:         ${formatDropPrice(drop)} × ${quantity} = ${formatEther(payload.value)} per wallet`,
       ),
     );
     console.log(chalk.gray(`    Max per wallet: ${drop.maxTotalMintableByWallet || "unlimited"}`));
@@ -523,7 +524,7 @@ export async function runFcfsBranch(
     console.log(chalk.gray(`    NFT:           ${nftContract}`));
     console.log(
       chalk.gray(
-        `    Price:         ${formatEther(selectedDrop.mintPrice)} × ${quantity} per wallet (from the phase inventory)`,
+        `    Price:         ${formatDropPrice(selectedDrop)} × ${quantity} per wallet (from the phase inventory)`,
       ),
     );
     console.log(chalk.gray(`    Max per wallet: ${selectedDrop.maxTotalMintableByWallet || "unlimited"}`));
@@ -540,7 +541,7 @@ export async function runFcfsBranch(
         : chalk.gray("(not yet open)");
   console.log(chalk.gray(`    Window:        ${fmtWhen(startsAt)} → ${fmtWhen(endsAt)} ${timingNote}`));
 
-  if (drop.maxTotalMintableByWallet > 0 && quantity > drop.maxTotalMintableByWallet) {
+  if ((selectedDrop.capKnown && selectedDrop.maxTotalMintableByWallet > 0) && quantity > selectedDrop.maxTotalMintableByWallet) {
     throw new Error(
       `Requested quantity ${quantity} exceeds the per-wallet cap of ${drop.maxTotalMintableByWallet} for this phase. Reduce quantity.`
     );

@@ -233,6 +233,9 @@ async function fetchPublicDrop(
     maxTotalMintableByWallet: Number(d.maxTotalMintableByWallet),
     maxTotalMintable: 0, // public drops don't have a total cap on-chain
     totalMinted: 0,       // can't get from SeaDrop — check the NFT contract
+    priceKnown: true,
+    capKnown: true,
+    mintedKnown: false,
     feeBps: Number(d.feeBps),
     feeRecipient: feeRecipient, // default SEA DEX fee addr
     mintData: null,
@@ -307,6 +310,9 @@ async function fetchAllowlistPhase(
     endTime: 0,
     mintPrice: 0n,
     maxTotalMintableByWallet: 0,
+    priceKnown: false,
+    capKnown: false,
+    mintedKnown: false,
     maxTotalMintable: 0,
     totalMinted: 0,
     feeBps: 0,
@@ -372,6 +378,9 @@ async function fetchTokenGatedPhase(
       maxTotalMintableByWallet: Number(d.maxTotalMintableByWallet),
       maxTotalMintable: Number(d.maxTokenSupplyForStage),
       totalMinted: 0,
+      priceKnown: true,
+      capKnown: true,
+      mintedKnown: false,
       feeBps: Number(d.feeBps),
       feeRecipient: OPENSEA_FEE_RECIPIENT,
       mintData: null,

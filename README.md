@@ -626,6 +626,22 @@ live information:
   re-read never stops the fire — the original plan is still the best information
   available, and the on-chain revert is the backstop.
 
+### "Stated" versus guessed
+
+Several fields are `0` when they have a real meaning — a price of `0` is a free
+mint, a cap of `0` is unlimited. So an API response that does **not** state one
+used to parse as `0` and quietly become the optimistic reading: an unpriced drop
+was quoted as free, an uncapped one as unlimited.
+
+Each of those now carries a `priceKnown` / `capKnown` / `mintedKnown` flag
+records whether the API actually stated the value. When it did not, the price
+prints `unknown`, the quantity check is skipped rather than passed, and the
+allocation check is not run — instead of a favourable guess. The on-chain reads
+set the flags from what the contract actually returned.
+
+Signed payloads carry the stage OpenSea signed for, and the fire refuses a
+payload whose stage differs from the one you selected.
+
 ---
 
 ## What it protects you from

@@ -26,6 +26,18 @@ import { getWalletJwt } from "./opensea-session";
 const OPENSEA_BASE = "https://api.opensea.io";
 
 /**
+ * Did the API actually state this value?
+ *
+ * Absent, empty and unparseable all count as "no". This matters because 0 is a
+ * REAL value elsewhere in this file — a free mint, an unlimited cap — so a
+ * missing field parsed as 0 silently became the optimistic reading.
+ */
+function statedScalar(raw: unknown): boolean {
+  if (raw == null || raw === "" || typeof raw === "object") return false;
+  return Number.isFinite(Number(raw));
+}
+
+/**
  * Normalize an OpenSea timestamp to UNIX seconds.
  *
  * GQL returns ISO-8601 strings ("2026-11-01T00:00:00.000Z"); REST returns
@@ -96,6 +108,19 @@ export function isSignedStageType(raw: string | null | undefined): boolean {
 
 // ── Shapes ──────────────────────────────────────────────────────────────────
 
+/**
+ * Price for display.
+ *
+ * "unknown" when the API did not state one. 0 is a REAL value here — a free
+ * mint — so an unstated price must not be shown as 0, which reads as "free"
+ * and understates what the mint will actually cost.
+ */
+export function formatDropPrice(drop: { mintPrice: bigint; priceKnown?: boolean }): string {
+  // `priceKnown === undefined` means the caller had no flag to go on — a
+  // payload's own meta, which by construction did state its price.
+  return drop.priceKnown === false ? "unknown" : formatEther(drop.mintPrice);
+}
+
 export interface DropPhase {
   // OpenSea identity
   dropId: string;
@@ -115,6 +140,16 @@ export interface DropPhase {
   maxTotalMintableByWallet: number; // per-wallet limit (0 = unlimited)
   maxTotalMintable: number; // total remaining across all wallets (if reported)
   totalMinted: number; // total minted so far (if reported)
+
+  // ── "Stated vs guessed" flags ───────────────────────────────────────────
+  // An absent API field used to parse as 0, and 0 means two different things
+  // here: a free mint, and an unlimited cap. Both readings are favourable, so
+  // an absent field silently became the optimistic one. These record whether
+  // the API actually stated the value; when false, 0 means UNKNOWN and must be
+  // surfaced as such rather than quoted.
+  priceKnown: boolean;
+  capKnown: boolean;
+  mintedKnown: boolean;
 
   // Fee
   feeBps: number;
@@ -489,23 +524,26 @@ async function fetchGraphqlDrops(
       // wei decimal string ("5600000000000000"). parsePriceToWei handles both
       // and never throws — the previous BigInt(String(...)) threw on floats and
       // silently emptied the whole inventory.
-      const mintPrice = parsePriceToWei(
-        c.price?.token?.unit ?? c.price ?? c.mintPrice ?? c.mint_price ?? c.mintPriceWei ?? 0
-      );
+      const mintPriceRaw =
+        c.price?.token?.unit ?? c.price ?? c.mintPrice ?? c.mint_price ?? c.mintPriceWei;
+      const priceKnown = statedScalar(mintPriceRaw);
+      const mintPrice = priceKnown ? parsePriceToWei(mintPriceRaw) : 0n;
       // `max_total` is the COLLECTION's capacity, not a per-wallet limit. It
       // used to be the last fallback here, which quoted a wallet an allowance
       // as large as the whole drop.
-      const maxPerWallet = Number(
-        c.max_per_wallet || c.maxPerWallet || c.maxTotalMintableByWallet ||
-        c.max_total_mintable_by_wallet || 0
-      );
+      const maxPerWalletRaw =
+        c.max_per_wallet ?? c.maxPerWallet ?? c.maxTotalMintableByWallet ??
+        c.max_total_mintable_by_wallet;
+      const capKnown = statedScalar(maxPerWalletRaw);
+      const maxPerWallet = capKnown ? Number(maxPerWalletRaw) : 0;
       const maxTotal = Number(
         c.maxTotalMintable || c.max_total_mintable || c.maxTotal || c.max_total ||
         c.capacity || 0
       );
-      const totalMinted = Number(
-        c.total_minted || c.totalMinted || c.minted || c.mintedCount || c.minted_count || 0
-      );
+      const totalMintedRaw =
+        c.total_minted ?? c.totalMinted ?? c.minted ?? c.mintedCount ?? c.minted_count;
+      const mintedKnown = statedScalar(totalMintedRaw);
+      const totalMinted = mintedKnown ? Number(totalMintedRaw) : 0;
 
       const mintData = c.mintData || c.mint_data || c.calldata || c.data || null;
       const mintSignature = c.mintSignature || c.mint_signature || c.signature || null;
@@ -545,6 +583,9 @@ async function fetchGraphqlDrops(
         maxTotalMintableByWallet: maxPerWallet,
         maxTotalMintable: maxTotal,
         totalMinted,
+        priceKnown,
+        capKnown,
+        mintedKnown,
         feeBps: feeBpsVal,
         feeRecipient: feeRecipient || null,
         mintData,
@@ -678,23 +719,23 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
     const label = c.label || c.name || c.title || c.displayName || null;
 
     // GQL price is an ETH float; REST price is a wei decimal string.
-    const mintPrice = parsePriceToWei(
-      c.price?.token?.unit ?? c.price ?? c.mintPrice ?? c.mint_price ?? c.mintPriceWei ?? 0
-    );
-    // `max_total` is the COLLECTION's capacity, not a per-wallet limit. It
-    // used to be the last fallback here, which quoted a wallet an allowance
-    // as large as the whole drop.
-    const maxPerWallet = Number(
-      c.max_per_wallet || c.maxPerWallet || c.maxTotalMintableByWallet ||
-      c.max_total_mintable_by_wallet || 0
-    );
+    const mintPriceRaw =
+      c.price?.token?.unit ?? c.price ?? c.mintPrice ?? c.mint_price ?? c.mintPriceWei;
+    const priceKnown = statedScalar(mintPriceRaw);
+    const mintPrice = priceKnown ? parsePriceToWei(mintPriceRaw) : 0n;
+    const maxPerWalletRaw =
+      c.max_per_wallet ?? c.maxPerWallet ?? c.maxTotalMintableByWallet ??
+      c.max_total_mintable_by_wallet;
+    const capKnown = statedScalar(maxPerWalletRaw);
+    const maxPerWallet = capKnown ? Number(maxPerWalletRaw) : 0;
     const maxTotal = Number(
       c.maxTotalMintable || c.max_total_mintable || c.maxTotal || c.max_total ||
       c.capacity || 0
     );
-    const totalMinted = Number(
-      c.total_minted || c.totalMinted || c.minted || c.mintedCount || c.minted_count || 0
-    );
+    const totalMintedRaw =
+      c.total_minted ?? c.totalMinted ?? c.minted ?? c.mintedCount ?? c.minted_count;
+    const mintedKnown = statedScalar(totalMintedRaw);
+    const totalMinted = mintedKnown ? Number(totalMintedRaw) : 0;
 
     const mintData = c.mintData || c.mint_data || c.calldata || c.data || null;
     const mintSignature = c.mintSignature || c.mint_signature || c.signature || null;
@@ -734,6 +775,9 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
       maxTotalMintableByWallet: maxPerWallet,
       maxTotalMintable: maxTotal,
       totalMinted,
+      priceKnown,
+      capKnown,
+      mintedKnown,
       feeBps: feeBpsVal,
       feeRecipient: feeRecipient || null,
       mintData,
@@ -863,7 +907,7 @@ function verdictToReport(drop: DropPhase, v: PhaseEligibilityVerdict): Eligibili
   // phase has already ended".
   const isPast = drop.endTime > 0 && Date.now() >= drop.endTime * 1000;
   const overAllocated =
-    drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+    drop.mintedKnown && drop.maxTotalMintable > 0 &&
     drop.totalMinted >= drop.maxTotalMintable;
 
   let recommendation: EligibilityReport["recommendation"];
@@ -892,7 +936,7 @@ function verdictToReport(drop: DropPhase, v: PhaseEligibilityVerdict): Eligibili
     walletMintable:
       v.eligible === true
         ? mintableFromCap({
-            phaseLimit: drop.maxTotalMintableByWallet > 0 ? drop.maxTotalMintableByWallet : null,
+            phaseLimit: (drop.capKnown && drop.maxTotalMintableByWallet > 0) ? drop.maxTotalMintableByWallet : null,
             runningCap: v.cap,
             minted: v.minted,
           })
@@ -1189,7 +1233,7 @@ export function assessDropEligibility(
     // This path never talks to OpenSea, so the running cap and the minted count
     // are unknown; the phase limit is the only bound in hand.
     walletMintable: mintableFromCap({
-      phaseLimit: drop.maxTotalMintableByWallet > 0 ? drop.maxTotalMintableByWallet : null,
+      phaseLimit: (drop.capKnown && drop.maxTotalMintableByWallet > 0) ? drop.maxTotalMintableByWallet : null,
       runningCap: null,
       minted: null,
     }),
@@ -1202,7 +1246,7 @@ function assessDropEligibilityLocal(
 ): EligibilityReport {
   const wallet = ourWallet?.trim().toLowerCase() || "";
   const overAllocated =
-    drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+    drop.mintedKnown && drop.maxTotalMintable > 0 &&
     drop.totalMinted >= drop.maxTotalMintable;
 
   // A public stage is open to everyone — no signature, no allowlist — and
@@ -1332,7 +1376,7 @@ function assessDropEligibilityLocal(
           drop,
           ourWalletEligible: null,
           allocationRemaining: remaining,
-          isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+          isOverAllocated: drop.mintedKnown && drop.maxTotalMintable > 0 &&
             drop.totalMinted >= drop.maxTotalMintable,
           recommendation: remaining !== null && remaining <= 0 ? "skip" : "target",
           reason: "OpenSea reports ineligible, but OVR/allowlist phase has signed data — " +
@@ -1343,7 +1387,7 @@ function assessDropEligibilityLocal(
         drop,
         ourWalletEligible: null,
         allocationRemaining: computeAllocationRemaining(drop),
-        isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+        isOverAllocated: drop.mintedKnown && drop.maxTotalMintable > 0 &&
           drop.totalMinted >= drop.maxTotalMintable,
         recommendation: "check-manually",
         reason: "OVR/allowlist phase, OpenSea reports ineligible, no signed data yet. " +
@@ -1371,7 +1415,7 @@ function assessDropEligibilityLocal(
         drop,
         ourWalletEligible: null, // recheck eligibility at fire time if possible
         allocationRemaining: remaining,
-        isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+        isOverAllocated: drop.mintedKnown && drop.maxTotalMintable > 0 &&
           drop.totalMinted >= drop.maxTotalMintable,
         recommendation: remaining !== null && remaining <= 0 ? "skip" : "target",
         reason: "OpenSea reports ineligible, but phase has signed data — " +
@@ -1397,7 +1441,7 @@ function assessDropEligibilityLocal(
       drop,
       ourWalletEligible: true,
       allocationRemaining: remaining,
-      isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+      isOverAllocated: drop.mintedKnown && drop.maxTotalMintable > 0 &&
         drop.totalMinted >= drop.maxTotalMintable,
       recommendation: remaining !== null && remaining <= 0 ? "skip" : "target",
       reason: remaining !== null && remaining <= 0
@@ -1415,7 +1459,7 @@ function assessDropEligibilityLocal(
       drop,
       ourWalletEligible: null, // can't tell without getting a per-wallet sig
       allocationRemaining: remaining,
-      isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+      isOverAllocated: drop.mintedKnown && drop.maxTotalMintable > 0 &&
         drop.totalMinted >= drop.maxTotalMintable,
       recommendation: remaining !== null && remaining <= 0 ? "skip" : "target",
       reason: "Phase has signed mint data — targetable, but eligibility "
@@ -1429,7 +1473,7 @@ function assessDropEligibilityLocal(
       drop,
       ourWalletEligible: null,
       allocationRemaining: computeAllocationRemaining(drop),
-      isOverAllocated: drop.totalMinted != null && drop.maxTotalMintable > 0 &&
+      isOverAllocated: drop.mintedKnown && drop.maxTotalMintable > 0 &&
         drop.totalMinted >= drop.maxTotalMintable,
       recommendation: "check-manually",
       reason: "Phase exists but OpenSea didn't return signed mint data. "
@@ -1449,7 +1493,7 @@ function assessDropEligibilityLocal(
 }
 
 function computeAllocationRemaining(drop: DropPhase): number | null {
-  if (drop.maxTotalMintable > 0 && drop.totalMinted != null) {
+  if (drop.maxTotalMintable > 0 && drop.mintedKnown) {
     return Math.max(0, drop.maxTotalMintable - drop.totalMinted);
   }
   if (drop.maxTotalMintable === -1) return null; // unknown capacity
@@ -1599,10 +1643,10 @@ export function printDropsInventory(
       typeBadge = "token-gated";
 
     // Price line
-    const priceEth = formatEther(drop.mintPrice);
+    const priceEth = formatDropPrice(drop);
 
     // Per-wallet limit
-    const perWallet = drop.maxTotalMintableByWallet > 0
+    const perWallet = (drop.capKnown && drop.maxTotalMintableByWallet > 0)
       ? `${drop.maxTotalMintableByWallet} per wallet`
       : "unlimited per wallet";
 
@@ -1621,7 +1665,7 @@ export function printDropsInventory(
           (collectionRemaining != null ? `, ${collectionRemaining} left` : "") +
           ")"
       );
-    } else if (drop.totalMinted != null) {
+    } else if (drop.mintedKnown) {
       allocLine = chalk.gray(`  minted: ${drop.totalMinted} (capacity unknown)`);
     }
 

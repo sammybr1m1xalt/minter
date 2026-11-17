@@ -98,6 +98,9 @@ function loadPersistedSessions(): void {
       sessions.set(addr, {
         cookies: new Map(Object.entries(s.cookies)),
         token: s.token,
+        // Expiry of 0 means "not stated", and every consumer reads 0 as
+        // expired — the safe direction, since it forces a fresh login rather
+        // than trusting a session whose expiry could not be read.
         exp: Number(s.exp) || 0,
         // Absent on sessions written before the wallet-JWT leg existed; the
         // optional fields degrade to "no cached token" rather than a parse error.
