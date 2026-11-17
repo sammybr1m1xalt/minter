@@ -897,6 +897,14 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         // would always come back null and drop the wallet); phase 2 fetches at
         // T-0 instead.
         phaseOpensInFuture,
+        // The stage the user picked. A payload whose own stage is known and
+        // differs is refused instead of firing a calldata for another window.
+        expectedStage: {
+          uuid: selectedDrop.dropId || null,
+          type: selectedDrop.type ?? null,
+          startTime: selectedDrop.startTime > 0 ? selectedDrop.startTime : null,
+          endTime: selectedDrop.endTime > 0 ? selectedDrop.endTime : null,
+        },
         // Re-read the per-wallet cap at T-0. A drop's limit can be edited in the
         // last minutes before its stage opens, and the signed calldata binds the
         // quantity — when this comes back lower, the fire path re-fetches every

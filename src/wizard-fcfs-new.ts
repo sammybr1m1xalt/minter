@@ -486,6 +486,24 @@ export async function runFcfsBranch(
   const endMs = windowEnd > 0 ? windowEnd * 1000 : null;
   const startsAt = startMs != null ? new Date(startMs) : null;
   const endsAt = endMs != null ? new Date(endMs) : null;
+
+  // The wait must follow the stage the USER selected, not whatever stage
+  // OpenSea's payload happens to name. When the payload states a window and it
+  // differs from the selection, say so before anything is scheduled: the fire
+  // will refuse that payload, and silently sitting until a later stage is how
+  // a run aimed at one phase ends up aimed at another.
+  if (payload?.stage?.startTime && payload.stage.startTime > 0 && selectedDrop.startTime > 0) {
+    if (payload.stage.startTime !== selectedDrop.startTime) {
+      const fmt = (t: number) => toIST(new Date(t * 1000));
+      console.log(
+        chalk.yellow(
+          `\n  ⚠ The payload OpenSea signed is for a stage opening ${fmt(payload.stage.startTime)}, not the ` +
+            `stage you selected (${fmt(selectedDrop.startTime)}).`
+        )
+      );
+      console.log(chalk.gray(`    It will be refused at fire time rather than mint the wrong stage.`));
+    }
+  }
   const live = startMs != null && endMs != null && Date.now() >= startMs && Date.now() < endMs;
 
   if (payload) {
@@ -802,6 +820,15 @@ export async function runFcfsBranch(
     // A future phase has no payload yet — phase 1 must not fetch one, phase 2
     // fetches at T-0.
     phaseOpensInFuture: futurePhaseAccepted,
+    // The stage the user picked, so a payload for a different stage is refused
+    // rather than silently broadcast (and rather than silently deciding the
+    // wait from its window).
+    expectedStage: {
+      uuid: selectedDrop.dropId || null,
+      type: selectedDrop.type ?? null,
+      startTime: selectedDrop.startTime > 0 ? selectedDrop.startTime : null,
+      endTime: selectedDrop.endTime > 0 ? selectedDrop.endTime : null,
+    },
     // Re-read the per-wallet cap at T-0. The signed calldata binds the quantity,
     // so a cap that dropped while waiting means every payload fetched so far is
     // for the wrong quantity and must be re-fetched rather than broadcast.

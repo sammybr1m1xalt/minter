@@ -103,6 +103,96 @@ export interface FcfsGasData {
   maxPriorityFeePerGas: bigint; // wei
 }
 
+/** The stage a signed payload is actually for. Nulls mean "not stated". */
+export interface SignedStage {
+  uuid: string | null;
+  type: string | null;
+  /** UNIX seconds. null = unknown — never read as 0/1970. */
+  startTime: number | null;
+  endTime: number | null;
+}
+
+/**
+ * The stage the user selected, carried to the fire so a payload can be checked
+ * against it. `dropId` is OpenSea's stage uuid for API-discovered phases.
+ */
+export interface ExpectedStage {
+  uuid?: string | null;
+  type?: string | null;
+  startTime?: number | null;
+  endTime?: number | null;
+}
+
+/** OpenSea stage uuids are 32 hex chars, dashed or plain. */
+const UUID_SHAPED = /^([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+
+function normUuid(u: string | null | undefined): string | null {
+  if (!u) return null;
+  const s = u.trim().toLowerCase();
+  return UUID_SHAPED.test(s) ? s.replace(/-/g, "") : null;
+}
+
+/**
+ * Do these two describe the same stage?
+ *
+ * Only compares what BOTH sides state. A payload that carries no stage identity
+ * (GraphQL) cannot be checked and returns true — "cannot tell" is not
+ * "matches", but refusing every GraphQL payload would stop the primary path.
+ * Where a comparison IS possible and the two disagree, this returns false.
+ */
+export function stageMatches(payload: FcfsSignedPayload, expected: ExpectedStage | null | undefined): boolean {
+  return stageMismatchReason(payload, expected) == null;
+}
+
+/**
+ * Build the refusal for a payload whose stage is known and differs from the
+ * selected one, or null when it may proceed. Shared by every place a payload
+ * enters the fire set, so the three cannot drift.
+ */
+function stageRefusal(
+  payload: FcfsSignedPayload,
+  walletIndex: number,
+  addr: string,
+  expected: ExpectedStage | null | undefined,
+): SnipeResult | null {
+  const why = stageMismatchReason(payload, expected);
+  if (!why) return null;
+  say(`    ${addr} — ${why}. Refusing to broadcast.`, "error");
+  return {
+    walletIndex,
+    walletAddress: addr,
+    success: false,
+    error: `${why} — refusing to broadcast.`,
+    retryable: true,
+  };
+}
+
+/** A one-line description of the mismatch, for the message that refuses to fire. */
+export function stageMismatchReason(payload: FcfsSignedPayload, expected: ExpectedStage | null | undefined): string | null {
+  if (!expected) return null;
+  const s = payload.stage;
+  if (!s) return null;
+
+  // uuid comparison, only when both sides actually look like OpenSea stage
+  // uuids — dropId can be a hash for on-chain phases, and comparing those
+  // would refuse a perfectly good payload.
+  const a = normUuid(s.uuid);
+  const b = normUuid(expected.uuid);
+  if (a && b && a !== b) {
+    return `payload is for stage ${a}, but stage ${b} was selected`;
+  }
+  if (s.startTime != null && s.startTime > 0 && expected.startTime != null && expected.startTime > 0) {
+    if (s.startTime !== expected.startTime) {
+      const fmt = (t: number) => new Date(t * 1000).toISOString().replace("T", " ").slice(0, 19);
+      return (
+        `payload is for a stage opening ${fmt(s.startTime)}, ` +
+        `but the selected stage opens ${fmt(expected.startTime)}`
+      );
+    }
+  }
+  return null;
+}
+
 /** Which OpenSea surface produced a signed payload. */
 export type PayloadSource =
   | "gql"     // GraphQL MintActionTimelineQuery
@@ -117,7 +207,16 @@ export interface FcfsSignedPayload {
   mintSignature: string;    // OpenSea's server signature bound to this wallet (per-wallet!)
   value: bigint;            // mintPrice × quantity
   drop: SeaDropDropMeta;
-  gasData?: FcfsGasData;   // optional — OpenSea sometimes recommends gas fields
+  gasData?: FcfsGasData;    // optional — OpenSea sometimes recommends gas fields
+  /**
+   * Which stage OpenSea actually signed for.
+   *
+   * Null when the surface does not say — GraphQL's MintActionTimeline carries
+   * no stage identity at all. Without this, a payload for a DIFFERENT stage
+   * than the one selected was silently accepted, and the wait was then taken
+   * from the signed stage's window rather than the chosen one.
+   */
+  stage?: SignedStage | null;
   /**
    * Which leg produced this payload. Reported per wallet so a run says what it
    * actually used — a payload that came back through the REST fallback looks
@@ -329,6 +428,9 @@ function openseaMintTxToSignedPayload(
       feeBps: 0,
       restrictFeeRecipients: false,
     },
+    // GraphQL states no stage identity. Null, not a guess: callers must not
+    // treat that as "matches anything" without saying so.
+    stage: null,
     gasData: undefined,
   };
 }
@@ -398,6 +500,14 @@ export function mintResponseToPayload(
       ),
       feeBps: 0,
       restrictFeeRecipients: false,
+    },
+    // The REST body states which stage it signed for. Recording it is what
+    // makes the payload checkable against the stage the user selected.
+    stage: {
+      uuid: json?.stage_uuid ?? json?.stageUuid ?? null,
+      type: json?.stage_type ?? json?.stageType ?? null,
+      startTime: isoToUnixSeconds(json?.stage_start_time ?? json?.stageStartTime) || null,
+      endTime: isoToUnixSeconds(json?.stage_end_time ?? json?.stageEndTime) || null,
     },
     gasData: undefined,
   };
@@ -635,6 +745,14 @@ export async function buildSignedPayloadFromDrop(
     mintSignature,
     value,
     drop: { mintPrice, startTime, endTime, maxTotalMintableByWallet: maxTotal, feeBps, restrictFeeRecipients: restrict },
+    // Assembled from a known drop, so the stage is known — carry it, for the
+    // same reason the REST path does.
+    stage: {
+      uuid: drop?.stageUuid ?? drop?.stage_uuid ?? null,
+      type: drop?.type ?? drop?.stageType ?? null,
+      startTime: startTime > 0 ? startTime : null,
+      endTime: endTime > 0 ? endTime : null,
+    },
     gasData,
   };
 }
@@ -850,6 +968,12 @@ export interface ExecuteSnipeOpts {
    * wallet is dropped before it ever had a chance to mint.
    */
   phaseOpensInFuture?: boolean;
+  /**
+   * The stage the user selected. A payload whose own stage identity is known
+   * and differs from this is refused rather than broadcast — firing a calldata
+   * for a stage the user did not pick is the failure this guards.
+   */
+  expectedStage?: ExpectedStage | null;
   /** Maximum total price (wei) the user will accept. Asserted before signing. */
   maxPriceWei?: bigint | null;
   /** Per-unit price OpenSea quoted for this wallet during the eligibility check.
@@ -1090,6 +1214,16 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         return;
       }
 
+      // And it must be for the stage the user selected. A payload carries its
+      // stage only when the surface states one (REST does, GraphQL does not);
+      // when it does and it disagrees, the calldata is for a different window
+      // and firing it is not what was asked for.
+      const refused = stageRefusal(payload, i, addr, opts.expectedStage);
+      if (refused) {
+        results[i] = refused;
+        return;
+      }
+
       // ── Price protection (local, no RPC) ────────────────────────────────
       // The eligibility check quoted a per-wallet price; a signed payload carries
       // the price OpenSea quoted when it was built. Checking the quote first
@@ -1239,6 +1373,12 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         const p = pendingAtT0[i];
         const payload = prepolled.get(p.walletIndex);
         if (!payload) continue;
+        // Same stage check as phase 1 — a pre-polled payload is still a payload.
+        const refused = stageRefusal(payload, p.walletIndex, p.addr, opts.expectedStage);
+        if (refused) {
+          results[p.walletIndex] = refused;
+          continue;
+        }
         ready.push({
           walletIndex: p.walletIndex,
           addr: p.addr,
@@ -1412,6 +1552,13 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
             success: false,
             error: `T-0 payload for ${addr} is bound to a different wallet — refusing to broadcast.`,
           };
+          return null;
+        }
+        // Same stage check — the T-0 fetch is the one that discovers a future
+        // phase's real stage, so it is where a mismatch is most likely.
+        const refused = stageRefusal(payload, walletIndex, addr, opts.expectedStage);
+        if (refused) {
+          results[walletIndex] = refused;
           return null;
         }
         return { walletIndex, addr, payload };
