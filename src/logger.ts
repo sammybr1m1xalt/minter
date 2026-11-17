@@ -121,6 +121,7 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
       out += `  Platform:  ${process.platform}\n`;
       out += `  CWD:       ${process.cwd()}\n`;
       out += `  Log file:  ${logFile}\n`;
+      out += `  Invoked:   ${redactArgv(process.argv.slice(2)).join(" ")}\n`;
       out += `═══════════════════════════════════════════════════════════════\n\n`;
 
       if (fields.length > 0) {
@@ -194,6 +195,15 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
  * every log file on disk.
  */
 const CREDENTIAL_FIELD = /key|token|secret|private|rpc|auth|password|seed|mnemonic/i;
+
+/**
+ * The command line as invoked, with anything key-shaped blanked out. A log
+ * that records only the PARSED result cannot answer "why did it target that" —
+ * the arguments are the first thing needed.
+ */
+function redactArgv(args: string[]): string[] {
+  return args.map((a) => (/^0x[0-9a-fA-F]{64}$/.test(a) ? "0x<redacted>" : a));
+}
 
 export function maskFieldValue(key: string, value: string): string {
   if (!value || !CREDENTIAL_FIELD.test(key)) return value;
