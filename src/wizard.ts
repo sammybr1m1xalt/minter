@@ -1672,10 +1672,23 @@ export async function promptKeys(log: RunLogger, spec?: string | null): Promise<
     }
     return selected.map((w) => w.privateKey);
   }
-  if (envKeys.length > 0 && process.env.PRIVATE_KEY && !process.stdin.isTTY) {
-    // Non-interactive stdin with a key present: use it rather than hanging on a
-    // prompt that can never be answered.
-    console.log(chalk.gray(`  ${envKeys.length} wallet(s) from environment.`));
+  // Keys from the environment or the wallet file are used as they are; only a
+  // run with none of those is asked to paste some.
+  //
+  // This used to require `process.env.PRIVATE_KEY` by name, so a wallet file —
+  // encrypted or not — was never read by the wizard at all unless --wallets was
+  // also passed. That contradicted the README and the --fcfs branch, which has
+  // always loaded the file headless.
+  if (envKeys.length > 0) {
+    const sources = [
+      process.env.PRIVATE_KEY?.trim() ? "PRIVATE_KEY" : null,
+      process.env.PRIVATE_KEYS?.trim() ? "PRIVATE_KEYS" : null,
+    ].filter(Boolean);
+    if (!sources.length) sources.push("wallets file");
+    console.log(chalk.gray(`  ${envKeys.length} wallet(s) from ${sources.join(", ")}.`));
+    for (const w of envKeys) {
+      console.log(chalk.green(`  ✓ ${w.address}`));
+    }
     return envKeys.map((w) => w.privateKey);
   }
 
@@ -1691,8 +1704,8 @@ export async function promptKeys(log: RunLogger, spec?: string | null): Promise<
   // the tool is thinking. Fail with the fix instead.
   if (!process.stdin.isTTY && envKeys.length === 0) {
     throw new Error(
-      "No wallet keys available. Set PRIVATE_KEY (or PRIVATE_KEYS) in the environment, " +
-        "pass --wallets, or run interactively so keys can be pasted."
+      "No wallet keys available. Set PRIVATE_KEY (or PRIVATE_KEYS) or WALLETS_FILE, " +
+        "or run interactively so keys can be pasted."
     );
   }
 
@@ -1705,8 +1718,8 @@ export async function promptKeys(log: RunLogger, spec?: string | null): Promise<
         // Re-asking here is the hang described above.
         if (!process.stdin.isTTY) {
           throw new Error(
-            "No wallet keys available. Set PRIVATE_KEY (or PRIVATE_KEYS) in the environment, " +
-              "pass --wallets, or run interactively so keys can be pasted."
+            "No wallet keys available. Set PRIVATE_KEY (or PRIVATE_KEYS) or WALLETS_FILE, " +
+              "or run interactively so keys can be pasted."
           );
         }
         continue;
