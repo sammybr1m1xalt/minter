@@ -721,6 +721,26 @@ set the flags from what the contract actually returned.
 Signed payloads carry the stage OpenSea signed for, and the fire refuses a
 payload whose stage differs from the one you selected.
 
+Only what **both** sides state is compared, in order: the stage uuid, the stage
+type, then the stage window. Each surface states a different subset:
+
+| Surface | uuid | type | window |
+|---|---|---|---|
+| GraphQL | — | ✓ (from the calldata selector: `mintPublic` / `mintSigned` / `mintAllowList`) | — |
+| REST | ✓ | ✓ | ✓ |
+| local / assembled | ✓ | ✓ | ✓ |
+
+So a GraphQL payload is checked by **type**, which is what catches the expensive
+case: a presale payload coming back for a public selection, or the reverse. It
+cannot catch two stages of the same type overlapping, because GraphQL states no
+window — and the check says so rather than treating "cannot tell" as a match. The
+stage index is decoded and carried on the payload but not compared, because the
+inventory has no index of its own to compare it against.
+
+An unrecognised type label on either side means "cannot tell" and the payload is
+allowed through. Refusing on a vocabulary guess would block valid mints, which is
+the one direction this check must never err in.
+
 ### When it fires
 
 For a phase that is still in the future, the signed payload cannot exist yet, so

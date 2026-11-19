@@ -106,10 +106,25 @@ export interface FcfsGasData {
 /** The stage a signed payload is actually for. Nulls mean "not stated". */
 export interface SignedStage {
   uuid: string | null;
+  /**
+   * Canonical stage type: "public_sale" | "signed_presale" | "merkle_presale".
+   *
+   * Only the GraphQL surface leaves this null — and it does not: the selector
+   * names the entrypoint (mintPublic / mintSigned / mintAllowList) and
+   * `buildOpenseaMint` already decodes it. It also decodes the stage INDEX from
+   * mintParams, which is carried below for the same reason.
+   */
   type: string | null;
   /** UNIX seconds. null = unknown — never read as 0/1970. */
   startTime: number | null;
   endTime: number | null;
+  /**
+   * OpenSea's stage index, decoded from mintParams. Carried but NOT compared:
+   * `DropPhase` has no index of its own, so there is nothing authoritative to
+   * compare it against. Comparing it against an invented mapping would refuse
+   * valid payloads.
+   */
+  index: number | null;
 }
 
 /**
@@ -167,7 +182,29 @@ function stageRefusal(
   };
 }
 
-/** A one-line description of the mismatch, for the message that refuses to fire. */
+/** A canonical OpenSea stage type, or null when the label is not one we know. */
+function canonicalStageType(raw: string | null | undefined): string | null {
+  if (!raw || typeof raw !== "string") return null;
+  const s = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (s === "public" || s === "public_sale" || s === "publicsale") return "public_sale";
+  if (s === "signed_presale" || s === "signed" || s === "signature_presale") return "signed_presale";
+  if (s === "merkle_presale" || s === "merkle") return "merkle_presale";
+  return null;
+}
+
+/**
+ * A one-line description of the mismatch, for the message that refuses to fire.
+ *
+ * Compares, in order, only what BOTH sides state:
+ *   1. the stage uuid — when both look like OpenSea stage uuids
+ *   2. the stage type — public_sale / signed_presale / merkle_presale
+ *   3. the stage window — when both state a real start time
+ *
+ * A payload that carries no stage at all cannot be checked and returns null.
+ * "Cannot tell" is not "matches", but refusing every such payload would stop a
+ * path that has no alternative. Where a comparison IS possible and the two
+ * disagree, this refuses.
+ */
 export function stageMismatchReason(payload: FcfsSignedPayload, expected: ExpectedStage | null | undefined): string | null {
   if (!expected) return null;
   const s = payload.stage;
@@ -181,6 +218,23 @@ export function stageMismatchReason(payload: FcfsSignedPayload, expected: Expect
   if (a && b && a !== b) {
     return `payload is for stage ${a}, but stage ${b} was selected`;
   }
+
+  // Stage type. This is the comparison the GraphQL path can actually make: the
+  // selector names the entrypoint, so a presale payload returned for a public
+  // selection is caught here rather than silently minted.
+  //
+  // Only OpenSea's own type vocabulary participates. An unrecognised label on
+  // either side means "cannot tell" — refusing on a vocabulary guess would
+  // block valid mints, which is the one direction this check must never err in.
+  const pt = canonicalStageType(s.type);
+  const et = canonicalStageType(expected.type);
+  if (pt && et && pt !== et) {
+    return (
+      `payload is for a ${pt.replace("_", " ")} stage, ` +
+      `but a ${et.replace("_", " ")} stage was selected`
+    );
+  }
+
   if (s.startTime != null && s.startTime > 0 && expected.startTime != null && expected.startTime > 0) {
     if (s.startTime !== expected.startTime) {
       const fmt = (t: number) => new Date(t * 1000).toISOString().replace("T", " ").slice(0, 19);
@@ -428,9 +482,20 @@ function openseaMintTxToSignedPayload(
       feeBps: 0,
       restrictFeeRecipients: false,
     },
-    // GraphQL states no stage identity. Null, not a guess: callers must not
-    // treat that as "matches anything" without saying so.
-    stage: null,
+    // GraphQL states no stage UUID and no window, but it DOES state a stage
+    // type: the selector names the entrypoint (mintPublic / mintSigned /
+    // mintAllowList). That is enough to catch the expensive mismatch — a
+    // presale payload returned for a public selection, or the reverse. What it
+    // cannot catch is two stages of the SAME type overlapping, because the
+    // GraphQL surface carries no window. Said out loud at the call site rather
+    // than silently treated as "matches anything".
+    stage: {
+      uuid: null,
+      type: tx.stageType,
+      startTime: null,
+      endTime: null,
+      index: tx.stageIndex,
+    },
     gasData: undefined,
   };
 }
@@ -511,6 +576,7 @@ export function mintResponseToPayload(
       type: json?.stage_type ?? json?.stageType ?? null,
       startTime: isoToUnixSeconds(json?.stage_start_time ?? json?.stageStartTime) || null,
       endTime: isoToUnixSeconds(json?.stage_end_time ?? json?.stageEndTime) || null,
+      index: null,
     },
     gasData: undefined,
   };
@@ -759,6 +825,7 @@ export async function buildSignedPayloadFromDrop(
       type: drop?.type ?? drop?.stageType ?? null,
       startTime: startTime > 0 ? startTime : null,
       endTime: endTime > 0 ? endTime : null,
+      index: null,
     },
     gasData,
   };
