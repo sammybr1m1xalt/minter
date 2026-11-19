@@ -1139,6 +1139,13 @@ export async function runFcfsBranchCli(
         : `Could not resolve "${targetArg}".`
     );
   }
+  // A Scatter collection has no OpenSea phases, so the FCFS branch would find
+  // nothing and fall through to the generic probe — which cannot see Scatter's
+  // bespoke mint entrypoint either. Route it to the Scatter path.
+  if (resolvedTarget.platform === "scatter") {
+    const { runScatterBranchCli } = await import("./scatter-mint");
+    return runScatterBranchCli(log, targetArg, opts as any);
+  }
   const nftContract = resolvedTarget.contract;
   const targetLabel = resolvedTarget.slug ?? resolvedTarget.contract;
   const targetChainKey = resolvedTarget.chainKey;

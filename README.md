@@ -184,6 +184,7 @@ neither loses your keys nor scatters logs:
 | `npm start` | Interactive wizard — keys, chain, quantity, NFT link, RPC, gas, timing |
 | `npm start -- --help` | Print all CLI flags |
 | `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
+| `npm start -- --scatter <slug>` | Mint a Scatter.art collection — the Scatter API builds the transaction (proof + signature included) |
 | `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases, whether your wallet can target each, and how many tokens it can mint |
 | `npm start -- --doctor` | Read-only health report — config, wallets, key pool, SIWE sessions, and RPC latency/chain-id per chain. Exits 1 if anything will stop a run |
 | `npm start -- --confirm <tx…>` | Re-ask the chain whether a transaction landed — by hash alone, so it works for a tx from an earlier run. Also `--confirm --last` / `--log <file>` / `--all` |
@@ -215,6 +216,7 @@ npm start -- --logger
 npm start -- --confirm 0xabc… 0xdef…
 npm start -- --confirm --last
 npm start -- --fcfs 0xabc… on base --quantity 3 --wallets all
+npm start -- --scatter nockmilio --chain base --quantity 2
 ```
 
 ---
@@ -446,7 +448,8 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/rpc-timeout.ts`](src/rpc-timeout.ts) | `withRpcTimeout` — bounds a single chain read so a dead endpoint cannot stall a mint |
 | [`src/simulate.ts`](src/simulate.ts) | Pre-flight eth_call simulation |
 | [`src/allowlist-onchain.ts`](src/allowlist-onchain.ts) | Reading allowlist state from chain |
-| [`src/scatter.ts`](src/scatter.ts) | Scatter.art collections and mint calldata |
+| [`src/scatter.ts`](src/scatter.ts) | Scatter.art collections, mint lists and calldata |
+| [`src/scatter-mint.ts`](src/scatter-mint.ts) | Scatter mint execution — list selection, unit conversion, caps, ERC20 approval, `--scatter` |
 | [`src/price-protection.ts`](src/price-protection.ts) | Price-cap parsing and enforcement |
 | [`src/logger.ts`](src/logger.ts) | Per-run log files in `.minter-logs/` |
 | [`src/doctor.ts`](src/doctor.ts) | `--doctor` — one read-only health report: config, wallets, key pool, sessions, RPC per chain |
@@ -638,6 +641,50 @@ slow-but-alive endpoint later in the list is not cut off.
 A read that fails is reported as a failure. An empty allowed-fee-recipient list
 and a failed read of that list are different answers: the first is a property of
 the drop, the second is a network fault, and only the first refuses the mint.
+
+### Scatter.art
+
+Scatter mints through a bespoke `mint(auth, quantity, affiliate, signature)`
+entrypoint, so the generic selector probe cannot see it and OpenSea has no phases
+for it. Instead the Scatter API builds the transaction — proof and signature
+included:
+
+```bash
+npm start -- --scatter nockmilio --chain base --quantity 2
+```
+
+The wizard picks the same path up on its own: when OpenSea reports no phases and
+the slug is a Scatter collection **at the same contract address**, it mints
+through Scatter rather than reporting "no mintable mechanism". The address
+comparison is the guard — a slug can exist on both platforms for different
+collections.
+
+A Scatter mint list carries fields the API returns and the code reads:
+
+| Field | Meaning |
+|---|---|
+| `root` | The list key (Merkle root) the contract knows it by |
+| `token_price` / `decimals` | Price per mint in **whole currency units** — `"0.001"` ETH, `"1111"` NOCK at 16 decimals. Not a wei string. |
+| `unit_size` | NFTs received per unit of the quantity field. Asking for 5 NFTs from a `unit_size` 5 list is one unit. |
+| `wallet_limit` / `list_limit` | Caps in NFTs; `4294967295` means unlimited |
+| `start_time` / `end_time` | The mint window. A closed list is refused, not minted into |
+
+Lists are chosen native-first (an ERC20 price cannot be compared with a native
+one, and native needs no approval), then cheapest within one currency. A
+requested quantity above the wallet's remaining allowance is refused with the
+numbers, not silently clipped.
+
+An ERC20-priced list needs an approval before the mint: the token contract's
+`allowance` is read, and if it is short the collection contract is approved for
+the max amount. The spender is the contract that will actually pull the tokens —
+`mintTransaction.to`, which is the collection for an ordinary mint and a batch
+contract for a batch mint.
+
+Verified live against `nockmilio` (Base) and `cashcat` (Robinhood): collection
+metadata, list selection, unit and cap arithmetic, the `/mint` quote (including
+that the API's `paymentValue` matches the list price), the sold-out refusal, the
+closed-window refusal, and the full approve-then-mint send path against a
+scripted chain.
 
 ### Per-wallet caps
 

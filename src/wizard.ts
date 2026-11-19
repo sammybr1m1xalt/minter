@@ -71,6 +71,13 @@ import { parseTarget, resolveTarget, chainSlug, ResolvedTarget } from "./target-
 import { parseWhen } from "./schedule";
 import { parsePriceSpec } from "./price-protection";
 import { findUniversalMint, findAllUniversalMints, explainFailure, UniversalMintPlan } from "./universal-mint";
+import {
+  planScatterMint,
+  executeScatterMint,
+  describeScatterPlan,
+  runScatterBranchCli,
+} from "./scatter-mint";
+import { ScatterCollection, getScatterCollection } from "./scatter";
 import { getMintMechanisms } from "./seadrop-public";
 import { verifyContract } from "./contract-verify";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
@@ -330,6 +337,25 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
   const provider = new JsonRpcProvider(rpcUrls[0], chainProfile.chainId, {
     staticNetwork: true,
   });
+
+  // ── 5b. Scatter collections have their own mint path ─────────────────────
+  // Scatter's mint entrypoint is bespoke and not discoverable from the contract,
+  // so neither the OpenSea phase discovery nor the universal selector probe
+  // below can see it. The Scatter API builds the transaction instead.
+  if (target.resolved?.scatter) {
+    await runScatterWizardBranch({
+      log,
+      scatter: target.resolved.scatter,
+      wallets,
+      quantity,
+      rpcUrls,
+      provider,
+    });
+    closePrompts();
+    return;
+  }
+
+
   try {
 
     // ── 6. Verify the target is a contract ──────────────────────────────────
@@ -427,6 +453,31 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       console.log(
         chalk.gray("  OpenSea reports no phases — probing the contract directly...")
       );
+
+      // A Scatter collection has no OpenSea phases, and its bespoke mint
+      // entrypoint is invisible to the generic selector probe. Check Scatter
+      // BEFORE that probe so a Scatter target is not reported as "no mintable
+      // mechanism". The address comparison is the guard: a slug can exist on
+      // both platforms for different collections.
+      const scatterSlug =
+        target.resolved?.scatter?.slug ??
+        (target.resolved?.slug && !isSlug(nftInput) ? target.resolved.slug : null) ??
+        (isSlug(nftInput) ? nftInput : null);
+      if (scatterSlug) {
+        const scatter = await getScatterCollection(scatterSlug);
+        if (scatter && scatter.address.toLowerCase() === nftInput.toLowerCase()) {
+          await runScatterWizardBranch({ log, scatter, wallets, quantity, rpcUrls, provider });
+          closePrompts();
+          return;
+        }
+        if (scatter) {
+          console.log(
+            chalk.yellow(
+              `  ⚠ ${scatterSlug} is a Scatter collection at ${scatter.address}, not ${nftInput}.`
+            )
+          );
+        }
+      }
 
       if (universalPlans.length > 0) {
         const plan = universalPlans[0];
@@ -1888,6 +1939,90 @@ export function selectFromLoaded(all: LoadedWallet[], spec: string): LoadedWalle
   // Wallet order is preserved however the indices were typed.
   return [...seen].sort((a, b) => a - b).map((n) => all[n - 1]);
 }
+
+/**
+ * Mint a Scatter collection for every wallet, one wallet at a time.
+ *
+ * The Scatter API builds the mint transaction (proof and signature included), so
+ * this is the whole flow: pick a list the wallet is eligible for, convert the
+ * requested NFT count into the list's quantity units, respect the caps, approve
+ * the ERC20 if the list is priced in one, then send through the shared blast path.
+ */
+async function runScatterWizardBranch(args: {
+  log: RunLogger;
+  scatter: ScatterCollection;
+  wallets: Wallet[];
+  quantity: number;
+  rpcUrls: string[];
+  provider: JsonRpcProvider;
+}): Promise<void> {
+  const { log, scatter, wallets, quantity, rpcUrls, provider } = args;
+  console.log(chalk.bold.white("\nScatter mint"));
+  console.log(
+    chalk.gray(
+      `  ${scatter.name} · ${scatter.numItems ?? "?"}/${scatter.maxItems ?? "?"} minted`
+    )
+  );
+
+    let succeeded = 0;
+    for (let i = 0; i < wallets.length; i++) {
+      const wallet = wallets[i];
+      console.log(chalk.bold.white(`\n[W${i}] ${wallet.address}`));
+
+      let planned: Awaited<ReturnType<typeof planScatterMint>>;
+      try {
+        planned = await planScatterMint({
+          slug: scatter.slug,
+          collection: scatter,
+          wallet,
+          quantity,
+          provider,
+        });
+      } catch (e: any) {
+        console.log(chalk.yellow(`  ✗ planning failed: ${e?.message ?? e}`));
+        log.warn(`W${i} planning failed: ${e?.message ?? e}`);
+        continue;
+      }
+      if (!planned.plan) {
+        console.log(chalk.yellow(`  ✗ ${planned.reason}`));
+        log.warn(`W${i} refused: ${planned.reason}`);
+        continue;
+      }
+      const p = planned.plan;
+      console.log(chalk.green(`  ✓ ${describeScatterPlan(p)}`));
+      if (p.quoteMismatch) {
+        console.log(chalk.yellow(`  ⚠ quote mismatch: ${p.quoteMismatch}`));
+      }
+
+      const didConfirm = await askYesNo(`Mint ${p.nfts} NFT(s) from "${p.list.name}"?`, true);
+      if (!didConfirm) {
+        console.log(chalk.yellow("  Skipped."));
+        continue;
+      }
+
+      const result = await executeScatterMint({
+        plan: p,
+        walletIndex: i,
+        rpcUrls,
+        chainId: scatter.chainId,
+        onMessage: (m) => console.log(chalk.gray(`  ${m}`)),
+      });
+      if (result.status === "SUCCESS") {
+        succeeded++;
+        console.log(chalk.green(`  ✓ minted — ${result.txHash}`));
+        console.log(chalk.gray(`    block ${result.receipt?.block} · gas ${result.receipt?.gasUsed}`));
+      } else {
+        console.log(chalk.red(`  ✗ ${result.status}: ${result.error ?? "no detail"}`));
+        log.warn(`W${i} ${result.status}: ${result.error ?? "no detail"}`);
+      }
+    }
+
+    console.log(
+      chalk.bold.white(`\n===== SCATTER MINT COMPLETE — ${succeeded}/${wallets.length} succeeded =====`)
+    );
+    log.field("scatter_succeeded", succeeded);
+    closePrompts();
+    return;}
 
 async function promptQuantity(walletCount: number): Promise<number> {
   console.log(chalk.bold.white("\nQuantity"));
