@@ -109,19 +109,37 @@ export async function fetchPublicDrop(
   }
 }
 
+/**
+ * The three answers a fee-recipient read can give.
+ *
+ * An EMPTY list and a FAILED read are different answers, and collapsing them
+ * into one `null` is what made a dead endpoint read as "this drop allows no
+ * fee recipient": for a restricting drop the mint was refused with a reason
+ * that described the drop rather than the network, and for an unrestricted one
+ * the OpenSea default was substituted for a list that may well have existed.
+ */
+type FeeRecipientResult =
+  | { address: string; source: string }
+  | { address: null; source: "none-allowed" }
+  | { address: null; source: "read-failed"; error: string };
+
 // SeaDrop reverts on a zero fee recipient, and on a disallowed one when the drop
 // restricts them — so this has to come from the chain, not a guess.
 async function readFeeRecipient(
   provider: JsonRpcProvider,
   nftContract: string,
   restricted: boolean
-): Promise<{ address: string; source: string } | null> {
+): Promise<FeeRecipientResult> {
   const seadrop = new Contract(SEADROP_ADDRESS, PUBLIC_ABI, provider);
-  let allowed: string[] = [];
+  let allowed: string[];
   try {
     allowed = await seadrop.getAllowedFeeRecipients(nftContract);
-  } catch {
-    allowed = [];
+  } catch (e: any) {
+    return {
+      address: null,
+      source: "read-failed",
+      error: e?.shortMessage || e?.message || String(e),
+    };
   }
 
   if (allowed.length > 0) {
@@ -130,7 +148,7 @@ async function readFeeRecipient(
   if (restricted) {
     // Nothing allowed and the drop enforces the list — a public mint cannot be
     // constructed at all, locally or otherwise.
-    return null;
+    return { address: null, source: "none-allowed" };
   }
   return { address: OPENSEA_FEE_RECIPIENT, source: "OpenSea default (drop does not restrict)" };
 }
@@ -248,7 +266,7 @@ export async function buildLocalMintPlanAttempt(
 ): Promise<{ plan: LocalMintPlan | null; reason: string }> {
   const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
   let drop: PublicDrop | null;
-  let fee: { address: string; source: string } | null;
+  let fee: FeeRecipientResult | null;
   const rpc = safeHost(rpcUrl);
   try {
     try {
@@ -281,10 +299,13 @@ export async function buildLocalMintPlanAttempt(
         reason: `reading the fee recipient from ${rpc} failed: ${e?.shortMessage || e?.message || e}`,
       };
     }
-    if (!fee) {
+    if (fee.address == null) {
       return {
         plan: null,
-        reason: `${nftContract} restricts fee recipients and none is allowed — no public mint can be built`,
+        reason:
+          fee.source === "read-failed"
+            ? `reading the allowed fee recipients from ${rpc} failed: ${fee.error}`
+            : `${nftContract} restricts fee recipients and none is allowed — no public mint can be built`,
       };
     }
   } finally {
@@ -321,12 +342,19 @@ export async function buildLocalMintPlan(
 }
 
 /**
- * Build a local mint plan, trying each RPC in order until one answers.
+ * Build a local mint plan, trying each RPC until one answers.
  *
  * Every caller used to pass `rpcUrls[0]`, so one dead endpoint meant no plan —
  * and therefore no mint — on the very path whose purpose is redundancy: the
- * fire itself fans out across the whole set. The plan is built during the wait,
- * so trying them in order costs nothing but a few unmetered chain reads.
+ * fire itself fans out across the whole set. The plan is built during the
+ * wait, so trying them in order costs nothing but a few unmetered chain reads.
+ *
+ * `timeoutMs` is the budget for the WHOLE sweep, not per endpoint. Spending it
+ * per endpoint made four dead endpoints cost 4 × 15s, and the plan is needed
+ * before the mint fires — that delay lands on T-0. Each attempt is capped at a
+ * fair share so one dead endpoint cannot consume the entire budget and leave
+ * the rest nothing; a share is a floor of 500ms so a slow-but-alive endpoint is
+ * not cut off for being later in the list.
  */
 export async function buildLocalMintPlanOnAnyRpc(
   rpcUrls: readonly string[],
@@ -338,9 +366,21 @@ export async function buildLocalMintPlanOnAnyRpc(
   if (urls.length === 0) {
     return { plan: null, reason: "no RPC endpoint is configured for this chain", rpcUrl: null };
   }
+  const started = Date.now();
+  const share = Math.max(500, Math.floor(timeoutMs / urls.length));
   let last = "";
   for (const url of urls) {
-    const attempt = await buildLocalMintPlanAttempt(url, nftContract, quantity, timeoutMs);
+    const remaining = timeoutMs - (Date.now() - started);
+    if (remaining <= 0) {
+      last = "the plan budget ran out before this endpoint was tried";
+      break;
+    }
+    const attempt = await buildLocalMintPlanAttempt(
+      url,
+      nftContract,
+      quantity,
+      Math.min(share, remaining)
+    );
     if (attempt.plan) return { plan: attempt.plan, reason: "", rpcUrl: url };
     last = attempt.reason;
   }

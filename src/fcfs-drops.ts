@@ -1665,13 +1665,17 @@ export function printDropsInventory(
     const collectionRemaining = computeAllocationRemaining(drop);
     if (drop.maxTotalMintable > 0) {
       const total = drop.maxTotalMintable;
-      const used = drop.totalMinted ?? 0;
-      const pct = total > 0 ? ((used / total) * 100).toFixed(1) : "?";
-      allocLine = chalk.gray(
-        `  allocated ${pct}% (${used}/${total}` +
-          (collectionRemaining != null ? `, ${collectionRemaining} left` : "") +
-          ")"
-      );
+      // Capacity known but minted count not: printing 0 would report an empty
+      // drop as the state of a full one, and the percentage would be a number
+      // with no measurement behind it.
+      allocLine = !drop.mintedKnown
+        ? chalk.gray(`  capacity ${total}, minted so far not reported`)
+        : chalk.gray(
+            `  allocated ${((drop.totalMinted as number) / total * 100).toFixed(1)}% ` +
+              `(${drop.totalMinted}/${total}` +
+              (collectionRemaining != null ? `, ${collectionRemaining} left` : "") +
+              ")"
+          );
     } else if (drop.mintedKnown) {
       allocLine = chalk.gray(`  minted: ${drop.totalMinted} (capacity unknown)`);
     }

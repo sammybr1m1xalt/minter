@@ -261,14 +261,26 @@ tokens into the best OpenSea offer automatically.
   same criteria offer; `remaining_quantity` means one fills and the others revert.
 - **A failed mint sells nothing.** No sale and no token approval is sent for a
   wallet whose mint did not succeed.
+- **A failed approval stops the sale.** The fulfillment pulls the NFT through
+  the order's own conduit, so the approval target is resolved first and the sale
+  is skipped if it cannot be — broadcasting anyway can only revert and burn gas.
+- **A book that could not be read is not an empty book.** A 401, a 5xx or a
+  timed-out offer read is reported as a read failure; only a successful read with
+  no rows reads as "no offer clears the cost floor".
+- **The full fulfillment order sets the net, for every entrypoint.**
+  `fulfillOrder` names one order (`order`), the `match*` entrypoints name a list
+  (`orders`); both are read, so the authoritative net re-derivation and the
+  conduit lookup work for a single-order sale too.
 
 Gas modes are rational multipliers of the live base fee and tip:
 `slow` = 1.1×base + 1×tip, `fast` = 1.5×base + 2×tip, `ultra` = 2×base + 4×tip.
 
-**Not yet verified:** the broadcast path. Selling needs a funded wallet holding a
-freshly minted token with a live offer, so the sign-and-send leg has never been
-executed. Everything up to and including the encoded transaction is verified
-against the live API.
+**Not yet verified live:** the broadcast path. Selling needs a funded wallet
+holding a freshly minted token with a live offer, so the sign-and-send leg has
+never run against the real chain. Everything up to and including the encoded
+transaction is verified against the live API, and the decision logic
+(offer ranking, cost guard, approval gate, conduit resolution, receipt verdict)
+is exercised against a scripted chain and API.
 
 ---
 
@@ -401,7 +413,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 
 ## Architecture
 
-43 TypeScript modules, ~25k lines. The important ones:
+49 TypeScript modules, ~25k lines. The important ones:
 
 | Module | Role |
 |---|---|
@@ -612,6 +624,20 @@ a second wave is a re-send of an identical transaction, not a competing one; it
 cannot consume the nonce twice. Nonces are pre-read during the wait, walking
 every endpoint in turn on a best-effort basis, and re-read after it; only the
 wallets whose nonce actually moved are re-signed.
+
+### Building the plan across endpoints
+
+A public mint's calldata is built from on-chain reads, and the plan is built
+during the wait so it costs nothing. The endpoints are tried in order, and the
+caller's timeout is the budget for the **whole sweep**, not per endpoint — four
+dead endpoints would otherwise cost four times the budget, and the plan is
+needed before the fire. Each attempt is capped at a fair share of the budget so
+one dead endpoint cannot consume all of it; the share has a 500 ms floor so a
+slow-but-alive endpoint later in the list is not cut off.
+
+A read that fails is reported as a failure. An empty allowed-fee-recipient list
+and a failed read of that list are different answers: the first is a property of
+the drop, the second is a network fault, and only the first refuses the mint.
 
 ### Per-wallet caps
 

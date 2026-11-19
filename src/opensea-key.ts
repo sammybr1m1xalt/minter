@@ -298,11 +298,15 @@ export async function probeKey(
     const latencyMs = Math.round(Date.now() - t0);
     // Read rate-limit headers from every response — even 429 tells us where we stand.
     // An absent header means "unknown", not "zero". Treating a missing header
-    // as 0 marks every healthy key exhausted when a proxy strips it.
+    // as 0 marks every healthy key exhausted when a proxy strips it. A
+    // non-numeric header is the same case: parseInt("abc") is NaN, and
+    // Math.max(0, NaN) is NaN, which would poison computeScore for this entry.
     const remainingRaw = res.headers.get("x-ratelimit-remaining");
-    const remaining = remainingRaw != null ? parseInt(remainingRaw, 10) : -1;
+    const remainingNum = remainingRaw != null ? Number(remainingRaw) : NaN;
+    const remaining = Number.isFinite(remainingNum) ? remainingNum : -1;
     const resetRaw = res.headers.get("x-ratelimit-reset");
-    const resetAt = resetRaw != null ? parseInt(resetRaw, 10) : 0;
+    const resetNum = resetRaw != null ? Number(resetRaw) : NaN;
+    const resetAt = Number.isFinite(resetNum) ? resetNum : 0;
     if (res.status === 200) {
       // If remaining is exactly 0, we're exhausted even though this call went
       // through. Mark as "alive_but_exhausted" so scoring deprioritizes it.
@@ -383,11 +387,13 @@ export function computeScore(entry: KeyPoolEntry): number {
       score = 30; // reset passed but still getting 429 — server hasn't caught up
     }
   } else if (entry.last_probe === "alive_but_exhausted") {
-    // Got a 200 but remaining is 0 or 1. Still usable for THIS call (one
-    // more shot before the window closes). Don't abandon it.
+    // The probe itself consumed the last call in the window (remaining was 0 on
+    // a 200), so the NEXT call is throttled until the window resets. Still worth
+    // more than a throttled key — the reset time is known — but it cannot serve
+    // this run.
     const resetMs = entry.rate_limit_reset > 0 ? entry.rate_limit_reset * 1000 : 0;
     if (resetMs > now) {
-      score = 150; // one more call then it resets — valuable
+      score = 150; // resets at a known time
     } else {
       score = 100; // reset already passed but still at 0 — might recover, still try
     }
@@ -443,10 +449,13 @@ export async function probeAndRankPool(
     }
     // A timeout reads no headers and says nothing about the key, so it must not
     // erase the evidence that the key was working — otherwise one transient
-    // network fault makes every good key look unusable.
+    // network fault makes every good key look unusable. That includes the quota
+    // reading: `probeKey` reports -1/0 for a timeout, and copying those over the
+    // last known values would drop a healthy key out of `remainingBudget`'s
+    // `>= 0` filter for as long as the network is flaky.
     const keep = result.status === "timeout" ? prior.get(entry.api_key) : undefined;
     const next: KeyPoolEntry = keep
-      ? { ...keep, remaining_calls: result.remaining, rate_limit_reset: result.resetAt }
+      ? { ...keep }
       : {
           ...entry,
           last_probe: result.status,

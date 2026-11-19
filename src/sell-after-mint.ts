@@ -256,7 +256,7 @@ export interface EncodedSellTx {
   functionName: string;
 }
 
-const ZERO_CONDUIT_KEY = "0x" + "00".repeat(32);
+const ZERO_BYTES32 = "0x" + "00".repeat(32);
 
 /**
  * Which keys of `input_data` feed each Seaport entrypoint's arguments, in the
@@ -285,7 +285,7 @@ const PARAM_KEYS: Record<string, string[]> = {
 
 /** Arguments the API may omit, with the value Seaport expects for them. */
 function defaultArg(key: string): unknown {
-  if (key === "fulfillerConduitKey") return ZERO_CONDUIT_KEY;
+  if (key === "fulfillerConduitKey") return ZERO_BYTES32;
   if (key.endsWith("Fulfillments")) return [];
   if (key === "criteriaResolvers") return [];
   if (key === "maximumFulfilled") return 0;
@@ -438,6 +438,23 @@ export function encodeFulfillmentCalldata(
   };
 }
 
+/**
+ * The order set a fulfillment transaction carries.
+ *
+ * `fulfillOrder` / `fulfillAdvancedOrder` name ONE order (`order`); the match*
+ * entrypoints name a list (`orders`). Reading only `orders` silently skipped
+ * two things for every single-order fulfillment: the full-order net
+ * re-derivation fell back to the listing estimate, and the conduit lookup saw
+ * no seller order — so the approval targeted Seaport instead of the conduit
+ * that would actually pull the NFT, and the sale reverted.
+ */
+export function fulfillmentOrders(tx: FulfillmentTransaction): any[] {
+  const input = (tx.input_data ?? {}) as Record<string, any>;
+  if (Array.isArray(input.orders)) return input.orders;
+  if (input.order != null) return [input.order];
+  return [];
+}
+
 // ── Sale decision ───────────────────────────────────────────────────────────
 
 export interface SaleDecision {
@@ -565,8 +582,6 @@ const ERC721_APPROVAL_ABI = [
   },
 ] as const;
 
-const ZERO_BYTES32 = "0x" + "00".repeat(32);
-
 /**
  * Re-read the fee market at sell time and apply the chosen mode's multipliers.
  *
@@ -602,6 +617,18 @@ export async function liveGasQuote(
   }
 }
 
+export interface ApprovalOperator {
+  operator: string | null;
+  /**
+   * Set when the operator could not be established: the conduit lookup threw,
+   * or the key mapped to nothing. `operator: null` with no error is NOT
+   * possible — a zero/absent conduit key resolves to the Seaport contract — so
+   * a null here means the approval target is unknown, and selling anyway would
+   * broadcast a transaction that can only revert.
+   */
+  error?: string;
+}
+
 /**
  * The address that will pull the seller's NFT, resolved from the order's own
  * conduit key via Seaport's ConduitController.
@@ -613,8 +640,8 @@ export async function approvalOperator(
   provider: JsonRpcProvider,
   conduitKey: string | null,
   seaportAddress: string
-): Promise<string | null> {
-  if (!conduitKey || conduitKey === ZERO_BYTES32) return seaportAddress;
+): Promise<ApprovalOperator> {
+  if (!conduitKey || conduitKey === ZERO_BYTES32) return { operator: seaportAddress };
   try {
     const controller = new Contract(CONDUIT_CONTROLLER_ADDRESS, CONDUIT_CONTROLLER_ABI, provider);
     const [conduit, exists] = await withTimeout(
@@ -622,9 +649,11 @@ export async function approvalOperator(
       RPC_READ_TIMEOUT_MS,
       "conduit lookup"
     );
-    return exists ? conduit : null;
-  } catch {
-    return null;
+    // `exists: false` is a real answer — the order names a conduit that was
+    // never registered, so the order cannot be fulfilled at all.
+    return exists ? { operator: conduit } : { operator: null, error: "the order's conduit key is not registered" };
+  } catch (e: any) {
+    return { operator: null, error: e?.message ?? String(e) };
   }
 }
 
@@ -699,7 +728,6 @@ export interface SellWalletResult {
   heldTokenIds: string[];
   sold: SoldToken[];
   approvalTxHash?: string;
-  approvalError?: string;
   skippedReason?: string;
   error?: string;
 }
@@ -775,11 +803,16 @@ export async function executeSellAfterMint(
     for (const tokenId of result.heldTokenIds.slice(0, opts.quantity)) {
       try {
         const [tokenOffers, collectionOffers] = await Promise.all([
-          fetchTokenOffers(opts.slug, tokenId, opts.apiKey),
-          fetchCollectionOffers(opts.slug, opts.apiKey),
+          fetchTokenOffersResult(opts.slug, tokenId, opts.apiKey),
+          fetchCollectionOffersResult(opts.slug, opts.apiKey),
         ]);
+        // A book that could not be read is not an empty book. Selling into a
+        // partial view risks taking an offer that is not the best one, and
+        // reporting "no offer clears the cost floor" would blame the market for
+        // a request that never completed.
+        const readError = tokenOffers.error ?? collectionOffers.error;
         const decision = chooseOffer(
-          [...tokenOffers, ...collectionOffers],
+          [...tokenOffers.offers, ...collectionOffers.offers],
           wallet.address,
           opts.costWeiPerToken,
           opts.symbol
@@ -789,7 +822,9 @@ export async function executeSellAfterMint(
             tokenId,
             offerHash: "",
             netWei: 0n,
-            error: "no offer clears the cost floor",
+            error: readError
+              ? `could not read the offer book (${readError})`
+              : "no offer clears the cost floor",
           });
           continue;
         }
@@ -807,10 +842,8 @@ export async function executeSellAfterMint(
 
         // The full order set is authoritative — re-derive net from it and
         // re-apply the guard against the listing-time estimate.
-        const fullNet = netFromOrders(
-          (tx.input_data?.orders as any[]) ?? [],
-          wallet.address
-        );
+        const orderSet = fulfillmentOrders(tx);
+        const fullNet = netFromOrders(orderSet, wallet.address);
         const net = fullNet ?? decision.netWei;
         try {
           assertSaleProfitable(net, opts.costWeiPerToken, opts.symbol);
@@ -827,21 +860,39 @@ export async function executeSellAfterMint(
         const encoded = encodeFulfillmentCalldata(tx);
 
         // Approve the conduit that will pull this NFT, unless already approved.
-        const sellerOrder = ((tx.input_data?.orders as any[]) ?? []).find(
+        const sellerOrder = orderSet.find(
           (o: any) => (o?.parameters?.offerer ?? "").toLowerCase() === wallet.address.toLowerCase()
         );
-        const operator = await approvalOperator(
+        const op = await approvalOperator(
           provider,
           sellerOrder?.parameters?.conduitKey ?? null,
           encoded.to
         );
-        if (operator) {
-          const approval = await ensureApproval(provider, wallet, opts.contract, operator);
+        // An approval that could not be established is a STOP, not a note: the
+        // fulfillment pulls the NFT through this operator, so without it the
+        // sale transaction can only revert and burn gas. Recording the reason
+        // and skipping keeps the token unsold and the wallet whole.
+        if (op.error) {
+          result.sold.push({
+            tokenId,
+            offerHash: decision.offer.orderHash,
+            netWei: net,
+            error: `could not establish the approval target (${op.error}) — not selling`,
+          });
+          continue;
+        }
+        if (op.operator) {
+          const approval = await ensureApproval(provider, wallet, opts.contract, op.operator);
           if (approval.error) {
-            result.approvalError = approval.error;
-          } else if (approval.txHash) {
-            result.approvalTxHash = approval.txHash;
+            result.sold.push({
+              tokenId,
+              offerHash: decision.offer.orderHash,
+              netWei: net,
+              error: `approval failed (${approval.error}) — not selling`,
+            });
+            continue;
           }
+          if (approval.txHash) result.approvalTxHash = approval.txHash;
         }
 
         const gasLimit = opts.gasLimit ?? SELL_GAS_LIMIT;
@@ -856,13 +907,21 @@ export async function executeSellAfterMint(
         });
         // A sale tx is worth waiting for longer than a read, but not unbounded:
         // ethers' default is 300s with 429 backoff.
-        const receipt2 = await withTimeout(sent.wait(), 120_000, "sale confirmation");
+        const receipt2 = await withTimeout<TransactionReceipt>(
+          sent.wait() as Promise<TransactionReceipt>,
+          120_000,
+          "sale confirmation"
+        );
+        // `sent.wait()` cannot resolve null here (ethers returns null only for
+        // confirms=0; this call asks for 1), so a receipt is the only resolution.
+        // A replacement or a timeout throws, and the surrounding catch records
+        // it — the token is never reported sold on the strength of a hash.
         result.sold.push({
           tokenId,
           offerHash: decision.offer.orderHash,
           netWei: net,
           txHash: sent.hash,
-          error: receipt2?.status === 0 ? "sale transaction reverted on-chain" : undefined,
+          error: receipt2.status === 0 ? "sale transaction reverted on-chain" : undefined,
         });
       } catch (e: any) {
         result.sold.push({
@@ -946,15 +1005,30 @@ function apiHeaders(apiKey: string): Record<string, string> {
   return { "X-API-KEY": apiKey, "content-type": "application/json" };
 }
 
-async function fetchJson(
+interface FetchResult {
+  json: any | null;
+  /** Why the read failed. null on success — including a success with no rows. */
+  error: string | null;
+}
+
+/**
+ * Fetch and report WHY it failed.
+ *
+ * Every non-OK response and every transport failure used to collapse to a bare
+ * `null`, which downstream read as a market verdict: a 401 or a DNS failure
+ * became "no offers", and the run reported that the book was empty. The status
+ * and the failure are not the same fact.
+ */
+async function fetchJsonResult(
   path: string,
   apiKey: string,
   opts: { timeoutMs?: number; method?: string; body?: unknown; retries?: number } = {}
-): Promise<any | null> {
+): Promise<FetchResult> {
   const retries = opts.retries ?? 1;
+  const timeoutMs = opts.timeoutMs ?? 15_000;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 15_000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const res = await fetch(`${API_BASE}${path}`, {
         method: opts.method ?? "GET",
@@ -974,22 +1048,46 @@ async function fetchJson(
         await new Promise((r) => setTimeout(r, waitMs));
         continue;
       }
-      if (!res.ok) return null;
-      return await res.json();
-    } catch {
-      return null;
+      if (!res.ok) return { json: null, error: `OpenSea answered HTTP ${res.status}` };
+      try {
+        return { json: await res.json(), error: null };
+      } catch (e: any) {
+        return { json: null, error: `OpenSea returned a body that is not JSON: ${e?.message ?? e}` };
+      }
+    } catch (e: any) {
+      const message = e?.name === "AbortError" ? `timed out after ${timeoutMs}ms` : e?.message ?? String(e);
+      return { json: null, error: message };
     } finally {
       clearTimeout(timer);
     }
   }
-  return null;
+  return { json: null, error: "every attempt was rate-limited" };
 }
 
-async function fetchOfferPages(
+/** Back-compatible wrapper: the parsed body, or null for any failure. */
+async function fetchJson(
+  path: string,
+  apiKey: string,
+  opts: { timeoutMs?: number; method?: string; body?: unknown; retries?: number } = {}
+): Promise<any | null> {
+  return (await fetchJsonResult(path, apiKey, opts)).json;
+}
+
+interface OfferFetchResult {
+  offers: SellOffer[];
+  /**
+   * Why the book could not be read in full. null means the read succeeded —
+   * an empty `offers` then really is an empty book, which is a different fact
+   * from "could not ask".
+   */
+  error: string | null;
+}
+
+async function fetchOfferPagesResult(
   firstPath: string,
   apiKey: string,
   opts: FetchOpts
-): Promise<SellOffer[]> {
+): Promise<OfferFetchResult> {
   const limit = opts.limit ?? 50;
   const maxPages = opts.maxPages ?? 10;
   const timeoutMs = opts.timeoutMs ?? 15_000;
@@ -1000,37 +1098,37 @@ async function fetchOfferPages(
   do {
     const qs = new URLSearchParams({ limit: String(limit) });
     if (next) qs.set("next", next);
-    const body = await fetchJson(`${firstPath}?${qs.toString()}`, apiKey, { timeoutMs });
-    if (!body) break;
-    for (const raw of body.offers ?? []) out.push(parseOffer(raw));
-    next = body.next ?? null;
+    const r = await fetchJsonResult(`${firstPath}?${qs.toString()}`, apiKey, { timeoutMs });
+    if (!r.json) return { offers: out, error: r.error };
+    for (const raw of r.json.offers ?? []) out.push(parseOffer(raw));
+    next = r.json.next ?? null;
     pages++;
   } while (next && pages < maxPages);
 
-  return out;
+  return { offers: out, error: null };
 }
 
-/** Collection-wide criteria offers for a slug. */
-export async function fetchCollectionOffers(
+/** Collection-wide criteria offers, with the read failure reported. */
+export async function fetchCollectionOffersResult(
   slug: string,
   apiKey: string,
   opts: FetchOpts = {}
-): Promise<SellOffer[]> {
-  return fetchOfferPages(
+): Promise<OfferFetchResult> {
+  return fetchOfferPagesResult(
     `/api/v2/offers/collection/${encodeURIComponent(slug)}`,
     apiKey,
     opts
   );
 }
 
-/** Token-specific offers for one minted token id. */
-export async function fetchTokenOffers(
+/** Token-specific offers, with the read failure reported. */
+export async function fetchTokenOffersResult(
   slug: string,
   tokenId: string,
   apiKey: string,
   opts: FetchOpts = {}
-): Promise<SellOffer[]> {
-  return fetchOfferPages(
+): Promise<OfferFetchResult> {
+  return fetchOfferPagesResult(
     `/api/v2/offers/collection/${encodeURIComponent(slug)}/nfts/${encodeURIComponent(tokenId)}`,
     apiKey,
     opts
