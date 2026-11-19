@@ -415,7 +415,7 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 
 ## Architecture
 
-49 TypeScript modules, ~25k lines. The important ones:
+50 TypeScript modules, ~25k lines. The important ones:
 
 | Module | Role |
 |---|---|
