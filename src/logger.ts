@@ -44,10 +44,6 @@ export interface RunLogger {
 
 let activeRunLogger: RunLogger | null = null;
 
-export function setActiveRunLogger(logger: RunLogger | null): void {
-  activeRunLogger = logger;
-}
-
 /**
  * Write one line to both the live console and the run log.
  *

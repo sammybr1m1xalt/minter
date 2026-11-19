@@ -642,6 +642,19 @@ set the flags from what the contract actually returned.
 Signed payloads carry the stage OpenSea signed for, and the fire refuses a
 payload whose stage differs from the one you selected.
 
+### When it fires
+
+For a phase that is still in the future, the signed payload cannot exist yet, so
+nothing is fetched before the wait. In the **last 30 seconds** before T-0 the
+minter polls for a payload — OpenSea often signs shortly before the window —
+and holds it for the fire. That window is bounded, and the wait is computed from
+whatever time is actually left, so the fire lands on T-0 rather than 30 seconds
+after it.
+
+Both of those were wrong: the poll ran from the moment the run started (a
+ten-minute schedule polled for nine and a half minutes) and the wait then slept
+the original delay again, so a drop scheduled at T+100s fired at T+170s.
+
 ---
 
 ## What it protects you from

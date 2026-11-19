@@ -276,11 +276,6 @@ export function saveKeyPool(pool: KeyPoolEntry[]): void {
   } catch {}
 }
 
-export function clearKeyPool(): void {
-  poolCache = [];
-  try { fs.unlinkSync(KEY_POOL_FILE); } catch {}
-}
-
 // ── Probe a single key ────────────────────────────────────────────────────
 
 export async function probeKey(
@@ -706,14 +701,6 @@ async function mintFreshKeys(count: number): Promise<KeyPoolEntry[]> {
   return added;
 }
 
-// ── Remove a dead key from the pool ──────────────────────────────────────
-
-export function removeKeyFromPool(apiKey: string): void {
-  const pool = loadKeyPool();
-  const filtered = pool.filter((e) => e.api_key !== apiKey);
-  saveKeyPool(filtered);
-}
-
 // ── Mint a fresh free key (ONE attempt, no retry) ────────────────────────
 
 const mintFreeKey = async (
@@ -976,14 +963,4 @@ export async function getValidApiKey(
 
   console.log(chalk.gray("  → Wait until the rate-limit window resets, or paste an existing key.\n"));
   return null;
-}
-
-// ── Probe a key without touching the pool (standalone check) ────────────
-
-export async function probeApiKey(
-  apiKey: string,
-  timeoutMs = 3000
-): Promise<boolean> {
-  const result = await probeKey(apiKey, timeoutMs);
-  return result.status === "alive";
 }

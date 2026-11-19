@@ -75,22 +75,6 @@ export const GQL_QUERY_TEXTS: Record<string, string> = {
   CollectionDropsQuery: `query CollectionDrops($slug: String!) { dropBySlug(slug: $slug) { __typename collection { slug name address chain { identifier networkId } } stages { __typename uuid stageType stageIndex label startTime endTime maxTotalMintableByWallet allowlistMemberCount price { token { unit symbol contractAddress chain { identifier } } } } } }`,
 };
 
-// Structured error codes OpenSea returns when a mint tx can't be built.
-const OS_ERROR_MEANINGS: Record<string, string> = {
-  InsufficientMintsRemainingError: "mint supply exhausted (already at the per-wallet max)",
-  DropNotMintingError: "stage is not open yet",
-  DropStageNotActiveError: "stage is not active",
-  NotEligibleError: "wallet is not eligible",
-  InsufficientFundError: "insufficient balance",
-};
-
-export function explainOpenseaError(msg: string): { code: string | null; meaning: string } {
-  for (const [code, meaning] of Object.entries(OS_ERROR_MEANINGS)) {
-    if (msg.includes(code)) return { code, meaning };
-  }
-  return { code: null, meaning: msg.replace(/^opensea drop:\s*/, "") };
-}
-
 // SeaDrop mint selectors → stage type
 export const SELECTOR_STAGE: Record<string, string> = {
   "0x161ac21f": "PUBLIC_SALE",    // mintPublic
@@ -196,11 +180,6 @@ export function parsePriceField(value: unknown): bigint {
 //
 // The previous code treated 409 as ELIGIBLE — the exact inverse of the docs —
 // so a drop that had not opened yet was reported as mintable.
-
-/** True only when OpenSea actually returned a buildable transaction. */
-export function isEligibleStatus(status: number): boolean {
-  return status === 200;
-}
 
 /**
  * Normalize any OpenSea timestamp to UNIX seconds.

@@ -135,24 +135,6 @@ async function readFeeRecipient(
   return { address: OPENSEA_FEE_RECIPIENT, source: "OpenSea default (drop does not restrict)" };
 }
 
-export async function resolveFeeRecipient(
-  rpcUrl: string,
-  nftContract: string,
-  restricted: boolean,
-  timeoutMs: number = DEFAULT_READ_TIMEOUT_MS
-): Promise<{ address: string; source: string } | null> {
-  const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
-  try {
-    return await withRpcTimeout(
-      readFeeRecipient(provider, nftContract, restricted),
-      timeoutMs,
-      "read the fee recipient"
-    );
-  } finally {
-    destroyProvider(provider);
-  }
-}
-
 /** ethers keeps a polling timer alive on every provider; without an explicit
  *  destroy the process never exits. */
 function destroyProvider(provider: JsonRpcProvider): void {

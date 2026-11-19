@@ -72,8 +72,3 @@ export function reconcileQuantity(requested: number, mintable: number | null): Q
   if (requested > mintable) return { quantity: mintable, clamped: true, exhausted: false, mintable };
   return { quantity: requested, clamped: false, exhausted: false, mintable };
 }
-
-/** "3" / "unknown" — for report lines. */
-export function describeMintable(mintable: number | null): string {
-  return mintable == null ? "unknown" : String(mintable);
-}

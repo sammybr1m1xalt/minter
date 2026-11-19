@@ -22,6 +22,7 @@ import { resolveChain } from "./chains";
 import { mintableFromCap } from "./mint-cap";
 import { noteKeyCall } from "./opensea-key";
 import { getWalletJwt } from "./opensea-session";
+import { say } from "./logger";
 
 const OPENSEA_BASE = "https://api.opensea.io";
 
@@ -98,12 +99,6 @@ export function normalizeStageType(raw: string | null | undefined): StageTypeTok
 /** True when the stage is open to all — mintable on-chain with no signature. */
 export function classifyStageType(raw: string | null | undefined): boolean {
   return normalizeStageType(raw) === "public";
-}
-
-/** True when the stage needs a per-wallet server signature. */
-export function isSignedStageType(raw: string | null | undefined): boolean {
-  const t = normalizeStageType(raw);
-  return t === "allowlist" || t === "ovr";
 }
 
 // ── Shapes ──────────────────────────────────────────────────────────────────
@@ -1007,9 +1002,21 @@ async function fetchRestEligibility(
         signal: AbortSignal.timeout(timeoutMs),
       }
     );
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // None of these is an eligibility VERDICT: 401/403 means the JWT was not
+      // accepted, 404 means the slug is wrong, 429 means throttled. They all
+      // return null so the caller falls back, but without this line a refusal
+      // is indistinguishable from "OpenSea was never asked" — the same
+      // conflation postMintRequest logs to avoid.
+      const level = res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500
+        ? "warn"
+        : "info";
+      say(`    REST eligibility ${slug}: ${res.status}`, level);
+      return null;
+    }
     return (await res.json()) as RestEligibility;
-  } catch {
+  } catch (e: any) {
+    say(`    REST eligibility ${slug}: transport failure — ${e?.message ?? e}`, "warn");
     return null; // transport failure is not a verdict
   }
 }

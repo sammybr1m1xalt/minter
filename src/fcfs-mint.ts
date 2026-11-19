@@ -468,7 +468,10 @@ export function mintResponseToPayload(
     return null;
   }
   const mintSignature = json?.mint_signature || json?.mintSignature || null;
-  const seaDropAddress = json?.to || json?.seaDropAddress || json?.contract || SEADROP_ADDRESS;
+  // `to` is the SeaDrop singleton. `contract` in a mint response is the
+  // COLLECTION — falling back to it would build a transaction sent to the NFT
+  // contract, which can never mint. The singleton is the only safe default.
+  const seaDropAddress = json?.to || json?.seaDropAddress || SEADROP_ADDRESS;
   const value = json?.value != null ? parsePriceField(json.value) : 0n;
   // The collection contract is NOT the SeaDrop singleton. Reporting the
   // seadrop address here made every downstream "which NFT did I mint" check
@@ -748,7 +751,11 @@ export async function buildSignedPayloadFromDrop(
     // Assembled from a known drop, so the stage is known — carry it, for the
     // same reason the REST path does.
     stage: {
-      uuid: drop?.stageUuid ?? drop?.stage_uuid ?? null,
+      // `dropId` is the DropPhase field; `stageUuid` is the REST/local shape.
+      // Both are accepted, and stageMismatchReason only compares uuids that
+      // actually look like OpenSea stage uuids, so an on-chain hash in dropId
+      // is never mistaken for a stage id.
+      uuid: drop?.stageUuid ?? drop?.stage_uuid ?? drop?.dropId ?? null,
       type: drop?.type ?? drop?.stageType ?? null,
       startTime: startTime > 0 ? startTime : null,
       endTime: endTime > 0 ? endTime : null,
@@ -1304,10 +1311,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     return results.filter((r): r is SnipeResult => r != null);
   }
 
-  // ══ WAIT ════════════════════════════════════════════════════════════════
-  const delay = targetStart.getTime() - Date.now();
-
-  // ══ PRE-POLL (during the wait, before T-0) ═══════════════════════════════
+  // ══ PRE-POLL (the last PREPOLL_LEAD_MS before T-0) ═══════════════════════
   //
   // A signed payload cannot be broadcast before its stage opens — the signed
   // mintParams carry startTime/endTime, so an early payload reverts on-chain.
@@ -1315,24 +1319,45 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   // fetching it during the wait removes the fetch from the T-0 critical path
   // entirely.
   //
-  // This polls from T-minus-PREPOLL_LEAD_MS. A payload found here is held and
-  // re-checked at T-0; it is never broadcast early. If OpenSea does not sign
-  // until the window opens, the poll simply finds nothing and the existing T-0
-  // fetch behaves exactly as before — this can only help, never hurt.
-  if (pendingAtT0.length > 0 && delay > PREPOLL_LEAD_MS + 2_000) {
-    const prepollUntil = targetStart.getTime() - PREPOLL_LEAD_MS;
+  // A payload found here is held and re-checked at T-0; it is never broadcast
+  // early. If OpenSea does not sign until the window opens, the poll simply
+  // finds nothing and the T-0 fetch behaves exactly as before.
+  //
+  // The window is BOUNDED to the last PREPOLL_LEAD_MS, and the wait below is
+  // computed from the time actually left. Both were wrong together: the poll
+  // ran from `now` to T-30s (so a run scheduled ten minutes out polled for
+  // nine and a half minutes) and the wait then slept the ORIGINAL delay
+  // again, firing late by exactly the poll's duration — measured, T+100s
+  // scheduled fired at +170s.
+
+  // Quantities decided at T-0, hoisted above the pre-poll. The poll fetches at
+  // the clamped quantity, and reading this before its declaration threw a TDZ
+  // ReferenceError on EVERY attempt — swallowed by the poll callback's own
+  // catch, which made the whole pre-poll silently inert (measured: 30s of
+  // polling, zero OpenSea calls).
+  const fireQuantities = new Map<number, number>();
+
+  const prepollFrom = targetStart.getTime() - PREPOLL_LEAD_MS;
+  if (pendingAtT0.length > 0 && Date.now() < prepollFrom) {
+    const headStart = prepollFrom - Date.now();
     console.log(
-      chalk.gray(`  Pre-polling for signed payloads from ${new Date(prepollUntil).toISOString().slice(11, 19)} (T-${PREPOLL_LEAD_MS / 1000}s)...`)
+      chalk.gray(`  Waiting ${Math.round(headStart / 1000)}s until the pre-poll window (T-${PREPOLL_LEAD_MS / 1000}s)...`)
+    );
+    await waitWithKeepAlive(rpcUrls, headStart);
+  }
+  if (pendingAtT0.length > 0 && Date.now() < targetStart.getTime()) {
+    console.log(
+      chalk.gray(`  Pre-polling for signed payloads in the last ${PREPOLL_LEAD_MS / 1000}s before T-0...`)
     );
     const prepolled = new Map<number, FcfsSignedPayload>();
     const pollStarted = Date.now();
-    while (Date.now() < prepollUntil) {
-      const remaining = prepollUntil - Date.now();
-      // Poll at most every 2s, and never past the deadline.
+    while (Date.now() < targetStart.getTime()) {
+      const remaining = targetStart.getTime() - Date.now();
+      // Poll at most every PREPOLL_INTERVAL_MS, and never past T-0.
       const budget = Math.min(PREPOLL_INTERVAL_MS, Math.max(0, remaining));
       if (budget <= 0) break;
       await new Promise((r) => setTimeout(r, budget));
-      if (Date.now() >= prepollUntil) break;
+      if (Date.now() >= targetStart.getTime()) break;
       // Only poll wallets still missing a payload.
       const want = pendingAtT0.filter((p) => !prepolled.has(p.walletIndex));
       if (want.length === 0) break;
@@ -1393,9 +1418,11 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   }
 
   // ══ WAIT ════════════════════════════════════════════════════════════════
-  if (delay > 0) {
-    console.log(`  Waiting ${Math.round(delay / 1000)}s until target start...`);
-    await waitWithKeepAlive(rpcUrls, delay);
+  // Whatever is left AFTER the pre-poll — not the delay computed before it.
+  const remainingToT0 = targetStart.getTime() - Date.now();
+  if (remainingToT0 > 0) {
+    console.log(`  Waiting ${Math.round(remainingToT0 / 1000)}s until target start...`);
+    await waitWithKeepAlive(rpcUrls, remainingToT0);
   }
 
   // ══ PHASE 2 — T-0: refresh only what can have moved, then blast ═════════
@@ -1412,7 +1439,6 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   // one recheck applied to every entry gave wallets with different remaining
   // allocations the same number — quoting an exhausted wallet a fresh
   // allowance and clipping one that had not yet minted.
-  const fireQuantities = new Map<number, number>();
   if (opts.recheckMintable && ready.length + pendingAtT0.length > 0) {
     const entries = [...ready, ...pendingAtT0];
     const rechecked = await Promise.all(
