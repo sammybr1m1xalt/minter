@@ -366,6 +366,42 @@ export function sessionToStoredSessionCookie(session: StoredSession): string {
 //
 // Returns null when no signed payload is available for this wallet/collection.
 
+/**
+ * First payload to arrive from any surface, bounded by `timeoutMs`.
+ *
+ * A surface that produces nothing must not win the race, so each promise is
+ * wrapped so that only a real payload resolves it. If every surface comes back
+ * empty the wrapped promises never settle, and the timer is what ends the wait —
+ * without it, a run where both surfaces fail would hang here forever.
+ */
+async function racePayloadSurfaces(
+  surfaces: { source: PayloadSource; promise: Promise<FcfsSignedPayload | null> }[],
+  timeoutMs: number
+): Promise<FcfsSignedPayload | null> {
+  return new Promise<FcfsSignedPayload | null>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const done = (p: FcfsSignedPayload | null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(p);
+    };
+    timer = setTimeout(() => done(null), Math.max(500, timeoutMs));
+    for (const s of surfaces) {
+      s.promise.then(
+        (p) => {
+          if (p) done(p);
+        },
+        () => {
+          // A failed surface must not end the race; the other one may still
+          // produce a payload.
+        }
+      );
+    }
+  });
+}
+
 export async function fetchSignedPayload(
   nftContract: string,
   quantity: number,
@@ -380,40 +416,74 @@ export async function fetchSignedPayload(
   // Always use the slug — REST /api/v2/drops/{CA} returns 404
   // for raw contract addresses, which is why the old auto-mint path was broken.
   if (slug && slug.trim() && walletAddress) {
-    try {
-      const gqlResult = await buildOpenseaMint({
-        slug: slug.trim(),
-        minterAddress: walletAddress,
-        contract: nftContract,
-        chain: chainKey || "ethereum",
-        quantity,
-        apiKey: apiKey || null,
-        timeoutMs,
-      });
-      const payload = openseaMintTxToSignedPayload(gqlResult, nftContract, quantity);
-      if (payload) return payload;
-    } catch (err: any) {
-      // GraphQL errors (e.g. NotEligibleError, DropNotMintingError) are expected
-      // for wallets not on the allowlist. Don't log these — they're normal.
-      if (!err?.message?.includes("opensea drop:")) {
-        // Unexpected error — log and fall through to REST
-        console.warn(`    ⚠ GraphQL signed payload fetch error: ${err.message}`);
+    // GraphQL and REST are raced when REST is a real second surface.
+    //
+    // Sequential meant a GraphQL call that hung consumed the whole timeout
+    // before REST was attempted at all — up to 10s of a ~30s pre-poll window,
+    // and again at T-0. Racing costs one extra REST call per wallet in the case
+    // GraphQL would have succeeded anyway.
+    //
+    // The race is gated on the wallet JWT. REST needs it for a signed/presale
+    // stage, so without one the extra call is guaranteed to fail for exactly the
+    // stages it exists to rescue — the rate limit is a shared bucket, but a
+    // doomed request is still wasted. Public stages keep the sequential path:
+    // the on-chain builder already mints them with no OpenSea call at all.
+    const gqlPromise = (async (): Promise<FcfsSignedPayload | null> => {
+      try {
+        const gqlResult = await buildOpenseaMint({
+          slug: slug.trim(),
+          minterAddress: walletAddress,
+          contract: nftContract,
+          chain: chainKey || "ethereum",
+          quantity,
+          apiKey: apiKey || null,
+          timeoutMs,
+        });
+        return openseaMintTxToSignedPayload(gqlResult, nftContract, quantity);
+      } catch (err: any) {
+        // GraphQL errors (e.g. NotEligibleError, DropNotMintingError) are expected
+        // for wallets not on the allowlist. Don't log these — they're normal.
+        if (!err?.message?.includes("opensea drop:")) {
+          // Unexpected error — surface it, the REST probe may still succeed.
+          console.warn(`    ⚠ GraphQL signed payload fetch error: ${err.message}`);
+        }
+        return null;
       }
+    })();
+
+    if (opts.accessToken) {
+      const raced = await racePayloadSurfaces(
+        [
+          { source: "gql", promise: gqlPromise },
+          {
+            source: "rest",
+            promise: postMintTxFallback(
+              slug, walletAddress, quantity, apiKey, timeoutMs,
+              chainKey || "ethereum", nftContract, opts.accessToken,
+            ),
+          },
+        ],
+        timeoutMs
+      );
+      if (raced) return raced;
+    } else {
+      const payload = await gqlPromise;
+      if (payload) return payload;
     }
   }
 
   // ── Fallback: REST /api/v2/drops/{slug}/mint ─────────────────────────────
-  // Only reached if no slug, no walletAddress, or GraphQL failed.
-  // This POST endpoint returns per-wallet signed data when the slug is known.
+  // Only reached when GraphQL was NOT raced against REST — i.e. there is no
+  // wallet JWT, so REST could not have been probed in parallel above. This POST
+  // endpoint returns per-wallet signed data when the slug is known.
   //
   // accessToken is the wallet JWT. The endpoint is wallet-scoped, so a
   // signed/presale stage is refused without it — but the call still goes out
-  // (it is the only REST attempt this path makes) and postMintRequest logs
-  // the refusal instead of collapsing it to a silent null.
-  if (slug && walletAddress) {
+  // and postMintRequest logs the refusal instead of collapsing it to a null.
+  if (!opts.accessToken && slug && walletAddress) {
     const restPayload = await postMintTxFallback(
       slug, walletAddress, quantity, apiKey, timeoutMs, chainKey || "ethereum", nftContract,
-      opts.accessToken ?? null,
+      null,
     );
     if (restPayload) return restPayload;
   }

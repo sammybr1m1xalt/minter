@@ -498,11 +498,22 @@ to ask what the contract is:
 Warnings never silently become part of the transaction. A contract that only
 warns is mintable; one that refuses or cannot be read is not.
 
-### Signed payload: GraphQL first, REST as fallback
+### Signed payload: GraphQL and REST, raced when REST can serve the stage
 
 The signed phase asks GraphQL (`MintActionTimelineQuery`) for the per-wallet
-`{to, data, value}`. When that fails — a 429 is common — it falls back to
-`POST /api/v2/drops/{slug}/mint`.
+`{to, data, value}`.
+
+When the run holds a wallet JWT, GraphQL and `POST /api/v2/drops/{slug}/mint` are
+probed **together**, and the first payload to arrive wins. Sequentially, a
+GraphQL call that hung consumed the whole timeout before REST was attempted at
+all — up to 10s of a ~30s pre-poll window, and again at T-0. Racing costs one
+extra REST call per wallet in the case GraphQL would have succeeded anyway.
+
+The race is gated on the JWT: REST needs it for a signed/presale stage, so
+without one the extra call is guaranteed to fail for exactly the stages it exists
+to rescue. Public stages keep the sequential path, because the on-chain builder
+already mints them with no OpenSea call at all. If both surfaces come back empty
+the wait ends at the caller's timeout rather than hanging.
 
 That endpoint is wallet-scoped too, so it needs the same wallet JWT; the JWT is
 forwarded from the session the run already holds. A refusal is logged with its
@@ -541,7 +552,7 @@ cap) while REST reported 166, the wallet's actual allowance.
 ### API key pool
 
 The pool holds a handful of free OpenSea keys. It exists for **availability**, not
-capacity: the rate-limit budget belongs to the IP, so ten wallets on one key and
+capacity: the rate-limit bucket is shared across every key on the account, so ten wallets on one key and
 ten wallets on five keys spend the same. Extra keys buy redundancy (a key can be
 revoked or start returning 403) and hedge against a per-key burst limit.
 

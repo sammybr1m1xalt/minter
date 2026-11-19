@@ -764,7 +764,7 @@ export const CALLS_PER_WALLET = 2;
 /**
  * The run's remaining read budget, as the last probe saw it.
  *
- * Under a per-IP quota every key reports the same number, so the lowest value
+ * Under a bucket shared across the account every key reports the same number, so the lowest value
  * across the pool is the budget. Under a per-key quota the minimum is still the
  * safe estimate — it is the key that runs out first.
  *
@@ -830,7 +830,7 @@ export async function getValidApiKey(
   let pool = loadKeyPool();
 
   // Pre-flight budget gate. Minting more keys cannot fix a shortfall when the
-  // quota belongs to the IP, so this warns rather than reaching for the mint
+  // bucket belongs to the account, so this warns rather than reaching for the mint
   // path below. It runs before probing, so it reads the cached counter; the
   // probe that follows refines it.
   if (opts?.wallets && opts.wallets > 0) {
@@ -843,7 +843,7 @@ export async function getValidApiKey(
         )
       );
       console.log(
-        chalk.gray(`    Minting more keys will not help — the quota belongs to the IP, not the key.`)
+        chalk.gray(`    Minting more keys will not help — the rate-limit bucket belongs to the account, not the key.`)
       );
     }
   }
@@ -852,7 +852,7 @@ export async function getValidApiKey(
   //    The old trigger replaced every key once all of them passed 3 days, which
   //    discarded keys that had just probed alive and capped the fleet at ~6
   //    (2 creations/day × 3 days). A key is a credential, not capacity: the
-  //    budget belongs to the IP, so wallets share one freely.
+  //    budget belongs to the account, so wallets share one freely.
   const supplyable = pool.filter((e) => canSupplyKey(e.last_probe)).length;
   if (supplyable < KEY_TARGET_USABLE) {
     const need = KEY_TARGET_USABLE - supplyable;
