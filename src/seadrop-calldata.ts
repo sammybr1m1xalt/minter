@@ -106,12 +106,51 @@ export function isPayloadBoundToWallet(
   return decoded.minter.toLowerCase() === walletAddress.toLowerCase();
 }
 
+export interface DecodedMintParams {
+  dropStageIndex: number;
+  /** OpenSea's signed stage window, UNIX seconds. */
+  startTime: number;
+  endTime: number;
+  mintPrice: bigint;
+  maxTotalMintableByWallet: number;
+}
+
+/**
+ * Decode the MintParams tuple out of mintSigned / mintAllowList calldata.
+ *
+ * WHY THIS EXISTS: the MintActionTimeline response states no stage window, so
+ * the payload looked like it could not be tied to one of two same-type stages.
+ * The window is not in the response — it is in the calldata, because OpenSea
+ * signs it as part of mintParams. Reading it here is what lets a payload be
+ * matched to the stage it was actually issued for.
+ *
+ * Returns null for anything that is not a signed mint we understand. Callers
+ * must treat null as "cannot verify", never as "verified".
+ */
+export function decodeMintParams(data: string): DecodedMintParams | null {
+  if (!data || typeof data !== "string" || data.length < 10) return null;
+  const selector = data.slice(0, 10).toLowerCase();
+  if (selector !== SIGNED_SELECTOR && selector !== MERKLE_SELECTOR) return null;
+
+  try {
+    const fn = selector === SIGNED_SELECTOR ? "mintSigned" : "mintAllowList";
+    const d = iface.decodeFunctionData(fn, data);
+    return {
+      dropStageIndex: Number(d.mintParams.dropStageIndex),
+      startTime: Number(d.mintParams.startTime),
+      endTime: Number(d.mintParams.endTime),
+      mintPrice: BigInt(d.mintParams.mintPrice),
+      maxTotalMintableByWallet: Number(d.mintParams.maxTotalMintableByWallet),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Read dropStageIndex out of mint calldata. Returns null for public-sale
  * mints (no stage index exists) and for anything undecodable.
  */
 export function decodeStageIndex(data: string): number | null {
-  const decoded = decodeMintCalldata(data);
-  if (!decoded) return null;
-  return decoded.dropStageIndex;
+  return decodeMintParams(data)?.dropStageIndex ?? null;
 }

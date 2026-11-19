@@ -733,20 +733,28 @@ Signed payloads carry the stage OpenSea signed for, and the fire refuses a
 payload whose stage differs from the one you selected.
 
 Only what **both** sides state is compared, in order: the stage uuid, the stage
-type, then the stage window. Each surface states a different subset:
+type, the stage window, and — last — the stage index:
 
-| Surface | uuid | type | window |
-|---|---|---|---|
-| GraphQL | — | ✓ (from the calldata selector: `mintPublic` / `mintSigned` / `mintAllowList`) | — |
-| REST | ✓ | ✓ | ✓ |
-| local / assembled | ✓ | ✓ | ✓ |
+| Surface | uuid | type | window | index |
+|---|---|---|---|---|
+| GraphQL | — | ✓ (calldata selector: `mintPublic` / `mintSigned` / `mintAllowList`) | ✓ (calldata `mintParams`) | ✓ |
+| REST | ✓ | ✓ | ✓ | — |
+| local / assembled | ✓ | ✓ | ✓ | — |
 
-So a GraphQL payload is checked by **type**, which is what catches the expensive
-case: a presale payload coming back for a public selection, or the reverse. It
-cannot catch two stages of the same type overlapping, because GraphQL states no
-window — and the check says so rather than treating "cannot tell" as a match. The
-stage index is decoded and carried on the payload but not compared, because the
-inventory has no index of its own to compare it against.
+A GraphQL payload is checked by **type and window**. The window is the
+interesting one: the MintActionTimeline *response* states none, but OpenSea signs
+`startTime`/`endTime` into the calldata's `mintParams`, and that is what
+separates two stages of the same type. On `lagrange-bend-by-jiwa` the two
+`SIGNED_PRESALE` phases are 16:00–16:10 and 16:10–16:15 — a type-only check could
+not tell them apart, a window check can.
+
+The **index** is a last resort, consulted only when the window is missing on a
+side and cannot arbitrate. Both sides stating an index is not the same as the two
+numberings agreeing: on `lagrange-bend-by-jiwa` the public stage is `stageIndex` 0
+while sitting at array position 2, so the API's numbering is demonstrably not the
+array's, and the signed `dropStageIndex` has never been confirmed to match it
+(confirming that needs a live presale). Refusing on the index alone could block
+valid mints, which is the one direction this check must never err in.
 
 An unrecognised type label on either side means "cannot tell" and the payload is
 allowed through. Refusing on a vocabulary guess would block valid mints, which is

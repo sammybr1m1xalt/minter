@@ -956,6 +956,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
           type: selectedDrop.type ?? null,
           startTime: selectedDrop.startTime > 0 ? selectedDrop.startTime : null,
           endTime: selectedDrop.endTime > 0 ? selectedDrop.endTime : null,
+          index: selectedDrop.stageIndex ?? null,
         },
         // Re-read the per-wallet cap at T-0. A drop's limit can be edited in the
         // last minutes before its stage opens, and the signed calldata binds the

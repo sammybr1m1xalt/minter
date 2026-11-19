@@ -831,6 +831,7 @@ export async function runFcfsBranch(
       type: selectedDrop.type ?? null,
       startTime: selectedDrop.startTime > 0 ? selectedDrop.startTime : null,
       endTime: selectedDrop.endTime > 0 ? selectedDrop.endTime : null,
+      index: selectedDrop.stageIndex ?? null,
     },
     // Re-read the per-wallet cap at T-0. The signed calldata binds the quantity,
     // so a cap that dropped while waiting means every payload fetched so far is

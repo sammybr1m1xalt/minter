@@ -38,6 +38,13 @@ function statedScalar(raw: unknown): boolean {
   return Number.isFinite(Number(raw));
 }
 
+/** The value itself when the surface stated a finite number, else null. */
+function statedNumber(raw: unknown): number | null {
+  if (raw == null || raw === "" || typeof raw === "object") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
 /**
  * Normalize an OpenSea timestamp to UNIX seconds.
  *
@@ -125,6 +132,17 @@ export interface DropPhase {
   // Phase type — OpenSea may label these "fcfs", "allowlist", "ovr",
   // "reserved", "public", or something else. We keep the raw value.
   type: string | null;
+
+  /**
+   * OpenSea's own `stageIndex` for this stage, when the surface stated one
+   * (GraphQL `dropBySlug.stages.stageIndex`; REST does not report it).
+   *
+   * This is NOT the position in `stages[]` — on lagrange-bend-by-jiwa the public
+   * stage is `stageIndex` 0 while sitting at array position 2. It is carried so
+   * a payload's signed `dropStageIndex` has something to be compared against
+   * when the window is unavailable; see ExpectedStage.index.
+   */
+  stageIndex?: number | null;
 
   // Timing
   startTime: number; // UNIX seconds
@@ -764,6 +782,9 @@ function catalogueDrops(json: any, nftContract: string): DropPhase[] {
       nftContract: contract || c.nftContract || c.contractAddress || c.address,
       name: label,
       type: stageType,
+      // Stated or absent, never guessed: REST does not report an index, and an
+      // invented one would refuse valid payloads downstream.
+      stageIndex: statedNumber(c.stageIndex ?? c.stage_index),
       startTime,
       endTime,
       mintPrice,

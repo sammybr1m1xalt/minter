@@ -37,7 +37,7 @@ import { resolveChain } from "./chains";
 import { fetchOnChainDrops } from "./seadrop-onchain";
 import type { DropPhase } from "./fcfs-drops";
 import { normalizeStageType } from "./fcfs-drops";
-import { isPayloadBoundToWallet, SIGNED_SELECTOR, MERKLE_SELECTOR } from "./seadrop-calldata";
+import { isPayloadBoundToWallet, decodeMintParams, SIGNED_SELECTOR, MERKLE_SELECTOR } from "./seadrop-calldata";
 export { isPayloadBoundToWallet } from "./seadrop-calldata";
 import { SEADROP_ADDRESS, OPENSEA_FEE_RECIPIENT } from "./seadrop-public";
 import { ConfirmedTx } from "./rpc-health";
@@ -119,10 +119,9 @@ export interface SignedStage {
   startTime: number | null;
   endTime: number | null;
   /**
-   * OpenSea's stage index, decoded from mintParams. Carried but NOT compared:
-   * `DropPhase` has no index of its own, so there is nothing authoritative to
-   * compare it against. Comparing it against an invented mapping would refuse
-   * valid payloads.
+   * OpenSea's stage index, decoded from mintParams. Compared only when the
+   * window is missing on a side and cannot arbitrate — see ExpectedStage.index
+   * for why this is a last resort.
    */
   index: number | null;
 }
@@ -136,6 +135,18 @@ export interface ExpectedStage {
   type?: string | null;
   startTime?: number | null;
   endTime?: number | null;
+  /**
+   * OpenSea's `stageIndex` for the selected stage, when the inventory stated one.
+   *
+   * A LAST RESORT, not a primary check. The signed calldata's `dropStageIndex`
+   * and the API's `stageIndex` are two numberings that have not been proven
+   * identical — on lagrange-bend-by-jiwa the public stage is `stageIndex` 0 while
+   * sitting at array position 2, so the API's numbering is demonstrably not the
+   * array's. Refusing on the index alone could therefore block valid mints, the
+   * one direction this check must never err in. It is consulted only when the
+   * window is missing on a side and cannot arbitrate.
+   */
+  index?: number | null;
 }
 
 /** OpenSea stage uuids are 32 hex chars, dashed or plain. */
@@ -198,7 +209,9 @@ function canonicalStageType(raw: string | null | undefined): string | null {
  * Compares, in order, only what BOTH sides state:
  *   1. the stage uuid — when both look like OpenSea stage uuids
  *   2. the stage type — public_sale / signed_presale / merkle_presale
- *   3. the stage window — when both state a real start time
+ *   3. the stage window — when both state a real start/end time
+ *   4. the stage index — only when the window is missing on a side, so the
+ *      index is a last resort rather than a second opinion on a settled matter
  *
  * A payload that carries no stage at all cannot be checked and returns null.
  * "Cannot tell" is not "matches", but refusing every such payload would stop a
@@ -235,13 +248,30 @@ export function stageMismatchReason(payload: FcfsSignedPayload, expected: Expect
     );
   }
 
-  if (s.startTime != null && s.startTime > 0 && expected.startTime != null && expected.startTime > 0) {
-    if (s.startTime !== expected.startTime) {
-      const fmt = (t: number) => new Date(t * 1000).toISOString().replace("T", " ").slice(0, 19);
-      return (
-        `payload is for a stage opening ${fmt(s.startTime)}, ` +
-        `but the selected stage opens ${fmt(expected.startTime)}`
-      );
+  // Stage window. GraphQL participates now: OpenSea signs startTime/endTime
+  // into mintParams, so the payload states them even though the response does
+  // not. This is the comparison that separates two stages of the SAME type —
+  // the uuid is absent on that surface and the type is equal by construction.
+  const fmt = (t: number) => new Date(t * 1000).toISOString().replace("T", " ").slice(0, 19);
+  const sStart = s.startTime != null && s.startTime > 0 ? s.startTime : null;
+  const eStart = expected.startTime != null && expected.startTime > 0 ? expected.startTime : null;
+  const sEnd = s.endTime != null && s.endTime > 0 ? s.endTime : null;
+  const eEnd = expected.endTime != null && expected.endTime > 0 ? expected.endTime : null;
+  if (sStart != null && eStart != null && sStart !== eStart) {
+    return `payload is for a stage opening ${fmt(sStart)}, but the selected stage opens ${fmt(eStart)}`;
+  }
+  if (sEnd != null && eEnd != null && sEnd !== eEnd) {
+    return `payload is for a stage closing ${fmt(sEnd)}, but the selected stage closes ${fmt(eEnd)}`;
+  }
+
+  // Stage index, only when the window could not arbitrate — that is, when a side
+  // is missing either endpoint. Both sides stating an index is not the same as the
+  // two numberings agreeing, which is why this sits behind the window rather than
+  // beside it.
+  const windowComplete = sStart != null && eStart != null && sEnd != null && eEnd != null;
+  if (!windowComplete) {
+    if (s.index != null && expected.index != null && s.index !== expected.index) {
+      return `payload is for stage index ${s.index}, but stage index ${expected.index} was selected`;
     }
   }
   return null;
@@ -525,6 +555,11 @@ function openseaMintTxToSignedPayload(
   // hardcoding them here was a second source of truth for the same selectors.
   const isSigned = tx.selector === SIGNED_SELECTOR || tx.selector === MERKLE_SELECTOR;
 
+  // The signed mintParams are the authoritative stage record: OpenSea signs the
+  // window, the per-wallet cap and the stage index into the calldata. Reading
+  // them here is what ties a payload to the stage it was issued for.
+  const mintParams = isSigned ? decodeMintParams(tx.data) : null;
+
   // `value` is the TOTAL transaction value (mintPrice × quantity) — the spec
   // describes it as "Native currency to send with the transaction", and
   // postMintTxFallback divides it by quantity for the same reason. Reporting it
@@ -543,27 +578,26 @@ function openseaMintTxToSignedPayload(
     value: totalValue,
     drop: {
       mintPrice,
-      // The MintActionTimeline response carries no stage window or per-wallet
-      // cap, so these stay 0 (= unknown). Callers that have the inventory should
-      // overlay it; 0 must never be read as 1970 or "unlimited".
+      // The MintActionTimeline RESPONSE carries no stage window or per-wallet
+      // cap, so these stay 0 (= unknown). The calldata does carry them — see
+      // `stage` below — but `drop` is the inventory's shape and callers overlay
+      // it; 0 must never be read as 1970 or "unlimited".
       startTime: 0,
       endTime: 0,
       maxTotalMintableByWallet: 0,
       feeBps: 0,
       restrictFeeRecipients: false,
     },
-    // GraphQL states no stage UUID and no window, but it DOES state a stage
-    // type: the selector names the entrypoint (mintPublic / mintSigned /
-    // mintAllowList). That is enough to catch the expensive mismatch — a
-    // presale payload returned for a public selection, or the reverse. What it
-    // cannot catch is two stages of the SAME type overlapping, because the
-    // GraphQL surface carries no window. Said out loud at the call site rather
-    // than silently treated as "matches anything".
+    // GraphQL states no stage UUID, but it DOES state a stage type (the selector
+    // names the entrypoint) and — from the calldata OpenSea signed — the stage
+    // window. The window is what separates two stages of the SAME type: on
+    // lagrange-bend-by-jiwa the two SIGNED_PRESALE phases are 16:00–16:10 and
+    // 16:10–16:15, so a type-only check could not tell them apart and this can.
     stage: {
       uuid: null,
       type: tx.stageType,
-      startTime: null,
-      endTime: null,
+      startTime: mintParams?.startTime ?? null,
+      endTime: mintParams?.endTime ?? null,
       index: tx.stageIndex,
     },
     gasData: undefined,
