@@ -1022,6 +1022,13 @@ export interface SnipeResult {
   error?: string;
   /** True when the failure is timing-related and a later attempt could work. */
   retryable?: boolean;
+  /**
+   * Wall-clock ms at which this wallet's transaction was dispatched, or
+   * undefined when nothing was sent. A later confirmation sweep uses it to
+   * report a real dispatch→inclusion time; without it the sweep would have to
+   * invent one.
+   */
+  dispatchedAt?: number;
 }
 
 /**
@@ -1741,6 +1748,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
 
   const inflight = toBlast.map((b) => ({
     b,
+    dispatchedAt: Date.now(),
     responsePromise: blastToAll(b.blast, blastEndpoints, {
       firstWave: BLAST_FIRST_WAVE,
       // 350ms, not the 600ms default. The first wave is 1-2 of the fastest
@@ -1752,7 +1760,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   }));
 
   const collected = await Promise.all(
-    inflight.map(async ({ b, responsePromise }) => {
+    inflight.map(async ({ b, dispatchedAt, responsePromise }) => {
       const blastResults = await responsePromise;
       // Pick the endpoint that actually accepted this wallet's tx — poll THAT
       // endpoint for the receipt so we don't burn time on one that never saw
@@ -1794,11 +1802,11 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
           };
         }
       }
-      return { b, blastResults, accepted, receipt };
+      return { b, dispatchedAt, blastResults, accepted, receipt };
     })
   );
 
-  for (const { b, blastResults, accepted, receipt } of collected) {
+  for (const { b, dispatchedAt, blastResults, accepted, receipt } of collected) {
 
     // Three distinct outcomes, and they must not collapse into one boolean:
     //   REVERTED — a receipt says the mint failed
@@ -1832,6 +1840,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
       txHash: (accepted?.txHash as string) || undefined,
       receipt,
       error,
+      dispatchedAt,
     };
   }
 

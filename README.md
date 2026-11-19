@@ -186,6 +186,7 @@ neither loses your keys nor scatters logs:
 | `npm start -- --fcfs <slug\|0x…>` | FCFS/allowlist/OVR mode — multi-phase discovery, per-wallet pre-fetch, gas polling |
 | `npm start -- --eligibility <slug\|0x…>` | Dry-run eligibility check — lists all active phases, whether your wallet can target each, and how many tokens it can mint |
 | `npm start -- --doctor` | Read-only health report — config, wallets, key pool, SIWE sessions, and RPC latency/chain-id per chain. Exits 1 if anything will stop a run |
+| `npm start -- --confirm <tx…>` | Re-ask the chain whether a transaction landed — by hash alone, so it works for a tx from an earlier run. Also `--confirm --last` / `--log <file>` / `--all` |
 | `npm start -- wallet <cmd>` | `status` \| `encrypt` \| `decrypt` the wallet file (`--wallet` also works) — see [Encrypting the wallet file](#encrypting-the-wallet-file) |
 
 ### Flags
@@ -200,6 +201,7 @@ neither loses your keys nor scatters logs:
 | `--quantity <n>` | NFTs per wallet (default 1) |
 | `--doctor` | Health report: config, wallets, key pool, sessions, RPC per chain (read-only, exits 1 on a blocker) |
 | `--logger [file]` | Read a run log as a digest — newest, a file, or `-` for stdin |
+| `--confirm <tx…>` | On-chain receipt audit for transactions already sent. Verdicts are SUCCESS, REVERTED, PENDING, NOT_FOUND or TIMEOUT; a hash that is not `0x` + 64 hex is refused rather than sent to the RPC |
 
 A target may also be given positionally (`npm start -- <target>`) when it is not
 passed to `--fcfs`.
@@ -210,6 +212,8 @@ npm start -- --fcfs de-bots --at "in 5m" --max-price 0.01
 npm start -- --eligibility 0x8d80efb61341e4b8459fbb52b213d5c25a1af179
 npm start -- --doctor
 npm start -- --logger
+npm start -- --confirm 0xabc… 0xdef…
+npm start -- --confirm --last
 npm start -- --fcfs 0xabc… on base --quantity 3 --wallets all
 ```
 
@@ -434,6 +438,8 @@ curl -X POST <your-rpc> -H 'content-type: application/json' \
 | [`src/price-protection.ts`](src/price-protection.ts) | Price-cap parsing and enforcement |
 | [`src/logger.ts`](src/logger.ts) | Per-run log files in `.minter-logs/` |
 | [`src/doctor.ts`](src/doctor.ts) | `--doctor` — one read-only health report: config, wallets, key pool, sessions, RPC per chain |
+| [`src/confirm-cli.ts`](src/confirm-cli.ts) | `--confirm` — re-ask the chain about transactions already sent, by hash alone |
+| [`src/rpc-health.ts`](src/rpc-health.ts) | The on-chain confirmation sweep behind `--confirm` and the pre-sell re-check |
 
 ### The two mint paths
 
@@ -654,6 +660,31 @@ after it.
 Both of those were wrong: the poll ran from the moment the run started (a
 ten-minute schedule polled for nine and a half minutes) and the wait then slept
 the original delay again, so a drop scheduled at T+100s fired at T+170s.
+
+### A mint that lands late
+
+The receipt poll gives up after 60s, and the sell step only sells a wallet whose
+mint is `SUCCESS` — so a transaction that landed after the poll was reported
+`UNKNOWN` forever and its tokens were never offered.
+
+Before the sell decision the minter re-asks the chain, by transaction hash, for
+every wallet whose receipt was never read. One that did land becomes `SUCCESS`
+and sells; one that is still `PENDING`, or that no endpoint can speak to, stays
+`UNKNOWN` honestly. That re-check is bounded (20s) so it never becomes a second
+60s-per-wallet wait.
+
+To settle one later, or a transaction from a run that has finished:
+
+```bash
+npm start -- --confirm 0x<txhash> [<txhash> …]   # ask about these
+npm start -- --confirm --last                    # every tx in the newest run log
+npm start -- --confirm --log <file>              # every tx in a specific run log
+npm start -- --confirm --all                     # every tx in .minter-logs/
+```
+
+It reads by hash alone, so no accepting endpoint or run state is needed. Verdicts
+are SUCCESS, REVERTED, PENDING, NOT_FOUND and TIMEOUT — and TIMEOUT is not a
+failure, it means the sweep could not tell.
 
 ---
 

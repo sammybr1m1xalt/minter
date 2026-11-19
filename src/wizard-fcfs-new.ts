@@ -29,7 +29,9 @@ import {
   FcfsSignedPayload,
   DropPhase,
   EligibilityReport,
+  SnipeResult,
 } from "./fcfs-mint";
+import { sweepOnChain } from "./rpc-health";
 import { getValidApiKey } from "./opensea-key";
 import { getSessionCookies } from "./opensea-session";
 import {
@@ -846,6 +848,14 @@ export async function runFcfsBranch(
     },
   });
 
+  // ── Step 13b: re-ask the chain about wallets whose receipt was never read ──
+  // `waitForReceipt` gives up after 60s, and the sell step below skips
+  // anything that is not SUCCESS — so a mint that landed late was reported
+  // UNKNOWN forever and its tokens were never offered. One bounded sweep by tx
+  // hash settles it: a wallet that did land becomes SUCCESS and sells; one that
+  // is still PENDING, or that no endpoint can speak to, stays UNKNOWN honestly.
+  await recheckUnknownMints(snipeResults, rpcUrls);
+
   // ── Step 14: Sell after mint ─────────────────────────────────────────────
   // One wallet at a time, in wallet order; a failed mint sells nothing.
   if (sellPlan) {
@@ -877,6 +887,67 @@ export async function runFcfsBranch(
   }
 }
 
+
+/**
+ * Re-ask the chain about wallets whose receipt could not be read, and upgrade
+ * the outcome in place.
+ *
+ * Bounded on purpose: this runs after the snipe and before the sell step, so it
+ * must not become a second 60s-per-wallet wait. A wallet that is still PENDING,
+ * or that no endpoint can speak to, keeps its UNKNOWN status — a later
+ * `npm start -- --confirm <tx>` settles it once the block has had time.
+ */
+export async function recheckUnknownMints(
+  results: SnipeResult[],
+  rpcUrls: string[],
+  budgetMs = 20_000,
+): Promise<void> {
+  const unknown = results.filter((r) => r.status === "UNKNOWN" && r.txHash);
+  if (unknown.length === 0) return;
+  if (rpcUrls.length === 0) return;
+
+  console.log(
+    chalk.gray(`\nRe-checking ${unknown.length} transaction(s) whose receipt was not read...`)
+  );
+  const confirmed = await sweepOnChain(
+    unknown.map((r) => ({
+      address: r.walletAddress,
+      txHash: r.txHash as string,
+      dispatchedAt: r.dispatchedAt ?? 0,
+    })),
+    rpcUrls,
+    budgetMs,
+  );
+
+  for (const c of confirmed) {
+    const r = unknown.find((u) => u.txHash === c.txHash);
+    if (!r) continue;
+    if (c.status === "SUCCESS" || c.status === "REVERTED") {
+      r.status = c.status;
+      r.success = c.status === "SUCCESS";
+      r.receipt = {
+        address: r.walletAddress,
+        txHash: c.txHash,
+        block: c.block,
+        position: c.position,
+        status: c.status,
+        gasUsed: c.gasUsed,
+        actualGasPrice: c.actualGasPrice,
+        blockTimeMs: c.blockTimeMs,
+      };
+      r.error = c.status === "REVERTED" ? "Transaction reverted on-chain." : undefined;
+      console.log(
+        chalk.green(`  ✓ ${r.walletAddress} — later confirmed ${c.status.toLowerCase()} (block ${c.block ?? "?"})`)
+      );
+    } else {
+      console.log(
+        chalk.gray(
+          `  – ${r.walletAddress} — ${c.status.toLowerCase()}${c.detail ? ` (${c.detail})` : ""}; still unknown`
+        )
+      );
+    }
+  }
+}
 
 // ── CLI entry: eligibility + gas check, no mint ──────────────────────────────
 // Polls all phases for a contract, shows eligibility + gas state, exits.

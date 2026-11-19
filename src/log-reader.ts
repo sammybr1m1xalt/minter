@@ -230,7 +230,7 @@ function groupByWallet(lines: string[]): Map<string, string[]> {
 // second copy of the usage text would drift from it.
 
 /** Newest run log in .minter-logs/, or null when there is none. */
-function newestRunLog(): string | null {
+export function newestRunLog(): string | null {
   try {
     const moduleDir = __dirname;
     const root = moduleDir.endsWith("dist") ? require("path").dirname(moduleDir) : moduleDir;

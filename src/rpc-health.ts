@@ -165,7 +165,7 @@ export async function sweepOnChain(
       status,
       gasUsed,
       actualGasPrice,
-      blockTimeMs: block !== null ? Date.now() - tx.dispatchedAt : null,
+      blockTimeMs: block !== null && tx.dispatchedAt > 0 ? Date.now() - tx.dispatchedAt : null,
       detail: timeoutDetail,
     });
   }
