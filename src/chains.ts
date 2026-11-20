@@ -2,7 +2,7 @@
 // network is a single entry instead of hunting for hardcoded values.
 //
 // `key` is the identifier used in three places, and they must match:
-//   1. the OpenSea GraphQL `chain` field (opensea-api.ts)
+//   1. the OpenSea GraphQL `chain` field (opensea-gql.ts)
 //   2. the `--chain` CLI option
 //   3. the `CHAIN` env var
 //

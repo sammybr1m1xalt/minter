@@ -41,6 +41,13 @@ export function parseWhen(spec: string, nowMs: number = Date.now()): number {
   // meant a user who typed the time shown on screen got a different instant.
   m = s.match(/^(\d{1,2}):(\d{2})$/);
   if (m) {
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    // setUTCHours rolls out-of-range values over into the next day, so "25:00"
+    // and "0:99" used to pass validation and fire at a different instant.
+    if (hh > 23 || mm > 59) {
+      throw new Error(`cannot parse time: "${spec}" (hours 0-23, minutes 0-59)`);
+    }
     const d = new Date(nowMs + IST_OFFSET_MS);
     d.setUTCHours(Number(m[1]), Number(m[2]), 0, 0);
     let t = Math.floor((d.getTime() - IST_OFFSET_MS) / 1000);

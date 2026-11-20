@@ -202,9 +202,17 @@ async function main(): Promise<void> {
   // `--confirm --help` describes the subcommand rather than the whole CLI, and
   // so a positional hash is never parsed as a mint target.
   if (args.includes("--confirm")) {
-    const code = await runConfirmCli(args.filter((a) => a !== "--confirm"));
-    closePrompts();
-    process.exit(code);
+    try {
+      const code = await runConfirmCli(args.filter((a) => a !== "--confirm"));
+      closePrompts();
+      process.exit(code);
+    } catch (e: any) {
+      // Every other subcommand prints a clean message here; an unprotected
+      // throw was an unhandled rejection with a raw stack.
+      console.error(chalk.red(`\n❌ confirm failed: ${e?.message ?? e}\n`));
+      closePrompts();
+      process.exit(1);
+    }
   }
 
   if (args.includes("--help") || args.includes("-h")) {
@@ -216,9 +224,15 @@ async function main(): Promise<void> {
   // starting one, and a trailing file argument would otherwise be parsed as a
   // mint target.
   if (args.includes("--logger")) {
-    const code = await runLoggerCli(args.filter((a) => a !== "--logger"));
-    closePrompts();
-    process.exit(code);
+    try {
+      const code = await runLoggerCli(args.filter((a) => a !== "--logger"));
+      closePrompts();
+      process.exit(code);
+    } catch (e: any) {
+      console.error(chalk.red(`\n❌ logger failed: ${e?.message ?? e}\n`));
+      closePrompts();
+      process.exit(1);
+    }
   }
 
   // Doctor runs alone: it is a read-only health report, not a mint mode, so
@@ -263,7 +277,11 @@ async function main(): Promise<void> {
   }
 
   // A target can be given positionally or after --fcfs. Prefer the flag.
-  const fcfsTarget = flags.fcfs ?? (flags.rest.length > 0 ? flags.rest.join(" ") : null);
+  // A positional target is the FCFS target only when no other platform flag
+  // claimed the run. Falling back to `rest` while --scatter was given ran the
+  // OpenSea FCFS branch against the positional and exited before Scatter ran.
+  const fcfsTarget =
+    flags.fcfs ?? (!flags.scatter && flags.rest.length > 0 ? flags.rest.join(" ") : null);
 
   // ── FCFS branch ──────────────────────────────────────────────────────────
   if (fcfsTarget) {

@@ -20,15 +20,16 @@
 //   3. The probe distinguishes "selector does not exist" from "selector exists
 //      but reverted on state/payment". A revert WITH data means the function is
 //      there; a revert with NO data means it is not. See detectMintFunction.
-//   4. Every selector hash in MINT_SIGNATURES is verified against
-//      ethers id(sig).slice(2,10) by tests/audit-fixes.test.js. A hand-typed
-//      hash fails silently — the probe never matches and the symptom looks like
-//      "contract has no mint function" rather than "our table is wrong".
+//   4. Every selector hash in MINT_SIGNATURES is DERIVED, not hand-typed:
+//      selectorFor() is ethers id(sig).slice(0,10), so the table cannot drift
+//      from the signature it claims. (There is no tests/ directory; the
+//      harbour-check harness under .hermes/cache/scratch exercises it.)
 
 import { id as keccakId, Interface, JsonRpcProvider } from "ethers";
 import { autoGasBounded } from "./auto-gas";
 import { SEADROP_ADDRESS } from "./seadrop-public";
 import { withRpcTimeout, DEFAULT_READ_TIMEOUT_MS } from "./rpc-timeout";
+import { isIndeterminateRpcError } from "./simulate";
 
 // ── Selector registry ───────────────────────────────────────────────────────
 //
@@ -536,10 +537,20 @@ export async function screenMintContract(
   }
 
   // ── 2. What standard does it declare? ────────────────────────────────────
+  // ERC165. The calldata must be ABI-encoded: `0x01ffc9a7` followed by the
+  // interface id left-padded to 32 bytes. It was hand-built as
+  // "0x01ffc9a7" + id.slice(2) — 8 bytes, which a real ERC165 contract reverts
+  // on, so erc165Supported was always false and this whole section never ran.
+  const ERC165_IFACE = new Interface([
+    "function supportsInterface(bytes4 interfaceId) view returns (bool supported)",
+  ]);
   const supports = (id: string) =>
     probe(`supportsInterface(${id})`, (t) =>
       withRpcTimeout(
-        provider.call({ to: contract, data: "0x01ffc9a7" + id.slice(2) }),
+        provider.call({
+          to: contract,
+          data: ERC165_IFACE.encodeFunctionData("supportsInterface", [id]),
+        }),
         t,
         `supportsInterface(${id})`
       )
@@ -550,14 +561,25 @@ export async function screenMintContract(
     supports(ERC165_INTERFACE_IDS.erc1155),
     supports(ERC165_INTERFACE_IDS.erc20),
   ]);
-  const erc721 = erc721Raw === "0x" + "0".repeat(63) + "1";
-  const erc1155 = erc1155Raw === "0x" + "0".repeat(63) + "1";
-  const erc20 = erc20Raw === "0x" + "0".repeat(63) + "1";
-  screen.erc721 = erc721;
-  screen.erc1155 = erc1155;
-  screen.erc20 = erc20;
-  screen.erc165Supported =
-    erc721Raw !== null || erc1155Raw !== null || erc20Raw !== null;
+
+  // `0x` is NOT an ERC165 answer — the contract returned no data at all.
+  // Counting it as "answered, claims nothing" refused every contract whose
+  // fallback succeeds instead of reverting.
+  const decodeSupport = (raw: string | null): boolean | null => {
+    if (raw == null || raw === "0x") return null;
+    try {
+      return ERC165_IFACE.decodeFunctionResult("supportsInterface", raw)[0] === true;
+    } catch {
+      return null;
+    }
+  };
+  const erc721 = decodeSupport(erc721Raw);
+  const erc1155 = decodeSupport(erc1155Raw);
+  const erc20 = decodeSupport(erc20Raw);
+  screen.erc721 = erc721 === true;
+  screen.erc1155 = erc1155 === true;
+  screen.erc20 = erc20 === true;
+  screen.erc165Supported = erc721 !== null || erc1155 !== null || erc20 !== null;
 
   if (screen.erc165Supported) {
     if (erc721) {
@@ -736,7 +758,11 @@ export function buildArgs(
         out.push(ctx.to);
         break;
       case "amount":
-        out.push(ctx.amount > 0n ? ctx.amount : 1n);
+        // Refuse rather than substitute: the recipient/proof/signature roles all
+        // refuse when the caller did not supply them, and rewriting 0 to 1 minted
+        // one token to a caller that asked for none.
+        if (!(ctx.amount > 0n)) return null;
+        out.push(ctx.amount);
         break;
       case "id":
         out.push(0n);
@@ -814,9 +840,23 @@ export async function detectMintFunction(
     }
 
     try {
-      await provider.call({ to: contract, from, data, value: 0 });
+      // Bounded. ethers' JsonRpcProvider has no timeout of its own (its
+      // FetchRequest default is 300 s), so a blackholed endpoint used to hold
+      // this probe — and every candidate after it — open for minutes. A failed
+      // read must also not read as "selector absent": the catch below treats it
+      // as unknown rather than as a non-reverting answer.
+      await withRpcTimeout(
+        provider.call({ to: contract, from, data, value: 0 }),
+        DEFAULT_READ_TIMEOUT_MS,
+        `probe ${candidate}`
+      );
       return { selector: candidate, revertedWithData: false };
     } catch (e: any) {
+      if (isIndeterminateRpcError(e)) {
+        // Transport, not a verdict: this candidate was never answered, so it
+        // is neither "exists" nor "absent". Keep probing.
+        continue;
+      }
       const errData = e?.data ?? e?.info?.error?.data;
       if (errData && errData !== "0x") {
         if (!firstReverting) firstReverting = { selector: candidate, revertedWithData: true };
@@ -843,7 +883,11 @@ export async function detectPrice(
   amount: bigint = 1n
 ): Promise<{ price: bigint; reader: string } | null> {
   for (const reader of PRICE_READERS) {
-    const iface = new Interface([`function ${reader.sig}`]);
+    // The fragment needs its return type. Without `returns (uint256)` the
+    // Interface has no outputs, decodeFunctionResult threw "out of result
+    // range" on every call, and detectPrice returned null for every contract —
+    // so buildGenericMintTx planned msg.value = 0 for every paid generic mint.
+    const iface = new Interface([`function ${reader.sig} view returns (uint256)`]);
     const name = reader.sig.split("(")[0];
     try {
       const args = reader.takesAmount ? [amount] : [];
@@ -946,8 +990,15 @@ export async function buildGenericMintTx(
   try {
     await provider.call(tx);
   } catch (e: any) {
-    simulationReverted = true;
-    simulationError = e?.shortMessage ?? e?.reason ?? e?.info?.error?.message ?? e?.message ?? "unknown revert";
+    // A timeout or transport failure is NOT a revert. Reporting it as one made
+    // isPlanBroadcastable false and aborted a mint that the shared simulate.ts
+    // gate would have classified as indeterminate.
+    if (isIndeterminateRpcError(e)) {
+      simulationError = `simulation inconclusive: ${e?.shortMessage ?? e?.message ?? "unknown"}`;
+    } else {
+      simulationReverted = true;
+      simulationError = e?.shortMessage ?? e?.reason ?? e?.info?.error?.message ?? e?.message ?? "unknown revert";
+    }
   }
 
   // Bounded and parallel. The previous local autoGas copy ran estimateGas then

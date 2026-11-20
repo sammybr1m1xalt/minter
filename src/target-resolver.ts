@@ -47,6 +47,32 @@ export function chainSlug(s: string | null | undefined): string {
   return CHAIN_ALIASES[s.trim().toLowerCase()] ?? s.trim().toLowerCase();
 }
 
+/**
+ * The host of a URL-shaped input, lowercased and without a leading "www.".
+ * Returns null when the input is not URL-shaped (a bare slug or address).
+ */
+function hostOf(s: string): string | null {
+  const withScheme = s.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i);
+  if (withScheme) return withScheme[1].replace(/^www\./i, "").toLowerCase();
+  // Scheme-less but still domain-shaped: "opensea.io/assets/…".
+  const bare = s.match(/^([a-z0-9-]+(?:\.[a-z0-9-]+)+)([/?#]|$)/i);
+  if (bare) return bare[1].toLowerCase();
+  return null;
+}
+
+/**
+ * True when the input's host is `name` (or a subdomain of it), or when the
+ * input has no host at all.
+ *
+ * Platform regexes used to be unanchored, so "notopensea.io/assets/…",
+ * "notscatter.art/abc" and "evil.com/?next=scatter.art/collection/abc" all
+ * parsed as the legitimate platform, and their slug was resolved and minted.
+ */
+function onHost(s: string, name: string): boolean {
+  const h = hostOf(s);
+  return h === null || h === name || h.endsWith("." + name);
+}
+
 // The set of chains this build can actually mint on, derived from the chain
 // table so it can never drift from it. The alias table above still normalises
 // names for platforms that name chains we do not serve (OpenSea returns
@@ -134,7 +160,10 @@ export function parseTarget(input: string): ParsedTarget {
   if (!s) throw new Error("No mint target provided");
 
   // OpenSea assets URL — trailing /N is a tokenId, not an amount.
-  let m = s.match(new RegExp(`opensea\\.io/assets/([\\w-]+)/(${ADDR})(?:/(\\d+))?`, "i"));
+  let m: RegExpMatchArray | null = null;
+  if (onHost(s, "opensea.io")) {
+    m = s.match(new RegExp(`opensea\\.io/assets/([\\w-]+)/(${ADDR})(?:/(\\d+))?`, "i"));
+  }
   if (m) {
     return {
       platform: "opensea",
@@ -146,7 +175,9 @@ export function parseTarget(input: string): ParsedTarget {
   }
 
   // OpenSea collection URL → slug.
-  m = s.match(/opensea\.io\/collection\/([\w-]+)/i);
+  if (onHost(s, "opensea.io")) {
+    m = s.match(/opensea\.io\/collection\/([\w-]+)/i);
+  }
   if (m) {
     return {
       platform: "opensea",
@@ -157,20 +188,26 @@ export function parseTarget(input: string): ParsedTarget {
   }
 
   // Scatter.art — /collection/<slug>, /c/<slug> (short link), or bare /<slug>.
-  m = s.match(/scatter\.art\/(?:collection\/|c\/)?([\w-]+)/i);
+  if (onHost(s, "scatter.art")) {
+    m = s.match(/scatter\.art\/(?:collection\/|c\/)?([\w-]+)/i);
+  }
   if (m) {
     return { platform: "scatter", slug: m[1].toLowerCase(), amount: extractAmount(s) };
   }
 
   // Manifold claim. Claim ids are URL slugs, which may contain hyphens — \w+
   // alone would stop at the first one and silently truncate the id.
-  m = s.match(/manifold\.xyz\/c\/([\w-]+)/i);
+  if (onHost(s, "manifold.xyz")) {
+    m = s.match(/manifold\.xyz\/c\/([\w-]+)/i);
+  }
   if (m) {
     return { platform: "manifold", claimId: m[1], amount: extractAmount(s) };
   }
 
   // Zora collect URL.
-  m = s.match(new RegExp(`zora\\.co/collect/(\\w+):(${ADDR})(?:/(\\d+))?`, "i"));
+  if (onHost(s, "zora.co")) {
+    m = s.match(new RegExp(`zora\\.co/collect/(\\w+):(${ADDR})(?:/(\\d+))?`, "i"));
+  }
   if (m) {
     return {
       platform: "zora",
@@ -287,8 +324,21 @@ async function resolveTargetUnchecked(
       // OpenSea first.
       try {
         const info = await resolveSlug(target.slug, apiKey, target.chain || preferredChain);
-        const chainKey = target.chain || preferredChain || info.chain;
+        const wanted = target.chain || preferredChain;
+        const chainKey = wanted || info.chain;
         if (!chainKey) return null;
+        // A slug can exist on several chains, and resolveSlug returns OpenSea's
+        // primary contract regardless of the chain asked for. Pairing that
+        // contract with a chain it is not on built the whole run against the
+        // wrong network (de-bots + "base" resolved the Ethereum contract), so
+        // refuse the pairing rather than assume.
+        if (wanted && info.chain && chainSlug(info.chain) !== chainSlug(wanted)) {
+          console.error(
+            `[resolveTarget] "${target.slug}" is on ${chainSlug(info.chain)}, not ${chainSlug(wanted)} ` +
+              `— refusing to pair a contract with a chain it is not on.`
+          );
+          return null;
+        }
         return {
           platform: "opensea",
           contract: info.contractAddress,
@@ -319,8 +369,12 @@ async function resolveTargetUnchecked(
             };
           }
         }
-      } catch {
-        // Scatter unreachable — treat as not found.
+      } catch (e: any) {
+        // Scatter unreachable — treat as not found, but SAY SO. Returning null
+        // silently made an outage indistinguishable from a missing collection,
+        // and the caller's message ("may not exist, or it needs an OpenSea API
+        // key") sent the user to check the wrong thing.
+        console.error(`[resolveTarget] Scatter API unreachable: ${e?.shortMessage ?? e?.message ?? e}`);
       }
       return null;
     }

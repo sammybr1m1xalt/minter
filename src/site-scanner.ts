@@ -518,9 +518,14 @@ export function rankCandidates(
   const bump = (addr: string, pts: number, src: AddressCandidate["source"], key?: string) => {
     const a = addr.toLowerCase();
     score.set(a, (score.get(a) ?? 0) + pts);
-    // Keep the strongest source we have seen for this address.
-    if (!source.has(a)) source.set(a, src);
-    if (key) keyName.set(a, key);
+    // Keep the STRONGEST source seen, and the key that came with it. Keeping the
+    // first source and the last key reported the weakest provenance under a
+    // misleading key — a "contracts-block" hit shown as "owner".
+    const prev = source.get(a);
+    if (prev === undefined || sourceRank(src) > sourceRank(prev)) {
+      source.set(a, src);
+      if (key) keyName.set(a, key);
+    }
   };
 
   // Addresses that are never a collection contract. Two independent rules:
@@ -687,7 +692,7 @@ export function scanHtml(
     contractsBlock,
     [...scriptHits],
     buttons,
-    extractAddressOccurrences(html),
+    extractAddressOccurrences(text),
     depths,
     currencySentinels,
     SHARED_INFRASTRUCTURE_SENTINELS,
@@ -1173,11 +1178,30 @@ export function extractWebpackChunkUrls(js: string, baseUrl: string): string[] {
   for (const m of js.matchAll(/\.e\s*\(\s*["']?(\d+)["']?\s*\)/g)) ids.add(m[1]);
   if (ids.size === 0) return [];
 
-  let filenameFor: (id: string) => unknown;
+  let filenameFor: ((id: string) => unknown) | null = null;
   try {
-    const fn = new Function(`return (${expr})`)();
-    if (typeof fn !== "function") return [];
-    filenameFor = fn;
+    // `new Function` on text fetched from a REMOTE PAGE executed arbitrary code
+    // in the bot process. The body is now accepted only when it is built solely
+    // from the arrow parameter, string/number literals, object-literal syntax
+    // and the operators a chunk-filename function actually uses — no other
+    // identifiers, no calls, no assignments, no statements. Anything else is
+    // skipped, which is the documented behaviour: an invented URL is worse than
+    // none.
+    const arrow = expr.match(/^\s*(\w+)\s*=>\s*([\s\S]+)$/);
+    if (!arrow) return [];
+    const param = arrow[1];
+    const body = arrow[2];
+    const identifiers = body.match(/[a-zA-Z_$][a-zA-Z0-9_$]*/g) ?? [];
+    const onlyParam =
+      identifiers.every((t) => t === param || t === "true" || t === "false");
+    const onlySafeChars = /^[\s\dA-Za-z_$.+?:|&()\[\]{}'",*()-]*$/.test(body);
+    const noCallOnParam = !new RegExp(`\\b${param}\\s*\\(`).test(body);
+    const noStatements = !/=>|;|=[^=]/.test(body);
+    if (!onlyParam || !onlySafeChars || !noCallOnParam || !noStatements) return [];
+    filenameFor = new Function(
+      `"use strict"; return (function (${param}) { return (${body}); })`
+    )() as (id: string) => unknown;
+    if (typeof filenameFor !== "function") return [];
   } catch {
     return [];
   }
@@ -1495,13 +1519,12 @@ export async function scanWithBundles(
 /** Merge several scan results, keeping the highest score per address. */
 function mergeScans(scans: ScanResult[]): ScanResult {
   const byAddr = new Map<string, AddressCandidate>();
-  let totalFound = 0;
   for (const s of scans) {
-    totalFound += s.totalFound;
     for (const c of s.candidates) {
-      const existing = byAddr.get(c.address);
+      const k = c.address.toLowerCase();
+      const existing = byAddr.get(k);
       if (!existing) {
-        byAddr.set(c.address, { ...c });
+        byAddr.set(k, { ...c });
       } else {
         // Keep the strongest evidence: highest score, and the most specific
         // source we have seen.
@@ -1513,7 +1536,10 @@ function mergeScans(scans: ScanResult[]): ScanResult {
     }
   }
   const candidates = [...byAddr.values()].sort((a, b) => b.score - a.score);
-  return { candidates, totalFound, empty: candidates.length === 0 };
+  // totalFound is documented as the number of DISTINCT addresses. Summing each
+  // scan's count double-counted an address seen in both the shell HTML and a
+  // bundle.
+  return { candidates, totalFound: candidates.length, empty: candidates.length === 0 };
 }
 
 function sourceRank(s: AddressCandidate["source"]): number {

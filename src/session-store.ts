@@ -19,7 +19,15 @@ export function sessionDir(): string {
   if (cachedDir) return cachedDir;
   const explicit = process.env.OPENSEA_SESSION_DIR?.trim();
   if (explicit) {
-    cachedDir = explicit;
+    // Resolved and created. A relative value used verbatim was cwd-dependent,
+    // and returning before the mkdirSync meant a missing or typo'd path made
+    // every write throw ENOENT — silently, because the caller swallows it, so
+    // the operator was never told the session jar was not persisting.
+    const d = path.resolve(explicit);
+    try {
+      require("fs").mkdirSync(d, { recursive: true, mode: 0o700 });
+    } catch {}
+    cachedDir = d;
     return cachedDir;
   }
   const d = path.join(path.resolve(__dirname, ".."), ".minter-session");

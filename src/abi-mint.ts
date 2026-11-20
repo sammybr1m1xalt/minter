@@ -17,6 +17,8 @@
 // Both are read-only public lookups. Nothing here signs or broadcasts.
 
 import { Interface, JsonRpcProvider } from "ethers";
+import { withRpcTimeout, DEFAULT_READ_TIMEOUT_MS } from "./rpc-timeout";
+import { isIndeterminateRpcError } from "./simulate";
 
 // ── ABI sources ─────────────────────────────────────────────────────────────
 
@@ -26,7 +28,6 @@ export interface AbiFetchResult {
   error?: string;
 }
 
-/** Sourcify chain-path map. Only chains Sourcify serves need entries. */
 /**
  * Fetch the verified ABI from Sourcify. Returns null when not verified.
  *
@@ -94,11 +95,17 @@ export async function fetchAbi(
   address: string,
   opts: { etherscanKey?: string; timeoutMs?: number } = {}
 ): Promise<AbiFetchResult> {
-  const sourcify = await fetchAbiFromSourcify(chainId, address, opts.timeoutMs);
+  // One budget for BOTH sources. Handing the full timeoutMs to each spent it
+  // twice: a 15 s Sourcify stall followed by a 15 s Etherscan stall cost 30 s
+  // with no overall ceiling.
+  const deadline = Date.now() + (opts.timeoutMs ?? 15000);
+  const share = () => Math.max(500, deadline - Date.now());
+
+  const sourcify = await fetchAbiFromSourcify(chainId, address, share());
   if (sourcify.abi) return sourcify;
 
   if (opts.etherscanKey) {
-    const etherscan = await fetchAbiFromEtherscan(chainId, address, opts.etherscanKey, opts.timeoutMs);
+    const etherscan = await fetchAbiFromEtherscan(chainId, address, opts.etherscanKey, share());
     if (etherscan.abi) return etherscan;
     return { abi: null, source: null, error: `sourcify: ${sourcify.error}; etherscan: ${etherscan.error}` };
   }
@@ -232,6 +239,12 @@ export function classifyParam(name: string, type: string): ParamRole {
     return "data";
   }
 
+  // Array and tuple types are excluded first: `uint256[] ids` matched
+  // /^u?int/, so it was classified "quantity", a scalar bigint was pushed for an
+  // array parameter, ethers threw at encode time, and every ERC1155 batch
+  // candidate was silently skipped.
+  if (t.includes("[") || t.startsWith("tuple")) return "unknown";
+
   // uint / int: quantity, token id, or something we cannot know.
   if (/^u?int/.test(t)) {
     if (/proof|merkle|index|stage|round|phase|nonce|salt/i.test(n)) return "unknown";
@@ -282,11 +295,18 @@ export function synthFromAbi(
         break;
 
       case "quantity":
-        args.push(ctx.amount > 0n ? ctx.amount : 1n);
+        // Refuse rather than substitute 1: the caller asked for a quantity and
+        // inventing one mints the wrong amount.
+        if (!(ctx.amount > 0n)) return { ok: false, reason: "no quantity supplied" };
+        args.push(ctx.amount);
         break;
 
       case "tokenId":
-        args.push(ctx.tokenId ?? 0n);
+        // Refuse rather than invent 0. An ERC1155 id the caller did not supply
+        // was encoded as 0 and could mint a different token than intended;
+        // proof and signature already refuse, so this guard now agrees with them.
+        if (ctx.tokenId == null) return { ok: false, reason: "no token id supplied" };
+        args.push(ctx.tokenId);
         break;
 
       case "proof":
@@ -365,10 +385,29 @@ export async function probeAbiCandidate(
   }
 
   try {
-    await provider.call({ to: contract, from, data, value });
+    // Bounded: this loop probes every candidate sequentially, and ethers has no
+    // provider timeout of its own.
+    await withRpcTimeout(
+      provider.call({ to: contract, from, data, value }),
+      DEFAULT_READ_TIMEOUT_MS,
+      `probeAbiCandidate(${candidate.name})`
+    );
     return { candidate, exists: true, wouldSucceed: true };
   } catch (e: any) {
-    const errData = e?.data ?? e?.info?.error?.data;
+    // A timeout or transport failure is neither "exists" nor "absent".
+    if (isIndeterminateRpcError(e)) {
+      return {
+        candidate,
+        exists: false,
+        wouldSucceed: false,
+        error: `indeterminate: ${e?.shortMessage ?? e?.message ?? "rpc did not answer"}`,
+        revertedWithoutData: true,
+      };
+    }
+    // Revert data arrives in more than one shape depending on the provider;
+    // reading only e.data / e.info.error.data reported an {error:{data}} revert
+    // as "selector absent".
+    const errData = e?.data ?? e?.info?.error?.data ?? e?.error?.data;
     if (errData && errData !== "0x") {
       return { candidate, exists: true, wouldSucceed: false, error: e?.reason ?? e?.shortMessage };
     }
@@ -424,10 +463,19 @@ export async function readPriceFromAbi(
     try {
       const args = g.inputs.length === 1 ? [amount] : [];
       const data = iface.encodeFunctionData(g.name, args);
-      const raw = await provider.call({ to: contract, data });
+      const raw = await withRpcTimeout(
+        provider.call({ to: contract, data }),
+        DEFAULT_READ_TIMEOUT_MS,
+        `readPriceFromAbi(${g.name})`
+      );
       const decoded = iface.decodeFunctionResult(g.name, raw);
       const v = decoded[0];
-      if (typeof v === "bigint") return { price: v, getter: g.name };
+      if (typeof v === "bigint") {
+        // A getter that takes no quantity returns a PER-UNIT price; one that
+        // takes uint256 (e.g. totalPrice(uint256)) returns the total. Using the
+        // per-unit value as msg.value underpaid by `amount ×`, so scale it.
+        return { price: g.inputs.length === 1 ? v : v * amount, getter: g.name };
+      }
     } catch {
       continue;
     }

@@ -76,8 +76,8 @@ export async function settleRanking(
 }
 
 // Minimal liveness check: eth_chainId + eth_blockNumber on each RPC.
-// This is cheaper than the full probeEndpoints() (no chainId verification,
-// no block-by-number fetch) but enough to ensure the socket+TLS+JSONRPC
+// This is cheaper than the full planRpcs() probe (no chainId verification,
+// no per-endpoint ranking) but enough to ensure the socket+TLS+JSONRPC
 // round-trip works before T-0.
 export async function warmConnections(rpcUrls: string[]): Promise<void> {
   if (rpcUrls.length === 0) return;

@@ -17,6 +17,7 @@
 // both were verified against the live SeaDrop contract.
 
 import { JsonRpcProvider, Interface, zeroPadValue, getAddress } from "ethers";
+import { withRpcTimeout, DEFAULT_READ_TIMEOUT_MS } from "./rpc-timeout";
 
 // keccak256("AllowListUpdated(address,bytes32,bytes32,string[],string)")
 const ALLOWLIST_UPDATED_TOPIC0 =
@@ -60,21 +61,40 @@ export async function fetchAllowListUri(
   const MAX_CHUNKS = 24; // ~4 days on Ethereum
   let latest: number;
   try {
-    latest = await provider.getBlockNumber();
+    latest = await withRpcTimeout(
+      provider.getBlockNumber(),
+      DEFAULT_READ_TIMEOUT_MS,
+      "getBlockNumber"
+    );
   } catch {
     return null;
   }
 
   const iface = new Interface(ALLOWLIST_EVENT_ABI);
-  for (let i = 0; i < MAX_CHUNKS; i++) {
-    const toBlock = latest - i * CHUNK;
-    const fromBlock = Math.max(0, toBlock - CHUNK + 1);
+  let chunk = CHUNK;
+  let cursor = latest;
+  let iterations = 0;
+  while (cursor > 0 && iterations < MAX_CHUNKS) {
+    iterations++;
+    const toBlock = cursor;
+    const fromBlock = Math.max(0, toBlock - chunk + 1);
     let logs: any[];
     try {
-      logs = await provider.getLogs({ address: seadropAddr, topics, fromBlock, toBlock });
+      logs = await withRpcTimeout(
+        provider.getLogs({ address: seadropAddr, topics, fromBlock, toBlock }),
+        DEFAULT_READ_TIMEOUT_MS,
+        "eth_getLogs"
+      );
     } catch {
-      // This endpoint caps the range harder than assumed. A smaller chunk may
-      // still work, so keep walking rather than reporting "no allowlist".
+      // This endpoint caps the range harder than assumed, so retry the SAME
+      // window with a smaller chunk. `continue` used to jump a full chunk
+      // forward, so a capped endpoint walked 24 identical ranges and never
+      // reached the event — the "a smaller chunk may still work" the comment
+      // promises had no code behind it.
+      if (chunk >= 250) {
+        chunk = Math.floor(chunk / 2);
+        iterations--;
+      }
       continue;
     }
     if (logs.length > 0) {
@@ -86,7 +106,7 @@ export async function fetchAllowListUri(
         return null;
       }
     }
-    if (fromBlock === 0) break;
+    cursor = fromBlock - 1;
   }
   return null;
 }
@@ -237,13 +257,21 @@ export async function getAllowlistRoot(
   ]);
   try {
     const data = iface.encodeFunctionData("getAllowListMerkleRoot", [nftContract]);
-    const raw = await provider.call({ to: seadropAddr, data });
+    const raw = await withRpcTimeout(
+      provider.call({ to: seadropAddr, data }),
+      DEFAULT_READ_TIMEOUT_MS,
+      "getAllowListMerkleRoot"
+    );
     const decoded = iface.decodeFunctionResult("getAllowListMerkleRoot", raw);
     const root: string = decoded.root ?? decoded[0];
     if (!root || typeof root !== "string") return null;
     // The contract returns 32 zero bytes for a contract with no allowlist.
     return /^0x0*$/.test(root) ? null : root;
-  } catch {
-    return null;
+  } catch (e: any) {
+    // A failed read is NOT "no allowlist". Returning null here made a transient
+    // RPC failure indistinguishable from a drop with no allowlist, and the
+    // caller's `if (root)` then silently skipped the whole allowlist adapter —
+    // an entitled wallet was told the drop was not mintable.
+    throw e;
   }
 }

@@ -176,6 +176,12 @@ function persistSessions(): void {
       encoding: "utf-8",
       mode: 0o600,
     });
+    // `mode` applies only at creation. A jar restored from a backup, tarball or
+    // an older build keeps its old mode while holding access_token and
+    // refresh_token, so tighten it explicitly.
+    try {
+      fs.chmodSync(siweSessionsFile(), 0o600);
+    } catch {}
   } catch {
     // A cache that cannot be written must never break a login.
   }

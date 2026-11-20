@@ -263,11 +263,16 @@ export async function waitForReceipt(
   // indexing its latest blocks). It is not a reason to keep polling for the
   // whole budget, so it gets a short grace of its own and then reports UNKNOWN.
   const MINED_GRACE_MS = 10_000;
+  // Bounded by the caller's budget, not a fixed 3 s. With a blackholed endpoint
+  // the receipt phase, the tx phase and the sleep all completed before the
+  // loop's deadline was tested, so a 1.2 s budget ran 7.5 s.
+  const perRequestMs = Math.max(500, Math.min(3000, Math.floor(timeoutMs / 4)));
+  const restMs = () => Math.max(0, timeoutMs - (Date.now() - start));
   let minedNoReceiptSince: number | null = null;
 
   const post = (url: string, method: string) => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
+    const timer = setTimeout(() => controller.abort(), perRequestMs);
     return {
       promise: fetch(url, {
         method: "POST",
@@ -321,7 +326,7 @@ export async function waitForReceipt(
         lastError = `mined in block ${parseHexQuantity(tx.blockNumber) ?? "?"} but no receipt returned`;
       }
       if (Date.now() - minedNoReceiptSince < MINED_GRACE_MS) {
-        await sleep(1000);
+        await sleep(Math.min(1000, restMs()));
         continue;
       }
       console.log(
@@ -334,7 +339,7 @@ export async function waitForReceipt(
 
     // Not found at all
     lastError = "tx not found";
-    await sleep(1500);
+    await sleep(Math.min(1500, restMs()));
   }
 
   console.log(chalk.yellow(`  [${txHash.slice(0, 10)}…] TIMEOUT after ${timeoutMs/1000}s — no receipt, last error: ${lastError}`));

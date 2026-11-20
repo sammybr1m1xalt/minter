@@ -73,7 +73,11 @@ export function parseRevert(err: any): { reason?: string; data?: string } {
     // ethers wraps revert data as "execution reverted: <reason>" or
     // "execution reverted (no data present; likely require(false))".
     const m = err.message.match(/execution reverted:?\s*(.*)$/);
-    reason = m ? m[1].trim() : err.message;
+    const trimmed = m ? m[1].trim() : err.message;
+    // An empty capture is a bare "execution reverted" with no reason. It must
+    // stay undefined: '' is not nullish, so a caller's `reason ?? <no-data
+    // hint>` never fired and that diagnostic branch was dead.
+    reason = trimmed === "" ? undefined : trimmed;
   }
 
   // Omit keys that are undefined rather than emitting them explicitly — a

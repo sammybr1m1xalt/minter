@@ -247,14 +247,9 @@ export async function detectStandardFallback(
     }
   }
 
-  // Last resort: name() exists on both standards but not on a plain wallet.
-  // Either way the standard is indeterminate — the call only distinguishes
-  // "some contract" from "nothing", and both branches reported the same thing.
-  try {
-    await provider.call({ to: address, data: "0x06fdde03" }); // name()
-  } catch {
-    // No name() either — still a contract, still unknown.
-  }
+  // Removed: a name() probe. It ran one RPC round trip and both its try and
+  // catch paths returned the same "unknown" — it could never change the verdict.
+
   return { standard: "unknown", erc165Supported: false };
 }
 
@@ -295,20 +290,11 @@ async function verifyContractInner(
   provider: JsonRpcProvider
 ): Promise<VerificationResult> {
   // 1. Contract?
-  let code: string;
-  try {
-    code = await provider.getCode(address);
-  } catch (err: any) {
-    return {
-      address,
-      chainId,
-      isContract: false,
-      standard: "unknown",
-      erc165Supported: false,
-      platform: "none",
-      reason: `RPC error reading code: ${err?.shortMessage ?? err?.message ?? "unknown"}`,
-    };
-  }
+  // No catch here on purpose: a getCode failure must propagate so
+  // withProviderFailover tries the next endpoint. Catching it here returned
+  // isContract:false, which read as "not a contract" and ended the failover
+  // after the first rate-limited endpoint.
+  const code = await provider.getCode(address);
 
   if (code === "0x" || code.length <= 2) {
     return {
@@ -337,8 +323,10 @@ async function verifyContractInner(
   }
 
   // 2. Known singleton? Cheapest and most certain identification.
+  // Compare lowercased against a lowercased constant: SEADROP_V1 is checksummed,
+  // so `lower === SEADROP_V1` was always false and this branch never fired.
   const lower = address.toLowerCase();
-  if (lower === SEADROP_V1 || lower === SEADROP_V2) {
+  if (lower === SEADROP_V1.toLowerCase()) {
     return { address, chainId, isContract: true, standard: "unknown", erc165Supported: false, platform: "seadrop-v1" };
   }
 

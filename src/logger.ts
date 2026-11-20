@@ -1,6 +1,8 @@
 // ── Run logger — captures every invocation with full diagnostic detail ───────
 //
-// Every run writes a log to .minter-logs/run-<timestamp>-<mode>.log.
+// Every run writes a log to
+// .minter-logs/run-<timestamp>-<pid>-<label>.log, where <label> is the mint
+// target (mode is a field inside the file, not part of the name).
 // IMPORTANT: log.end() MUST be called in every exit path (success, error, abort)
 // so the log is flushed and closed. The index.ts CLI entry points call log.end()
 // in both the success and catch branches of each mode. If you add a new entry
@@ -198,15 +200,25 @@ const CREDENTIAL_FIELD = /key|token|secret|private|rpc|auth|password|seed|mnemon
  * the arguments are the first thing needed.
  */
 export function redactArgv(args: string[]): string[] {
-  return args.map((a) => (/^0x[0-9a-fA-F]{64}$/.test(a) ? "0x<redacted>" : a));
+  // Case-insensitive, and not exactly-64-only: "0X…" is the same credential, and
+  // a 63-hex value was passed through verbatim. Anything address/key-shaped and
+  // long is blanked.
+  return args.map((a) => (/^0[xX][0-9a-fA-F]{63,64}$/.test(a) ? "0x<redacted>" : a));
 }
 
 export function maskFieldValue(key: string, value: string): string {
   if (!value || !CREDENTIAL_FIELD.test(key)) return value;
-  // Booleans and short flags ("true", "false", "<unset>") carry no secret.
-  if (value.length < 20) return value;
+  // Only an explicit boolean/placeholder is safe regardless of length. The
+  // previous `value.length < 20` bypass emitted ANY shorter credential
+  // verbatim — a 19-char key reached the run log in clear.
+  if (/^(true|false|<unset>|<empty>)$/i.test(value)) return value;
   return maskRpc(value);
 }
+
+/** Path segments that are structural, not credentials. */
+const SAFE_PATH_SEGMENTS = new Set([
+  "v1", "v2", "v3", "api", "json", "graphql", "collections", "tokens", "nfts",
+]);
 
 export function maskRpc(value: string): string {
   if (!value) return "<empty>";
@@ -215,17 +227,21 @@ export function maskRpc(value: string): string {
     u = new URL(value);
   } catch {
     // Not a URL — a bare API key read from the environment. Echo none of it.
-    return "••••••••";
+    return "********";
   }
   const segs = u.pathname.split("/").filter(Boolean);
+  // Mask by allowlist, not by shape. The old heuristic only masked segments
+  // that were >=32 hex or >=20 alphanumeric, so a short provider key
+  // (`/v2/shortkey`) and any key containing "." / "+" / "$" passed through.
   const masked = segs.map((s) =>
-    // Provider keys are long, opaque, and not purely numeric. Short path
-    // words ("v2", "collections") and chain ids stay readable.
-    /^[0-9a-fA-F]{32,}$/.test(s) || (/^[A-Za-z0-9_-]{20,}$/.test(s) && !/^\d+$/.test(s))
-      ? "••••••••"
-      : s
+    SAFE_PATH_SEGMENTS.has(s.toLowerCase()) || /^\d+$/.test(s) ? s : "********"
   );
   u.pathname = "/" + masked.join("/");
+  // The query string and the userinfo were re-serialised verbatim by
+  // toString(), so a key in `?apiKey=…` or `user:pass@` was logged in clear.
+  u.search = "";
+  u.username = "";
+  u.password = "";
   return u.toString();
 }
 

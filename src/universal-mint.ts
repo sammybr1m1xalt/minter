@@ -13,7 +13,7 @@
 // Adapter order matters:
 //   1. SeaDrop public   — the fastest path, and the one with no API dependency
 //   2. SeaDrop allowlist — needs a merkle proof from the event logs
-//   3. Generic registry — 61 known signatures, synthesizable args
+//   3. Generic registry — the known-signature table, synthesizable args
 //   4. ABI-driven       — any mint function the ABI exposes, args synthesised
 //
 // A contract that yields no plan from any adapter is genuinely untargettable,
@@ -202,12 +202,19 @@ export async function findUniversalMint(
         });
       }
     }
-  } catch {
-    // Not a SeaDrop contract, or the RPC refused the range — not an error.
+  } catch (e: any) {
+    // Not a SeaDrop contract, or the allowlist could not be read. Those are
+    // different answers: swallowing both made an RPC outage look like "no
+    // allowlist" and an entitled wallet was told the drop was not mintable.
+    attempts.push({
+      adapter: "seadrop-allowlist",
+      ok: false,
+      reason: `allowlist could not be read: ${e?.shortMessage ?? e?.message ?? String(e)}`,
+    });
   }
 
   // ── 3. Generic registry ────────────────────────────────────────────────
-  // 61 known signatures. Cheap: no ABI fetch, just selector probes.
+  // The known-signature table. Cheap: no ABI fetch, just selector probes.
   try {
     const generic = await buildGenericMintTx(contract, provider, from, amount, opts);
     if (generic && isPlanBroadcastable(generic)) {
@@ -367,7 +374,10 @@ export async function findAllUniversalMints(
           { to: localPlan.to, from, data: localPlan.data, value: localPlan.value },
           3_000
         );
-        if (!sim.reverted) {
+        // sim.ok, not !sim.reverted: an indeterminate simulation (timeout,
+        // transport failure) is not a pass. findUniversalMint already gates on
+        // sim.ok, so the two entry points agree.
+        if (sim.ok) {
           plans.push({
             adapter: "seadrop-public",
             to: localPlan.to,
@@ -454,9 +464,11 @@ export async function findAllUniversalMints(
 }
 
 /**
- * Order ABI candidates: free mints first, then cheapest, then by name for
- * determinism. A free mint is the most likely to succeed and costs nothing to
- * try.
+ * Order ABI candidates: free (non-payable) first, then fewest inputs, then by
+ * signature for determinism.
+ *
+ * Price is NOT a sort key here — it is not known per-candidate until probed.
+ * A free mint is the most likely to succeed and costs nothing to try.
  */
 function orderCandidates(candidates: AbiMintCandidate[]): AbiMintCandidate[] {
   // Prefer non-payable (free) mints, then the fewest parameters (simplest arg

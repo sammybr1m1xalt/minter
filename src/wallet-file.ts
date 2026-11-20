@@ -68,6 +68,18 @@ export function isEnvelope(value: any): value is WalletEnvelope {
   );
 }
 
+/** An envelope for a version this build cannot read. Not a plaintext file. */
+function isForeignEnvelope(value: any): boolean {
+  return (
+    value != null &&
+    typeof value === "object" &&
+    typeof value.v === "number" &&
+    value.v !== ENVELOPE_VERSION &&
+    typeof value.kdf === "string" &&
+    typeof value.ct === "string"
+  );
+}
+
 /**
  * Classify the raw text of a wallet file. Never throws: a malformed file is a
  * state the caller must report, not a reason to crash a run.
@@ -80,6 +92,15 @@ export function readWalletFile(text: string): WalletFile {
     return { kind: "malformed", error: `not valid JSON: ${e?.message ?? e}` };
   }
   if (isEnvelope(parsed)) return { kind: "encrypted", envelope: parsed };
+  // An envelope of an unknown version is NOT a plaintext wallet file. Reading
+  // it as plain made `wallet status` report "plaintext" and `wallet encrypt`
+  // wrap it in a new envelope, after which decrypt failed.
+  if (isForeignEnvelope(parsed)) {
+    return {
+      kind: "malformed",
+      error: `encrypted wallet file version ${parsed.v} is not supported (this build reads v${ENVELOPE_VERSION})`,
+    };
+  }
   return { kind: "plain", value: parsed };
 }
 

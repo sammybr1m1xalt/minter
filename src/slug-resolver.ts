@@ -36,7 +36,11 @@ async function htmlScrapeCollection(slug: string, timeoutMs = 10000): Promise<{ 
   // against it, so an unprovenanced address is refused rather than used.
   const contractsIdx = html.indexOf('"contracts":[');
   if (contractsIdx < 0) return null;
-  const window = html.slice(contractsIdx, contractsIdx + 1500);
+  // The window has to reach the collection's own address. 1500 chars was far too
+  // small: measured on live collection pages the first `"address"` inside the
+  // contracts block sits 33-39k characters after it, so this fallback never
+  // matched and resolveSlug's last resort was dead.
+  const window = html.slice(contractsIdx, contractsIdx + 100_000);
   const addrM = window.match(/"address":"(0x[a-fA-F0-9]{40})"/);
   const chainM = window.match(/"identifier":"([\w-]+)"/);
   if (!addrM || /^0x0+$/.test(addrM[1])) return null; // zero-address = placeholder
@@ -249,7 +253,10 @@ export async function resolveSlug(
 }
 
 export function isSlug(input: string): boolean {
-  return !input.startsWith("0x");
+  // Case-insensitive: "0X…" is an address too. Treating it as a slug sent it to
+  // resolveSlug (which answers "OpenSea doesn't know about it") and skipped the
+  // on-chain contract check the wizard gates on !isSlug.
+  return !/^0x/i.test(input.trim());
 }
 
 // ── Contract address → OpenSea slug (for drops endpoint) ────────────────────
@@ -282,7 +289,7 @@ export async function resolveContractToSlug(
 ): Promise<string | null> {
   // The SeaDrop singleton is not a collection and has no slug. Refuse it here
   // rather than letting a downstream step discover the synthetic identifier.
-  if (nftContract.toLowerCase() === SEADROP_SINGLETON) {
+  if (nftContract.toLowerCase() === SEADROP_SINGLETON.toLowerCase()) {
     console.error(
       "[resolveContractToSlug] The address is the SeaDrop singleton — a shared minter, " +
         "not a collection. It has no slug; target the collection's own contract instead."
@@ -325,9 +332,13 @@ export async function resolveContractToSlug(
       console.error("[resolveContractToSlug] GraphQL returned no hits for", nftContract);
     } else {
       const wanted = nftContract.toLowerCase();
-      // Prefer an exact address match; a chain match is a weaker but usable signal.
-      const exact = hits.find((h) => (h.address || "").toLowerCase() === wanted);
-      const chosen = exact || hits.find((h) => h.address);
+      // An exact address match is the only match that identifies a collection.
+      // OpenSea's shared storefront (0x495f9472…) alone is used by 35+
+      // collections, so a fuzzy hit is an arbitrary pick and every later step
+      // (SIWE, eligibility, payload) would run against the wrong collection.
+      // The "chain match is a weaker but usable signal" this comment used to
+      // promise is not a substitute for identity.
+      const chosen = hits.find((h) => (h.address || "").toLowerCase() === wanted);
       if (chosen?.slug) {
         // Reject GraphQL's synthetic placeholder for a contract that is not a
         // collection. Passing it downstream resolves to the wrong chain.
@@ -338,16 +349,13 @@ export async function resolveContractToSlug(
           );
           return null;
         }
-        if (!exact) {
-          console.error(
-            `[resolveContractToSlug] ⚠ no exact address match for ${nftContract}; ` +
-              `using ${chosen.slug} (${chosen.address}) — verify before minting.`
-          );
-        } else {
-          console.error("[resolveContractToSlug] GraphQL found slug:", chosen.slug);
-        }
+        console.error("[resolveContractToSlug] GraphQL found slug:", chosen.slug);
         return chosen.slug;
       }
+      console.error(
+        `[resolveContractToSlug] no exact address match for ${nftContract} ` +
+          `(${hits.length} fuzzy hit(s)) — refusing to guess a collection.`
+      );
       console.error("[resolveContractToSlug] GraphQL hits had no usable slug/address:", hits.length);
     }
   } catch (err: any) {
