@@ -32,10 +32,12 @@ try {
   // route is blackholed stays unreachable.
 }
 
-// Repo .env first; a .env in the CWD overrides it so a user can point at a
-// different config without editing the repo.
+// Repo .env first. A .env in the CWD is read too, but WITHOUT `override`: an
+// environment variable that was actually exported must win over a file, or a
+// stray .env in whatever directory the CLI was launched from silently
+// discards the operator's settings.
 dotenv.config({ path: path.resolve(repoRoot, ".env") });
-dotenv.config({ path: path.resolve(process.cwd(), ".env"), override: true });
+dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 import { createRunLogger } from "./logger";
 import { runLoggerCli } from "./log-reader";

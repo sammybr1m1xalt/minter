@@ -833,6 +833,12 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       status: string;
     }[] = [];
 
+    // Wallets already offered by the wave-1 sale, and that sale's tail. Both are
+    // declared here because the onWave callback (inside the snipe call below)
+    // and the post-run sell step (further down) both need them.
+    const soldWalletIndexes = new Set<number>();
+    let sellChain: Promise<void> = Promise.resolve();
+
     if (phaseEligibility.mode === "public") {
       // Public phase — on-chain calldata, no OpenSea needed
       const attempt = await buildLocalMintPlanOnAnyRpc(rpcUrls, mintContract, quantity);
@@ -975,7 +981,45 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
           });
           return report?.walletMintable ?? null;
         },
+        // Sell the wallets that were ready at T-0 as soon as they are minted.
+        // A wallet whose payload never arrives holds the run open for its full
+        // retry window, and the sell step runs after the snipe returns — so one
+        // dead wallet delayed the sale of every wallet that did mint. Only
+        // confirmed SUCCESS wallets are sold here; UNKNOWN ones wait for the
+        // receipt re-check.
+        onWave: (wave, waveResults) => {
+          if (!sellPlan?.enabled || wave !== 1) return;
+          const outcomes = waveResults
+            .map((r) => ({
+              walletIndex: r.walletIndex,
+              address: r.walletAddress,
+              txHash: r.txHash ?? null,
+              status:
+                r.status ??
+                (r.receipt?.status === "REVERTED" ? "REVERTED" : r.success ? "SUCCESS" : "FAILED"),
+            }))
+            .filter((o) => o.status === "SUCCESS" && o.txHash && !soldWalletIndexes.has(o.walletIndex));
+          if (outcomes.length === 0) return;
+          for (const o of outcomes) soldWalletIndexes.add(o.walletIndex);
+          sellChain = sellChain.then(() =>
+            runSellAfterMint({
+              sellPlan,
+              walletKeys,
+              contract: mintContract,
+              slug: slug!,
+              chainKey,
+              apiKey: apiKey ?? "",
+              rpcUrl: rpcUrls[0],
+              chainId: chainProfile.chainId,
+              symbol: chainProfile.nativeSymbol,
+              mintOutcomes: outcomes,
+            })
+          );
+        },
       });
+      // The wave-1 sale runs concurrently with the straggler tail; make sure it
+      // has finished before the post-run sale so the two never overlap.
+      await sellChain;
       mintOutcomes = snipeResults.map((r) => ({
         walletIndex: r.walletIndex,
         address: r.walletAddress,
@@ -1045,7 +1089,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         rpcUrl: rpcUrls[0],
         chainId: chainProfile.chainId,
         symbol: chainProfile.nativeSymbol,
-        mintOutcomes,
+        mintOutcomes: mintOutcomes.filter((o) => !soldWalletIndexes.has(o.walletIndex)),
       });
     }
   } finally {

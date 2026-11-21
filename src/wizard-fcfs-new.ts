@@ -799,6 +799,22 @@ export async function runFcfsBranch(
     preFetched.push(...fetched);
   }
 
+  // Wallets already offered by the wave-1 sale, and that sale's tail. Both are
+  // declared before the snipe because the onWave callback closes over them.
+  const soldWalletIndexes = new Set<number>();
+  let sellChain: Promise<void> = Promise.resolve();
+  const toSellOutcomes = (rs: SnipeResult[]) =>
+    rs.map((r) => ({
+      walletIndex: r.walletIndex,
+      address: r.walletAddress,
+      txHash: r.txHash ?? null,
+      status:
+        // Prefer the confirmed tri-state from the snipe; fall back to the old
+        // derivation for results built before the receipt stage.
+        r.status ??
+        (r.receipt?.status === "REVERTED" ? "REVERTED" : r.success ? "SUCCESS" : "FAILED"),
+    }));
+
   const snipeResults = await executeFcfsSnipe({
     nftContract,
     quantity,
@@ -847,7 +863,40 @@ export async function runFcfsBranch(
       });
       return report?.walletMintable ?? null;
     },
+    // Sell the wallets that were ready at T-0 as soon as they are minted,
+    // rather than after the whole run. A wallet whose payload never arrives
+    // holds the run open for its full retry window, and the sell step runs
+    // after the snipe returns — so one dead wallet delayed the sale of every
+    // wallet that did mint. Only confirmed SUCCESS wallets are sold here;
+    // UNKNOWN ones wait for the receipt re-check below, so a late-landing mint
+    // is never wrongly skipped.
+    onWave: (wave, waveResults) => {
+      if (!sellPlan || wave !== 1) return;
+      const outcomes = toSellOutcomes(waveResults).filter(
+        (o) => o.status === "SUCCESS" && o.txHash && !soldWalletIndexes.has(o.walletIndex)
+      );
+      if (outcomes.length === 0) return;
+      for (const o of outcomes) soldWalletIndexes.add(o.walletIndex);
+      sellChain = sellChain.then(() =>
+        runSellAfterMint({
+          sellPlan,
+          walletKeys,
+          contract: nftContract,
+          slug: effectiveSlug!,
+          chainKey,
+          apiKey: apiKey ?? "",
+          rpcUrl: rpcUrls[0],
+          chainId: chainProfile.chainId,
+          symbol: chainProfile.nativeSymbol,
+          mintOutcomes: outcomes,
+        })
+      );
+    },
   });
+
+  // The wave-1 sale runs concurrently with the straggler tail; make sure it has
+  // finished before the post-run sale so the two never overlap on a wallet.
+  await sellChain;
 
   // ── Step 13b: re-ask the chain about wallets whose receipt was never read ──
   // `waitForReceipt` gives up after 60s, and the sell step below skips
@@ -870,20 +919,7 @@ export async function runFcfsBranch(
       rpcUrl: rpcUrls[0],
       chainId: chainProfile.chainId,
       symbol: chainProfile.nativeSymbol,
-      mintOutcomes: snipeResults.map((r) => ({
-        walletIndex: r.walletIndex,
-        address: r.walletAddress,
-        txHash: r.txHash ?? null,
-        status:
-          // Prefer the confirmed tri-state from the snipe; fall back to the
-          // old derivation for results built before the receipt stage.
-          r.status ??
-          (r.receipt?.status === "REVERTED"
-            ? "REVERTED"
-            : r.success
-              ? "SUCCESS"
-              : "FAILED"),
-      })),
+      mintOutcomes: toSellOutcomes(snipeResults).filter((o) => !soldWalletIndexes.has(o.walletIndex)),
     });
   }
 }

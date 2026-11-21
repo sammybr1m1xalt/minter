@@ -1163,6 +1163,18 @@ export interface ExecuteSnipeOpts {
    */
   phaseOpensInFuture?: boolean;
   /**
+   * Notified after each wave's mints have been blasted, with that wave's
+   * results so far. Called without being awaited, so a slow consumer cannot
+   * delay the next wave.
+   *
+   * This exists because a wallet whose payload never arrives used to hold the
+   * whole run open for its full retry window, and the sell-after-mint step runs
+   * after the snipe returns — so one dead wallet delayed the sale of every
+   * wallet that had already minted. Selling on wave 1 while wave 2 is still
+   * settling is the fix.
+   */
+  onWave?: (wave: number, results: SnipeResult[]) => void;
+  /**
    * The stage the user selected. A payload whose own stage identity is known
    * and differs from this is refused rather than broadcast — firing a calldata
    * for a stage the user did not pick is the failure this guards.
@@ -2252,7 +2264,25 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   };
 
   // ── Wave 1: whoever is ready at T-0 ────────────────────────────────────────
+  const notifyWave = (wave: number) => {
+    if (!opts.onWave) return;
+    const snapshot = results.filter((r): r is SnipeResult => r != null);
+    try {
+      const out = opts.onWave(wave, snapshot) as unknown;
+      // Not awaited, so a slow consumer cannot delay the next wave — but an
+      // unhandled rejection would still crash the run.
+      if (out && typeof (out as Promise<void>)?.then === "function") {
+        (out as Promise<void>).catch((e: any) => {
+          console.log(chalk.gray(`  ⚠ onWave(${wave}) consumer failed: ${e?.message ?? e}`));
+        });
+      }
+    } catch (e: any) {
+      console.log(chalk.gray(`  ⚠ onWave(${wave}) threw: ${e?.message ?? e}`));
+    }
+  };
+
   await fireWave(ready);
+  notifyWave(1);
 
   // ── Wave 2: payloads that landed after the gate ────────────────────────────
   // Waited on only after the first wave has been blasted, so a late payload
@@ -2263,6 +2293,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
       chalk.gray(`  Firing ${lateWave.length} wallet(s) whose payload arrived after T-0...`)
     );
     await fireWave(lateWave);
+    notifyWave(2);
   }
 
   return results.filter((r): r is SnipeResult => r != null);
