@@ -78,6 +78,11 @@ const T0_PAYLOAD_RETRY_MS = 250;
 const T0_PAYLOAD_BACKOFF_AFTER_MS = 3_000;
 const T0_PAYLOAD_BACKOFF_MS = 2_000;
 const T0_PAYLOAD_MAX_ATTEMPTS = 80;
+// How long the first wave waits for held-back wallets' payloads before firing
+// without them. Short on purpose: the pre-poll has already spent 30s, so a
+// payload that has not landed by T-0 is usually a wallet that will never get
+// one, and every second here is taken from the wallets that ARE ready.
+const T0_PAYLOAD_GATE_MS = 1_500;
 
 // Pre-poll window: how far before T-0 to start trying to fetch signed payloads.
 //
@@ -1826,31 +1831,45 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
 
   // Wallets held back for a future phase get their payload fetched HERE, after
   // the wait. OpenSea signs a mint only for a live stage, so this is the first
-  // moment the payload can exist. A short retry window covers the lag between
-  // the on-chain start and OpenSea's signer coming online.
+  // moment the payload can exist. A retry window covers the lag between the
+  // on-chain start and OpenSea's signer coming online.
+  //
+  // The fetches are STARTED but not awaited before the fire. A wallet with no
+  // payload must not hold back the ones that have one: the pre-poll already
+  // spent 30s trying, so a wallet still empty at T-0 is either ineligible or
+  // served by a signer that is down — and making the other wallets wait up to
+  // T0_PAYLOAD_WINDOW_MS for it loses their mints too.
+  //
+  // Whoever answers within the short gate joins the first wave; whoever answers
+  // after it is blasted in a second wave by the same code path. A wallet whose
+  // retry budget runs out is recorded as failed and never blocks anything.
+  const stragglerRuns: Promise<void>[] = [];
+  const lateWave: ReadyTx[] = [];
+  const decided = new Set<number>();
+  // Assigned synchronously by the promise executor below; the no-op default
+  // keeps the type from narrowing to null at the call site.
+  let notifyAllDecided: () => void = () => {};
+  const allStragglersDecided = new Promise<void>((resolve) => {
+    notifyAllDecided = resolve;
+  });
   if (pendingAtT0.length > 0) {
     console.log(
       `  Phase is live — fetching signed payloads for ${pendingAtT0.length} wallet(s)...`
     );
-    const fetched = await Promise.all(
-      pendingAtT0.map(async ({ walletIndex, addr }) => {
-        // Retry across a real window: the stage can be live on-chain several
-        // seconds before OpenSea's signer will issue a payload for it, and a
-        // wallet that is not allowlisted gets the same null as a signer that is
-        // still warming up — the two are indistinguishable from the response.
-        //
-        // 4 attempts × 8s was ~36s of wall clock but only ~4s of actual
-        // retrying, because a fast null returns immediately. That is not enough
-        // to cover signer lag. This now retries for up to T0_PAYLOAD_WINDOW_MS
-        // with a short gap, which keeps a genuine "not allowlisted" answer from
-        // spinning forever (it returns as soon as two consecutive attempts agree
-        // there is no payload AND the stage has been live for a while) while
-        // still riding out a slow signer.
-        let payload: FcfsSignedPayload | null = null;
-        let lastErr: string | null = null;
-        const startedAt = Date.now();
-        let attempt = 0;
-        for (;;) {
+    for (const { walletIndex, addr } of pendingAtT0) {
+      stragglerRuns.push(
+        (async () => {
+          // Retry across a real window: the stage can be live on-chain several
+          // seconds before OpenSea's signer will issue a payload for it, and a
+          // wallet that is not allowlisted gets the same null as a signer that
+          // is still warming up — the two are indistinguishable from the
+          // response.
+          let payload: FcfsSignedPayload | null = null;
+          let lastErr: string | null = null;
+          const startedAt = Date.now();
+          let attempt = 0;
+          try {
+            for (;;) {
           attempt++;
           if (attempt > 1) {
             // Fast while signer lag is still plausible, then back off.
@@ -1894,7 +1913,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
               (lastErr ? ` — last error: ${lastErr}` : " — OpenSea did not return signed data."),
             retryable: true,
           };
-          return null;
+          return;
         }
         if (!isPayloadBoundToWallet(payload, addr)) {
           results[walletIndex] = {
@@ -1903,39 +1922,55 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
             success: false,
             error: `T-0 payload for ${addr} is bound to a different wallet — refusing to broadcast.`,
           };
-          return null;
+          return;
         }
         // Same stage check — the T-0 fetch is the one that discovers a future
         // phase's real stage, so it is where a mismatch is most likely.
         const refused = stageRefusal(payload, walletIndex, addr, opts.expectedStage);
         if (refused) {
           results[walletIndex] = refused;
-          return null;
+          return;
         }
-        return { walletIndex, addr, payload };
-      })
-    );
-
-    // Promote the successful fetches into the ready set so the blast below
-    // treats them exactly like wallets that had a payload all along.
-    for (const entry of fetched) {
-      if (!entry) continue;
-      ready.push({
-        walletIndex: entry.walletIndex,
-        addr: entry.addr,
-        to: entry.payload.seaDropAddress,
-        data: entry.payload.mintData,
-        value: entry.payload.value,
-        gasLimit: gasLimit || SIGNED_GAS_FLOOR,
-      });
+        lateWave.push({
+          walletIndex,
+          addr,
+          to: payload.seaDropAddress,
+          data: payload.mintData,
+          value: payload.value,
+          gasLimit: gasLimit || SIGNED_GAS_FLOOR,
+        });
+          } catch (e: any) {
+            results[walletIndex] = {
+              walletIndex,
+              walletAddress: addr,
+              success: false,
+              error: `T-0 payload fetch failed: ${e?.message ?? e}`,
+              retryable: true,
+            };
+          } finally {
+            decided.add(walletIndex);
+            if (decided.size === pendingAtT0.length) notifyAllDecided();
+          }
+        })()
+      );
     }
+    // Short gate. If everyone has answered, go now; otherwise give the
+    // stragglers this long to land, then fire with whoever is in hand.
+    await Promise.race([
+      allStragglersDecided,
+      new Promise((r) => setTimeout(r, T0_PAYLOAD_GATE_MS)),
+    ]);
+    // Take everything settled so far and empty the array: pushes landing after
+    // this belong to the second wave.
+    ready.push(...lateWave.splice(0));
   }
 
-  // The wait may have produced no ready wallets at all (every wallet was held
-  // back and every T-0 fetch failed) — nothing to blast.
-  if (ready.length === 0) {
-    return results.filter((r): r is SnipeResult => r != null);
-  }
+  // ── The fire, as a closure over this run's state ────────────────────────────
+  // Local rather than module-level so it can read the wallets, chain, fees,
+  // providers and results without a ten-argument signature. It runs once per
+  // wave: the wallets ready at T-0, then any whose payload landed late.
+  const fireWave = async (wave: ReadyTx[]): Promise<void> => {
+    if (wave.length === 0) return;
 
   // The chainId is passed explicitly. Without it ethers performs a network
   // detection (eth_chainId) on the first request — an extra round trip inside
@@ -1975,7 +2010,7 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     };
   }[] = [];
   try {
-    await Promise.all(ready.map(async (r) => {
+    await Promise.all(wave.map(async (r) => {
       const w = new Wallet(walletKeys[r.walletIndex]);
       try {
         const [sim, est] = await Promise.all([
@@ -2208,6 +2243,21 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
       error,
       dispatchedAt,
     };
+  }
+  };
+
+  // ── Wave 1: whoever is ready at T-0 ────────────────────────────────────────
+  await fireWave(ready);
+
+  // ── Wave 2: payloads that landed after the gate ────────────────────────────
+  // Waited on only after the first wave has been blasted, so a late payload
+  // costs the run nothing it had not already lost.
+  await Promise.all(stragglerRuns);
+  if (lateWave.length > 0) {
+    console.log(
+      chalk.gray(`  Firing ${lateWave.length} wallet(s) whose payload arrived after T-0...`)
+    );
+    await fireWave(lateWave);
   }
 
   return results.filter((r): r is SnipeResult => r != null);

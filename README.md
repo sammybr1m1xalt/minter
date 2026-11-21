@@ -792,6 +792,15 @@ Both of those were wrong: the poll ran from the moment the run started (a
 ten-minute schedule polled for nine and a half minutes) and the wait then slept
 the original delay again, so a drop scheduled at T+100s fired at T+170s.
 
+At T-0 the remaining wallets are fetched in the background and the fire is **not**
+gated on them. Whoever answers within a 1.5s gate joins the first wave; whoever
+answers after it is blasted in a second wave by the same code path once the
+first has gone out. One wallet with no payload — ineligible, or served by a
+signer that is down — used to hold back every other wallet for the full 30s
+retry window, losing their mints too. Measured on a two-wallet run with one
+payload 6s late: the ready wallet fired at **T+1.5s** instead of T+6s, and the
+late one still minted at T+6s.
+
 ### A mint that lands late
 
 The receipt poll gives up after 60s, and the sell step only sells a wallet whose
