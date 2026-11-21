@@ -804,6 +804,42 @@ Measured, two wallets with one payload 6s late: the ready wallet fired at
 **T+271ms** instead of T+6s, and the late one still minted at T+6s. With both
 payloads late by 300ms or by 6s, both still leave in a single blast.
 
+### Reveal scan (`--reveal-scan`)
+
+    minter --reveal-scan <contract> [--chain ethereum] [--rpc <url>]
+           [--blocks <n>] [--ids 1,2,3] [--gateway <url>]
+
+Answers whether a drop's token-id → artwork mapping is actually private. It
+reads only public data: `baseURI()`, `contractURI()`, a sample of
+`tokenURI(id)`, and whatever IPFS/Arweave CIDs those already point at. It does
+not call a non-public endpoint, enumerate unpublished data, or try to reach
+anything that is not already world-readable.
+
+The checks, in order:
+
+  1. `baseURI` trailing slash — the reveal switch. No slash means every token
+     returns one placeholder and there is no per-token metadata to find.
+  2. `contractURI` — often carries a metadata base or the token directory.
+  3. `tokenURI(id)` sample — distinct values while `baseURI` is hidden means
+     per-token metadata is already being served.
+  4. IPFS/Arweave resolution — the high-value one. A CID resolving to a
+     *directory* of per-token JSONs is the full mapping, published, whether or
+     not the contract calls itself revealed. A CID resolving to one JSON is
+     just the placeholder. Directory indexes are read as a bounded prefix
+     (256KB) because a 10,000-entry index is megabytes.
+  5. A bounded log sweep (`--blocks`) for `ipfs://` / `ar://` references.
+
+Verdicts: `HIDDEN`, `PARTIAL`, `PUBLIC`, `UNKNOWN`. Exit code 1 only for
+`PUBLIC` — a scanner that finds nothing is the success case.
+
+For a genuine OpenSea Studio drop the answer is `HIDDEN`: OpenSea holds the
+files privately until the reveal, so there is nothing to read before it. The
+`PUBLIC` cases are a creator who uploaded to IPFS first and only "revealed" by
+repointing `baseURI`, a commit-reveal seed left on-chain, or an indexer lag
+between the metadata going public and OpenSea catching up. What you do with a
+`PUBLIC` finding is a supply question, not a rarity one — IDs are sequential, so
+the mapping gives you a position to target.
+
 ### A mint that lands late
 
 The receipt poll gives up after 60s, and the sell step only sells a wallet whose

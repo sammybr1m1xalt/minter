@@ -43,6 +43,7 @@ import { runConfirmCli } from "./confirm-cli";
 import { runWalletCli } from "./wallet-cli";
 import { recordInvocationEnd, recordInvocationStart } from "./invocation-log";
 import { runDoctor } from "./doctor";
+import { runRevealScanCli } from "./reveal-scan-cli";
 import { runWizard, runFcfsBranchCli, runEligibilityCheck } from "./wizard";
 import { runScatterBranchCli } from "./scatter-mint";
 import { closePrompts } from "./prompt";
@@ -230,6 +231,19 @@ async function main(): Promise<void> {
       process.exit(code);
     } catch (e: any) {
       console.error(chalk.red(`\n❌ logger failed: ${e?.message ?? e}\n`));
+      closePrompts();
+      process.exit(1);
+    }
+  }
+
+  // Reveal scan runs alone: read-only reconnaissance, not a mint mode.
+  if (args.includes("--reveal-scan")) {
+    try {
+      const code = await runRevealScanCli(args.filter((a) => a !== "--reveal-scan"));
+      closePrompts();
+      process.exit(code);
+    } catch (e: any) {
+      console.error(chalk.red(`\n❌ reveal-scan failed: ${e?.message ?? e}\n`));
       closePrompts();
       process.exit(1);
     }
