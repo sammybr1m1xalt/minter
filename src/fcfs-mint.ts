@@ -1436,12 +1436,15 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
   // ── Pre-read nonces while there is time ────────────────────────────────────
   //
   // The nonce is not "unknowable ahead of time" — a wallet that has not sent a
-  // transaction during the wait has a stable pending nonce, and reading it now
-  // removes one RPC round trip from the T-0 critical path. It is still re-read
-  // at T-0 (see phase 2): a wallet that sent something while we waited must use
-  // the newer value, and broadcasting with a stale nonce produces a stuck tx.
+  // transaction during the wait has a stable pending nonce, and reading it here
+  // removes the slowest of the three reads from the T-0 critical path
+  // (361-403ms against ~307ms for the simulation and the estimate). The value is
+  // used as-is at T-0.
   //
-  // This is a pure latency optimisation — the T-0 read remains authoritative.
+  // A wallet that sent something during the wait makes it stale. That is
+  // recovered after the blast rather than prevented before it: every endpoint
+  // rejects a stale nonce, and repairStaleNonces re-reads the nonce and
+  // re-blasts the same transaction. See the fire block.
   const prewarmedNonces = new Map<number, number>();
   // One provider per endpoint, created up front. Each wallet then walks the
   // list until one answers: pinning every wallet to rpcUrls[0] meant a single
