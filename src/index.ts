@@ -46,6 +46,7 @@ import { runWalletCli } from "./wallet-cli";
 import { recordInvocationEnd, recordInvocationStart } from "./invocation-log";
 import { runDoctor } from "./doctor";
 import { runRevealScanCli } from "./reveal-scan-cli";
+import { runScanCli } from "./scan-cli";
 import { runWizard, runFcfsBranchCli, runEligibilityCheck } from "./wizard";
 import { runScatterBranchCli } from "./scatter-mint";
 import { closePrompts } from "./prompt";
@@ -233,6 +234,19 @@ async function main(): Promise<void> {
       process.exit(code);
     } catch (e: any) {
       console.error(chalk.red(`\n❌ logger failed: ${e?.message ?? e}\n`));
+      closePrompts();
+      process.exit(1);
+    }
+  }
+
+  // Site scan runs alone: read-only reconnaissance, not a mint mode.
+  if (args.includes("--scan")) {
+    try {
+      const code = await runScanCli(args.filter((a) => a !== "--scan"));
+      closePrompts();
+      process.exit(code);
+    } catch (e: any) {
+      console.error(chalk.red(`\n❌ scan failed: ${e?.message ?? e}\n`));
       closePrompts();
       process.exit(1);
     }
