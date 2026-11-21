@@ -78,11 +78,13 @@ const T0_PAYLOAD_RETRY_MS = 250;
 const T0_PAYLOAD_BACKOFF_AFTER_MS = 3_000;
 const T0_PAYLOAD_BACKOFF_MS = 2_000;
 const T0_PAYLOAD_MAX_ATTEMPTS = 80;
-// How long the first wave waits for held-back wallets' payloads before firing
-// without them. Short on purpose: the pre-poll has already spent 30s, so a
-// payload that has not landed by T-0 is usually a wallet that will never get
-// one, and every second here is taken from the wallets that ARE ready.
-const T0_PAYLOAD_GATE_MS = 1_500;
+// A brief coalescing window after the FIRST payload lands, so wallets whose
+// payloads arrive milliseconds apart still go out in one blast rather than one
+// wave each. Deliberately not a fixed gate: the old flat 1.5s made a wallet
+// that was ready now wait for a straggler, and the pre-poll has already spent
+// 30s trying, so a payload that has not landed by T-0 is usually one that will
+// never land.
+const T0_PAYLOAD_COALESCE_MS = 200;
 
 // Pre-poll window: how far before T-0 to start trying to fetch signed payloads.
 //
@@ -1954,11 +1956,14 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         })()
       );
     }
-    // Short gate. If everyone has answered, go now; otherwise give the
-    // stragglers this long to land, then fire with whoever is in hand.
+    // Fire the moment the first payload is in hand, then give the others a
+    // brief chance to join the same blast. `Promise.race(stragglerRuns)` is
+    // what makes this "as soon as ready" rather than a fixed delay; the second
+    // race only coalesces the stragglers that were already about to land.
+    await Promise.race(stragglerRuns);
     await Promise.race([
       allStragglersDecided,
-      new Promise((r) => setTimeout(r, T0_PAYLOAD_GATE_MS)),
+      new Promise((r) => setTimeout(r, T0_PAYLOAD_COALESCE_MS)),
     ]);
     // Take everything settled so far and empty the array: pushes landing after
     // this belong to the second wave.

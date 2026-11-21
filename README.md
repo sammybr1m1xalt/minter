@@ -793,13 +793,16 @@ ten-minute schedule polled for nine and a half minutes) and the wait then slept
 the original delay again, so a drop scheduled at T+100s fired at T+170s.
 
 At T-0 the remaining wallets are fetched in the background and the fire is **not**
-gated on them. Whoever answers within a 1.5s gate joins the first wave; whoever
-answers after it is blasted in a second wave by the same code path once the
-first has gone out. One wallet with no payload — ineligible, or served by a
-signer that is down — used to hold back every other wallet for the full 30s
-retry window, losing their mints too. Measured on a two-wallet run with one
-payload 6s late: the ready wallet fired at **T+1.5s** instead of T+6s, and the
-late one still minted at T+6s.
+gated on them. The fire goes out the moment the first payload is in hand, with a
+200ms coalescing window so wallets whose payloads arrive milliseconds apart
+still leave in one blast; a wallet whose payload lands after that is blasted in a
+second wave by the same code path once the first has gone out. One wallet with no
+payload — ineligible, or served by a signer that is down — used to hold back
+every other wallet for the full 30s retry window, losing their mints too.
+
+Measured, two wallets with one payload 6s late: the ready wallet fired at
+**T+271ms** instead of T+6s, and the late one still minted at T+6s. With both
+payloads late by 300ms or by 6s, both still leave in a single blast.
 
 ### A mint that lands late
 
