@@ -635,9 +635,28 @@ endpoint costs you the ordering, never the mint.
 
 The same signed transaction goes to every endpoint. Only one can include it, so
 a second wave is a re-send of an identical transaction, not a competing one; it
-cannot consume the nonce twice. Nonces are pre-read during the wait, walking
-every endpoint in turn on a best-effort basis, and re-read after it; only the
-wallets whose nonce actually moved are re-signed.
+cannot consume the nonce twice.
+
+Nonces are pre-read during the wait, walking every endpoint in turn on a
+best-effort basis, and that value is used as-is at T-0. The old code re-read it
+at T-0 and used the fresh value; that re-read measured as the slowest of the
+three reads in the fire block (361-403ms against ~307ms for the simulation and
+the estimate), and the nonce is the one value there that is usually stable — a
+wallet that sent nothing during the wait has a stable pending nonce.
+
+A wallet that did send something therefore broadcasts under a stale nonce. That
+is recoverable, not silent: every endpoint rejects the broadcast with a nonce
+error, and the repair pass re-reads the nonce and re-blasts the *same*
+transaction — only the nonce and the signature over it change. Two cases are
+deliberately never repaired. A non-nonce rejection (a revert, a closed stage) is
+not fixed by a different nonce, and `already known` means that node already has
+the tx and it is propagating, so re-blasting it under a new nonce would create a
+second transaction for the same wallet.
+
+The T-0 payload retry is fast at first and then backs off: 250ms gaps for the
+first 3s (signer lag is a startup phenomenon), then the old 2s cadence. A flat
+short gap would spend the whole retry window against a rate bucket shared by
+every key on the account.
 
 ### Building the plan across endpoints
 

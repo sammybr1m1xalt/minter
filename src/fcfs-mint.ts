@@ -32,7 +32,7 @@
 
 import chalk from "chalk";
 import { Wallet, JsonRpcProvider } from "ethers";
-import { parseRpcEndpoints, prepareBlast, blastToAll, waitForReceipt, type PreparedBlast } from "./rpc-blast";
+import { parseRpcEndpoints, prepareBlast, blastToAll, waitForReceipt, type PreparedBlast, type BlastResult } from "./rpc-blast";
 import { resolveChain } from "./chains";
 import { fetchOnChainDrops } from "./seadrop-onchain";
 import type { DropPhase } from "./fcfs-drops";
@@ -67,8 +67,17 @@ const BLAST_FIRST_WAVE = 2;
 // genuinely ineligible wallet still fails in reasonable time. The per-request
 // timeout stays 8s, so one hung request cannot exceed the window by much.
 const T0_PAYLOAD_WINDOW_MS = 30_000;
-const T0_PAYLOAD_RETRY_MS = 2_000;
-const T0_PAYLOAD_MAX_ATTEMPTS = 15;
+// Signer lag is a STARTUP phenomenon: a signer that is warming up starts
+// answering within a few seconds, and a wallet that is not allowlisted never
+// will. So the first retries are fast (250ms — the old flat 2s could put the
+// second attempt 2s past T-0) and then back off to the old 2s cadence for the
+// long tail. A flat 250ms across the whole window would spend ~45 requests
+// against a rate bucket shared by every key on the account; this spends about
+// as many as before while being 8x quicker off the mark.
+const T0_PAYLOAD_RETRY_MS = 250;
+const T0_PAYLOAD_BACKOFF_AFTER_MS = 3_000;
+const T0_PAYLOAD_BACKOFF_MS = 2_000;
+const T0_PAYLOAD_MAX_ATTEMPTS = 80;
 
 // Pre-poll window: how far before T-0 to start trying to fetch signed payloads.
 //
@@ -1202,6 +1211,136 @@ export interface SnipeResult {
   dispatchedAt?: number;
 }
 
+// ── Nonce repair ────────────────────────────────────────────────────────────
+// Skipping the T-0 nonce read (see the fire block) is only safe if a stale nonce
+// is recoverable. It is: a nonce the network does not want is rejected by every
+// endpoint with a recognisable error, and the SAME transaction can be re-signed
+// under the correct nonce and blasted unchanged.
+//
+// Without this pass the optimisation would trade a ~90ms read for an occasionally
+// dead mint — the tx is not mined, nothing retries it, and the wallet simply
+// loses the mint.
+const STALE_NONCE_RE =
+  /nonce too low|nonce too high|nonce mismatch|incorrect nonce|replacement transaction underpriced/i;
+// "already known" means that node already has the tx — it is propagating, not
+// failing. Re-blasting under a different nonce would create a SECOND transaction
+// for the same wallet, so it must never trigger a repair.
+const ALREADY_IN_POOL_RE = /already known|already exists|transaction already/i;
+
+interface BlastVerdict {
+  b: {
+    walletIndex: number;
+    addr: string;
+    blast: PreparedBlast;
+    ctx: {
+      to: string;
+      data: string;
+      value: bigint;
+      gasLimit: number;
+      maxFeePerGas: bigint;
+      maxPriorityFeePerGas: bigint;
+      nonce: number;
+    };
+  };
+  dispatchedAt: number;
+  blastResults: BlastResult[];
+  accepted: BlastResult | null;
+  /** Set to the replacement nonce when this verdict is the result of a repair. */
+  nonceRepair?: number;
+}
+
+/**
+ * Re-read the nonce and re-blast the wallets whose every rejection was a nonce
+ * error. Returns the verdict list with those entries replaced.
+ *
+ * Only nonce errors qualify. A transport failure says nothing (there is no
+ * verdict to repair), and any other rejection — a genuine revert, a closed
+ * stage — is not fixed by a different nonce.
+ */
+async function repairStaleNonces(
+  verdicts: BlastVerdict[],
+  opts: {
+    walletKeys: string[];
+    chainId: number;
+    endpoints: RankedEndpoint[];
+    escalateAfterMs: number;
+  }
+): Promise<BlastVerdict[]> {
+  const repairable = verdicts.filter((v) => {
+    if (v.accepted) return false;
+    const errors = v.blastResults.map((r) => r.error).filter((e): e is string => !!e);
+    if (errors.length === 0) return false;
+    if (errors.some((e) => ALREADY_IN_POOL_RE.test(e))) return false;
+    return errors.some((e) => STALE_NONCE_RE.test(e));
+  });
+  if (repairable.length === 0) return verdicts;
+
+  const providers = opts.endpoints.map(
+    (ep) => new JsonRpcProvider(ep.url, opts.chainId, { staticNetwork: true, pollingInterval: 4000 })
+  );
+  try {
+    const position = new Map<number, number>();
+    verdicts.forEach((v, i) => position.set(v.b.walletIndex, i));
+    const out = [...verdicts];
+    await Promise.all(
+      repairable.map(async (v) => {
+        const idx = v.b.walletIndex;
+        let nonce: number | null = null;
+        for (const p of providers) {
+          try {
+            nonce = await withDeadlineOrThrow(
+              p.getTransactionCount(v.b.addr, "pending"),
+              2_000,
+              "nonce repair"
+            );
+            break;
+          } catch {
+            // Try the next endpoint.
+          }
+        }
+        // Could not tell, or the network already agrees with the nonce we used —
+        // neither is a stale-nonce case.
+        if (nonce == null || nonce === v.b.ctx.nonce) return;
+
+        const w = new Wallet(opts.walletKeys[idx]);
+        const signed = await w.signTransaction({
+          to: v.b.ctx.to,
+          data: v.b.ctx.data,
+          value: v.b.ctx.value,
+          gasLimit: v.b.ctx.gasLimit,
+          maxFeePerGas: v.b.ctx.maxFeePerGas,
+          maxPriorityFeePerGas: v.b.ctx.maxPriorityFeePerGas,
+          nonce,
+          chainId: opts.chainId,
+        });
+        const blastResults = await blastToAll(prepareBlast(signed), opts.endpoints, {
+          firstWave: BLAST_FIRST_WAVE,
+          escalateAfterMs: opts.escalateAfterMs,
+        }).responsePromise;
+        const accepted = blastResults.find((r) => r.txHash != null) ?? null;
+        const at = position.get(idx);
+        if (at === undefined) return;
+        out[at] = { ...v, blastResults, accepted, nonceRepair: nonce };
+        const short = `${v.b.addr.slice(0, 10)}…${v.b.addr.slice(-4)}`;
+        console.log(
+          accepted
+            ? chalk.yellow(`    ↻ nonce repair ${short}: ${v.b.ctx.nonce} → ${nonce} — re-blast accepted`)
+            : chalk.yellow(`    ↻ nonce repair ${short}: ${v.b.ctx.nonce} → ${nonce} — still rejected`)
+        );
+      })
+    );
+    return out;
+  } finally {
+    for (const p of providers) {
+      try {
+        p.destroy();
+      } catch {
+        // Already destroyed.
+      }
+    }
+  }
+}
+
 /**
  * Sleep until the target while keeping the RPC sockets alive.
  *
@@ -1711,7 +1850,12 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
         for (;;) {
           attempt++;
           if (attempt > 1) {
-            await new Promise((r) => setTimeout(r, T0_PAYLOAD_RETRY_MS));
+            // Fast while signer lag is still plausible, then back off.
+            const gap =
+              Date.now() - startedAt < T0_PAYLOAD_BACKOFF_AFTER_MS
+                ? T0_PAYLOAD_RETRY_MS
+                : T0_PAYLOAD_BACKOFF_MS;
+            await new Promise((r) => setTimeout(r, gap));
           }
           try {
             payload = await fetchSignedPayloadForWallet(
@@ -1810,12 +1954,28 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     staticNetwork: true,
     pollingInterval: 1000,
   });
-  const toBlast: { walletIndex: number; addr: string; blast: PreparedBlast }[] = [];
+  // `ctx` is kept so the nonce-repair pass can re-sign the same transaction
+  // without rebuilding it: to/data/value/gas/fees are all known here, and only
+  // the nonce (and the signature over it) changes.
+  const toBlast: {
+    walletIndex: number;
+    addr: string;
+    blast: PreparedBlast;
+    ctx: {
+      to: string;
+      data: string;
+      value: bigint;
+      gasLimit: number;
+      maxFeePerGas: bigint;
+      maxPriorityFeePerGas: bigint;
+      nonce: number;
+    };
+  }[] = [];
   try {
     await Promise.all(ready.map(async (r) => {
       const w = new Wallet(walletKeys[r.walletIndex]);
       try {
-        const [sim, est, nonceResult] = await Promise.all([
+        const [sim, est] = await Promise.all([
           // Tightly bounded: a simulation is a nice-to-have and must never be
           // able to eat the T-0 window. Inconclusive fails open below.
           simulateTx(fireProvider, { to: r.to, from: r.addr, data: r.data, value: r.value }, 2_000),
@@ -1828,23 +1988,27 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
             { to: r.to, from: r.addr, data: r.data, value: r.value },
             2_000
           ),
-          // Bounded like its two siblings. ethers has no timeout option and its
-          // FetchRequest defaults to 300s with 429 backoff, so an unbounded nonce
-          // read would hold the entire T-0 batch on one stalled endpoint.
-          //
-          // The prewarmed nonce is used as the fallback: if this read times out
-          // but we read the nonce before the wait, the tx can still go out with
-          // a known-good value instead of being dropped.
-          withDeadlineOrThrow(
+        ]);
+        // The nonce is the one read here whose value is usually stable, and it
+        // measured as the SLOWEST of the three (361-403ms p50 against ~307ms for
+        // the simulation and the estimate). Prefer the value read before the
+        // wait; only fall back to a T-0 read when there is no prewarmed value.
+        //
+        // A wallet that sent something during the wait makes that value stale.
+        // That case is not silent: every endpoint rejects the broadcast with a
+        // nonce error, and the repair pass after the blast re-reads the nonce
+        // and re-blasts the same transaction. So the stale case costs one extra
+        // round trip rather than costing every wallet its T-0 read.
+        const nonce =
+          prewarmedNonces.get(r.walletIndex) ??
+          (await withDeadlineOrThrow(
             fireProvider.getTransactionCount(r.addr, "pending"),
             2_000,
             "nonce"
-          ).catch(() => prewarmedNonces.get(r.walletIndex) ?? null),
-        ]);
-        const nonce = nonceResult;
+          ).catch(() => null));
         if (nonce == null) {
           // No nonce from either read — without one the tx cannot be built.
-          throw new Error("Could not read a nonce at T-0 (RPC timed out and no prewarmed value).");
+          throw new Error("Could not read a nonce (RPC timed out and no prewarmed value).");
         }
 
         // An INDETERMINATE result (timeout, network error) is not evidence the tx
@@ -1879,7 +2043,20 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
           nonce,
           chainId,
         });
-        toBlast.push({ walletIndex: r.walletIndex, addr: r.addr, blast: prepareBlast(signed) });
+        toBlast.push({
+          walletIndex: r.walletIndex,
+          addr: r.addr,
+          blast: prepareBlast(signed),
+          ctx: {
+            to: r.to,
+            data: r.data,
+            value: r.value,
+            gasLimit: est ? Number(est.gasLimit) : r.gasLimit,
+            maxFeePerGas: est?.maxFeePerGas ?? maxFeePerGas,
+            maxPriorityFeePerGas: est?.maxPriorityFeePerGas ?? maxPriorityFeePerGas,
+            nonce,
+          },
+        });
       } catch (err: any) {
         results[r.walletIndex] = {
           walletIndex: r.walletIndex,
@@ -1930,17 +2107,32 @@ export async function executeFcfsSnipe(opts: ExecuteSnipeOpts): Promise<SnipeRes
     }).responsePromise,
   }));
 
-  const collected = await Promise.all(
+  // Verdicts first, with NO receipt waits. The nonce repair below must not be
+  // queued behind a 60s receipt poll.
+  const verdicts = await Promise.all(
     inflight.map(async ({ b, dispatchedAt, responsePromise }) => {
       const blastResults = await responsePromise;
+      const accepted = blastResults.find((r) => r.txHash != null) ?? null;
+      return { b, dispatchedAt, blastResults, accepted };
+    })
+  );
+
+  const repaired = await repairStaleNonces(verdicts, {
+    walletKeys,
+    chainId,
+    endpoints: blastEndpoints,
+    escalateAfterMs: 350,
+  });
+
+  const collected = await Promise.all(
+    repaired.map(async ({ b, dispatchedAt, blastResults, accepted }) => {
       // Pick the endpoint that actually accepted this wallet's tx — poll THAT
       // endpoint for the receipt so we don't burn time on one that never saw
       // the tx. Resolve by INDEX, never by label: labelFromUrl maps every URL
       // containing "alchemy" to "ALCHEMY" (likewise quicknode/infura/ankr), so a
       // label lookup returns the first match, which may not be the endpoint
-      // that accepted — and a receipt polled on the wrong endpoint comes back
+      // that accepted — and a receipt polled on a wrong endpoint comes back
       // null, reporting a landed mint as UNKNOWN.
-      const accepted = blastResults.find((r) => r.txHash != null);
       const acceptingEndpoint =
         accepted && accepted.index < blastEndpoints.length
           ? blastEndpoints[accepted.index]
