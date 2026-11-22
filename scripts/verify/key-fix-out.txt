@@ -1,0 +1,9 @@
+PASS  N1 non-numeric remaining reads as unknown (-1), not NaN — -1
+PASS  N2 non-numeric reset reads as 0 — 0
+PASS  N3 score stays finite — 999.5
+PASS  N4 remaining 0 is classified alive_but_exhausted — alive_but_exhausted
+PASS  N5 numeric headers survive — 42/1795331185
+PASS  N6 probe timeout bounded by the caller budget — 1802ms
+PASS  N7 timeout preserves the cached remaining_calls — 37
+PASS  N8 timeout preserves the cached reset time — 1795331185
+PASS  N9 timeout preserves the last real verdict — alive

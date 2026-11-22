@@ -1,0 +1,20 @@
+PASS  A1 restricted + reverting read reports the read failure — reading the allowed fee recipients from 127.0.0.1:33193 failed: missing revert data
+PASS  A2 ...and NOT 'none is allowed' — reading the allowed fee recipients from 127.0.0.1:33193 failed: missing revert data
+PASS  B restricted + empty list still refuses as none-allowed — 0x1111111111111111111111111111111111111111 restricts fee recipients and none is allowed — no public mint can be built
+PASS  C reverting read is never reported as a property of the drop — reading the allowed fee recipients from 127.0.0.1:33193 failed: missing revert data
+PASS  D allowed list is used — 0x00000000F9490004C11Cef243f5400493c00Ad63
+PASS  E sweep budget bounds 4 dead endpoints — 57ms (was up to 4x15s)
+PASS  F1 zero conduit key -> Seaport itself — {"operator":"0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"}
+PASS  F2 registered conduit -> its address — {"operator":"0x00000000F9490004C11Cef243f5400493c00Ad63"}
+PASS  F3 unregistered conduit -> error, not silent null — {"operator":null,"error":"the order's conduit key is not registered"}
+PASS  G1 HTTP 500 -> error — OpenSea answered HTTP 500
+PASS  G2 collection HTTP 500 -> error — OpenSea answered HTTP 500
+PASS  G3 empty book -> NO error (a real empty book) — null
+PASS  H1 unregistered conduit -> no transaction sent — 0 sent
+PASS  H2 ...and the token is recorded unsold with the reason — could not establish the approval target (the order's conduit key is not registered) — not selling
+PASS  I empty book is reported as an empty book — no offer clears the cost floor
+PASS  J1 happy path sends exactly one sale tx — 1 sent
+PASS  J2 net comes from the full order (0.02 ETH), not the 5 ETH listing — 20000000000000000
+PASS  J3 ...and it is recorded as sold with no error
+PASS  K1 failed approval -> no sale tx — 0 sent
+PASS  K2 ...and the reason is recorded — approval failed (missing revert data (action="estimateGas", data=null, reason=null, transaction={ "data": "0xa22cb46500000000000000000000000000000000f9490004c11cef243f5400493c00ad630000000000000000000000000000000000000000000000000000000000000001", "from": "0x62f94E9AC9349BCCC61Bfe66ddAdE6292702EcB6", "to": "0x1111111111111111111111111111111111111111" }, invocation=null, revert=null, code=CALL_EXCEPTION, version=6.17.0)) — not selling

@@ -1,0 +1,17 @@
+PASS  A1 detectPrice decodes a real reader — 1234567890000000
+PASS  A2 supportsInterface data is ABI-encoded — checked via screenMintContract below
+PASS  A3 maskRpc blanks the query string — https://rpc.example.com/v2/********
+PASS  A4 maskRpc blanks userinfo — https://host/v2
+PASS  A5 maskRpc masks a short path segment — https://example.com/v2/********
+PASS  A6 a 19-char credential is masked — ********
+PASS  A7 redactArgv catches 0X
+PASS  A8 redactArgv catches 63-hex
+PASS  A9 25:00 is refused
+PASS  A10 0:99 is refused
+PASS  A11 18:30 still parses
+PASS  A12 a v2 envelope is not 'plain' — malformed encrypted wallet file version 2 is not supported (this build reads v1)
+PASS  A13 onHost-like guard: isSlug catches 0X
+PASS  A14 a lookalike host is not Scatter — refused
+PASS  A15 a redirect-host URL is not Scatter — refused
+PASS  A16 the real host still parses — scatter
+PASS  A17 a scheme-less real host still parses — opensea
