@@ -102,6 +102,19 @@ function serve(root, port) {
   const keyed = await R.crawlTraits({ cid: "QmY", gateways: [gw], limit: 0, useCache: false, timeoutMs: 20000 });
   ok("object-keyed-by-id shape is read", keyed.source === "aggregate" && keyed.tokens.length === 2, `${keyed.tokens.length}`);
 
+  // A bare FILE CID: no directory at all, the CID itself is the aggregate file.
+  // Restore the array fixture first — the keyed test below overwrites it.
+  fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify(tokens));
+  const asFile = await R.crawlTraits({
+    cid: "metadata.json",
+    gateways: [`${gw}/QmX`],
+    limit: 0,
+    useCache: false,
+    timeoutMs: 20000,
+  });
+  ok("bare file CID is read as the file itself", asFile.source === "aggregate" && asFile.tokens.length === 10, `${asFile.tokens.length} token(s)`);
+  ok("bare file CID names itself", asFile.aggregateFile === "(the CID itself)", String(asFile.aggregateFile));
+
   // A directory with only a placeholder must be refused, not scored as trait-less.
   const srv2 = await serve(ph, 0);
   const gw2 = `http://127.0.0.1:${srv2.address().port}/ipfs`;

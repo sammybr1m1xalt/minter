@@ -353,17 +353,22 @@ export async function readAggregateMapping(
 ): Promise<AggregateMapping | null> {
   const bare = cid.replace(/^ipfs:\/\//i, "").replace(/^ar:\/\//i, "").replace(/\/+$/, "");
   const { entries } = await listDirectoryEntries(cid, gateways, timeoutMs);
-  const files = entries.filter((n) => /\.json$/i.test(n));
-  if (files.length === 0) return null;
+  const dirFiles = entries.filter((n) => /\.json$/i.test(n));
   // A directory with many .json files is not an aggregate; picking one would be
   // a guess.
-  if (files.length > 12) return null;
+  if (dirFiles.length > 12) return null;
 
-  for (const file of files) {
+  // Two shapes reach this function: a directory whose single .json file holds
+  // every token, and a bare FILE CID (no directory at all). For the latter the
+  // directory listing is empty, so the CID itself has to be tried as the file.
+  const paths = [...dirFiles.map((f) => `${bare}/${f}`), bare];
+
+  for (const p of paths) {
+    const label = p === bare ? "(the CID itself)" : p.slice(bare.length + 1);
     for (const gateway of gateways) {
       const base = gateway.replace(/\/+$/, "");
       try {
-        const r = await fetch(`${base}/${bare}/${file}`, {
+        const r = await fetch(`${base}/${p}`, {
           headers: { accept: "application/json", "user-agent": "Mozilla/5.0" },
           signal: AbortSignal.timeout(timeoutMs),
           redirect: "follow",
@@ -387,7 +392,7 @@ export async function readAggregateMapping(
         // No traits anywhere means a placeholder, not an aggregate mapping.
         if (!tokens.some((t) => t.traits.length > 0)) continue;
         tokens.sort((a, b) => a.tokenId - b.tokenId);
-        return { tokens, file, shape: Array.isArray(doc) ? "array" : "object" };
+        return { tokens, file: label, shape: Array.isArray(doc) ? "array" : "object" };
       } catch {
         // Next gateway.
       }
@@ -426,8 +431,9 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
   const cached = opts.useCache === false ? [] : loadRarityCache(opts.cid);
 
   // No per-token files: try a single aggregate metadata file before declaring
-  // the collection unscorable.
-  if (numeric.length === 0 && nonNumeric.length > 0) {
+  // the collection unscorable. This also covers a bare FILE CID, where the
+  // directory listing is empty and the CID itself is the file.
+  if (numeric.length === 0) {
     const agg = await readAggregateMapping(bare, gateways, requestTimeoutMs);
     if (agg) {
       const seen = new Set(cached.map((t) => t.tokenId));

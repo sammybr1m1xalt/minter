@@ -257,13 +257,27 @@ async function runRarity(o: {
       ipfsGateways: o.gateway ? [o.gateway] : undefined,
     });
     const dir = r.inspections.find((i) => i.kind === "directory");
-    if (!dir) {
+    // A single metadata FILE is also usable: rarity reads it as an aggregate.
+    const file = r.inspections.find((i) => i.kind === "file");
+    if (!dir && !file) {
+      if (r.inspections.some((i) => i.kind === "unfetchable")) {
+        // Could not tell is not the same as "there is none", and it must not
+        // exit 0 — a scanner that cannot reach the data has found nothing.
+        console.log(chalk.yellow("\n  Could not read the published metadata from any gateway — nothing to score."));
+        console.log(chalk.gray("  That is UNKNOWN, not \"no metadata\": every gateway refused the request."));
+        console.log(chalk.gray("  Retry, or pass --gateway <url> / --ipfs <link>."));
+        console.log();
+        return 2;
+      }
       console.log(chalk.yellow("\n  No published metadata directory for this contract — nothing to score."));
       console.log(chalk.gray("  Rarity needs the full id -> metadata mapping, not a single placeholder file."));
       console.log();
       return 0;
     }
-    cid = dir.cid;
+    cid = dir?.cid ?? file?.cid ?? null;
+    if (!dir && file) {
+      console.log(chalk.gray("  a single metadata file was found; rarity will try it as an aggregate"));
+    }
     if (r.verdict !== "PUBLIC") {
       console.log(chalk.yellow(`\n  note: the reveal scan verdict is ${r.verdict}, not PUBLIC.`));
     }

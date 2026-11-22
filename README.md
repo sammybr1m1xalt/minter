@@ -877,7 +877,8 @@ as the sum over its traits of `scored / count`. Higher = rarer.
   large table accumulative rather than a single long run.
 - A collection that publishes ONE metadata file instead of a directory of
   per-token files is read too: if the directory has no numeric entries, the
-  single `.json` file is tried (array, `{tokens: [...]}`, or keyed by id).
+  single `.json` file is tried (array, `{tokens: [...]}`, or keyed by id), and
+  a bare FILE CID is tried as the file itself.
   It is refused — not scored — unless at least one token carries a trait, so a
   pre-reveal placeholder file reads as no data rather than as a trait-less
   collection.
