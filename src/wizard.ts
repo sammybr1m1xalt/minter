@@ -141,6 +141,8 @@ export interface WizardOptions {
   chain?: string | null;
   /** Quantity per wallet. */
   quantity?: number | null;
+  /** Fire on this token POSITION rather than the wall clock. See --token-id. */
+  tokenId?: number | null;
   /** Pre-filled mint target, skipping the prompt. */
   target?: string | null;
 }
@@ -850,6 +852,8 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       mintOutcomes = (await localPublicSnipe({
         nftContract: mintContract,
         quantity,
+        // A positional target: hold for the supply that lands the mint on this id.
+        fireOnSupplyReached: opts.tokenId ? { tokenId: opts.tokenId, quantity } : undefined,
         walletKeys,
         rpcUrls,
         maxFeePerGas: gas.maxFeePerGasWei,

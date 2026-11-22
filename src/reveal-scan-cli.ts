@@ -5,6 +5,7 @@
 // CIDs the contract already publishes. See reveal-scan.ts for the reasoning and
 // for what it deliberately does not do.
 import chalk from "chalk";
+import { getValidApiKey } from "./opensea-key";
 import { scanReveal } from "./reveal-scan";
 import { resolveChain } from "./chains";
 import { resolveRpcsForChain } from "./rpc-resolver";
@@ -34,6 +35,7 @@ function parseArgs(args: string[]): {
       const raw = args[++i] ?? "";
       ids = raw.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 0);
     } else if (a === "--gateway") gateway = args[++i] ?? null;
+    else if (a === "--opensea") opensea = true;
     else if (a === "--help" || a === "-h") {
       console.log(`Usage: minter --reveal-scan <contract> [options]
 
@@ -58,16 +60,18 @@ whatever IPFS or Arweave CIDs those already point at.`);
 // The window this looks for: the metadata has gone public, but OpenSea's index
 // has not caught up with the contract yet — or has run ahead of it.
 //
-// Deliberately a REPORT, not a verdict. The response shape is not guessed: the
-// mode prints what OpenSea actually returned, and only compares when both sides
-// yielded a readable name. A key that is missing or dead is reported as such
-// rather than being turned into a conclusion.
+// Deliberately a REPORT, not a verdict. The endpoint below is the one verified
+// against the live API (200 in range, 404 out of range, shape name/description/
+// image/traits) — NOT /api/v2/chain/{chain}/token/{addr}/{id}, which 404s.
+// The mode prints what OpenSea actually returned and only compares when both
+// sides yielded a readable name.
 interface OpenseaProbe {
   tokenId: number;
   status: number | null;
   error: string | null;
   name: string | null;
   image: string | null;
+  traitCount: number | null;
   rawKeys: string[];
 }
 
@@ -78,14 +82,20 @@ async function probeOpenseaToken(
   apiKey: string,
   timeoutMs = 15_000
 ): Promise<OpenseaProbe> {
-  const out: OpenseaProbe = { tokenId, status: null, error: null, name: null, image: null, rawKeys: [] };
-  const url = `https://api.opensea.io/api/v2/chain/${encodeURIComponent(chain)}/token/${contract}/${tokenId}`;
+  const out: OpenseaProbe = { tokenId, status: null, error: null, name: null, image: null, traitCount: null, rawKeys: [] };
+  // Verified live: /api/v2/metadata/{chain}/{contract}/{tokenId}.
+  // 200 = OpenSea is serving metadata for this id; 404 = it has none indexed.
+  const url = `https://api.opensea.io/api/v2/metadata/${encodeURIComponent(chain)}/${contract}/${tokenId}`;
   try {
     const r = await fetch(url, {
       headers: { accept: "application/json", "x-api-key": apiKey },
       signal: AbortSignal.timeout(timeoutMs),
     });
     out.status = r.status;
+    if (r.status === 404) {
+      out.error = "not indexed (404)";
+      return out;
+    }
     const text = await r.text();
     let body: any = null;
     try {
@@ -96,14 +106,13 @@ async function probeOpenseaToken(
     }
     if (body && typeof body === "object") {
       out.rawKeys = Object.keys(body).slice(0, 12);
-      out.name = typeof body.name === "string" ? body.name : null;
-      out.image =
-        typeof body.image_url === "string"
-          ? body.image_url
-          : typeof body.image === "string"
-            ? body.image
-            : null;
-      if (!out.name && body.error) out.error = String(body.error);
+      // An empty name is NOT "no metadata" — OpenSea serves "" for most ids of
+      // a collection whose name lives on the image. Only a non-empty string is
+      // a usable name signal.
+      out.name = typeof body.name === "string" && body.name.trim() !== "" ? body.name : null;
+      out.image = typeof body.image === "string" ? body.image : null;
+      out.traitCount = Array.isArray(body.traits) ? body.traits.length : null;
+      if (body?.error) out.error = String(body.error);
     } else {
       out.error = `HTTP ${r.status}, empty body`;
     }
@@ -197,6 +206,40 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
   console.log();
   for (const f of r.findings) console.log(`  ${f}`);
   if (r.error) console.log(chalk.red(`\n  error: ${r.error}\n`));
+  // ── OpenSea comparison (opt-in) ───────────────────────────────────────────
+  if (parsed.opensea) {
+    console.log(chalk.bold.white("\nOpenSea comparison"));
+    const resolved = await getValidApiKey({ timeoutMs: 8000 }).catch(() => null);
+    if (!resolved) {
+      console.log(chalk.yellow("  No usable OpenSea key — skipping. Nothing was concluded."));
+    } else {
+      const idsToProbe = (parsed.ids.length > 0 ? parsed.ids : r.sampledTokenUris.map((s) => s.tokenId)).slice(0, 3);
+      console.log(chalk.gray(`  key source: ${resolved.source}`));
+      for (const id of idsToProbe) {
+        const probe = await probeOpenseaToken(profile.key, parsed.contract, id, resolved.api_key);
+        const onChain = r.sampledTokenUris.find((s) => s.tokenId === id);
+        const onChainJson = await readTokenUriJson(onChain?.uri ?? null);
+        const onChainName = typeof onChainJson?.name === "string" ? onChainJson.name : null;
+        const osName = probe.status === 200 ? probe.name : null;
+        console.log(`  token ${id}:`);
+        console.log(
+          `    opensea:  http ${probe.status ?? "-"}${probe.error ? "  " + probe.error : ""}${osName ? `  name "${osName.slice(0, 60)}"` : ""}${probe.traitCount != null ? `  traits ${probe.traitCount}` : ""}${probe.image ? "  image yes" : ""}`
+        );
+        console.log(
+          `    onchain:  ${onChainName ? `name "${onChainName.slice(0, 60)}"` : onChain?.uri ? onChain.uri.slice(0, 70) : "(no tokenURI)"}`
+        );
+        if (osName && onChainName && osName !== onChainName) {
+          console.log(chalk.yellow("    → the two differ: OpenSea is serving metadata the chain does not."));
+        } else if (osName && onChainName) {
+          console.log(chalk.gray("    → identical."));
+        } else if (probe.status === 404 && onChainName) {
+          console.log(chalk.gray("    → OpenSea has not indexed this id; the chain does have metadata."));
+        }
+      }
+    }
+    console.log();
+  }
+
   console.log();
 
   // Exit codes are a scanner's contract: 0 = nothing leaked, 1 = leaked,

@@ -10,6 +10,7 @@ import chalk from "chalk";
 import { performance } from "perf_hooks";
 import { JsonRpcProvider, Wallet, formatEther } from "ethers";
 import { blastToAll, parseRpcEndpoints, prepareBlast, waitForReceipt, PreparedBlast } from "./rpc-blast";
+import { waitForSupplyPosition, type SupplyPosition } from "./supply-position";
 import { warmConnections, rankRpcEndpoints, settleRanking, type RankedEndpoint } from "./connection-warmer";
 import { waitForMintTime } from "./timer";
 import { explorerTx } from "./chains";
@@ -38,6 +39,8 @@ export interface LocalSnipeOpts {
    * be minted at the new price with no warning.
    */
   maxPriceWei?: bigint | null;
+  /** Hold the fire until the minted supply lands the mint on this token id. */
+  fireOnSupplyReached?: SupplyPosition;
 }
 
 
@@ -162,7 +165,7 @@ export interface LocalSnipeResult {
 export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipeResult[]> {
   const {
     nftContract, quantity, walletKeys, rpcUrls,
-    maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan, maxPriceWei,
+    maxFeePerGas, maxPriorityFee, gasLimit, targetStart, plan, maxPriceWei, fireOnSupplyReached,
   } = opts;
 
   const provider = new JsonRpcProvider(rpcUrls[0], undefined, { staticNetwork: true });
@@ -447,6 +450,19 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
       await waitForMintTime(targetStart, 0);
     } else {
       console.log(chalk.bold.yellow("\n  🚀 Firing immediately..."));
+    }
+
+    // ── Optional: hold for a SUPPLY POSITION instead of the wall clock ──────
+    // Token ids are sequential, so the supply at inclusion decides which ids a
+    // mint receives. Same maths as the signed path; the chainId is resolved here
+    // because this function only reads it inside the signing block above.
+    if (fireOnSupplyReached) {
+      const cid = await resolveChainId(rpcUrls);
+      if (cid == null) {
+        console.log(chalk.yellow("  ⚠ No RPC would answer eth_chainId — ignoring the token-id target."));
+      } else {
+        await waitForSupplyPosition(fireOnSupplyReached, { nftContract, chainId: cid, rpcUrls });
+      }
     }
 
     // ── Re-read the per-wallet cap AFTER the wait ─────────────────────────

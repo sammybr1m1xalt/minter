@@ -66,7 +66,14 @@ export async function runFcfsBranch(
   nftContract: string,
   quantity: number,
   rpcUrls: string[],
-  target: { label: string; slug?: string | null; at?: string | null; whenOpen?: boolean; maxPrice?: string | null },
+  target: {
+    label: string;
+    slug?: string | null;
+    at?: string | null;
+    whenOpen?: boolean;
+    maxPrice?: string | null;
+    tokenId?: number | null;
+  },
 ): Promise<void> {
   log.info("FCFS branch: started");
   log.field("nftContract", nftContract);
@@ -818,6 +825,8 @@ export async function runFcfsBranch(
   const snipeResults = await executeFcfsSnipe({
     nftContract,
     quantity,
+    // A positional target: hold for the supply that lands the mint on this id.
+    fireOnSupplyReached: target.tokenId ? { tokenId: target.tokenId, quantity } : undefined,
     walletKeys,
     rpcUrls,
     maxFeePerGas,
@@ -1131,6 +1140,12 @@ export interface FcfsCliOptions {
   wallets?: string | null;
   chain?: string | null;
   quantity?: number | null;
+  /**
+   * Hold the fire until the minted supply reaches `tokenId - quantity`, so the
+   * mint starts at the position that lands on this token id. Meaningless
+   * without an id -> artwork mapping (see `--reveal-scan`).
+   */
+  tokenId?: number | null;
 }
 
 export async function runFcfsBranchCli(
@@ -1262,6 +1277,7 @@ export async function runFcfsBranchCli(
   log.info("FCFS CLI: keys loaded, calling runFcfsBranch");
 
   await runFcfsBranch(log, keys, effectiveProfile, targetChainKey, nftContract, quantity, effectiveRpcs, {
+    tokenId: opts.tokenId ?? null,
     label: targetLabel,
     slug: resolvedTarget.slug,
     at: opts.at,
