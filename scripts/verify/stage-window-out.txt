@@ -1,7 +1,0 @@
-PASS  S1 window matches the payload's signed window — ok=1
-PASS  S2 a different start is refused — payload is for a stage opening 2027-01-15 08:00:00, but the selected stage opens 2027-01-15 08:00:01 — refusin
-PASS  S3 a different end is refused — payload is for a stage closing 2027-01-15 08:10:00, but the selected stage closes 2027-01-15 08:10:01 — refusi
-PASS  S4 a public selection against a signed payload is refused — payload is for a signed presale stage, but a public sale stage was selected — refusing to broadcast.
-PASS  S5 index arbitrates when no window is stated — payload is for stage index 1, but stage index 2 was selected — refusing to broadcast.
-PASS  S6 a matching index is allowed — ok=1
-PASS  S7 type-only cannot tell, so it allows — ok=1

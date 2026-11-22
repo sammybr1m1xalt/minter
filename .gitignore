@@ -26,3 +26,6 @@ dead_exports*.json
 
 # The ignore file itself
 .gitignore
+
+# verification run output
+scripts/verify/*-out.txt
