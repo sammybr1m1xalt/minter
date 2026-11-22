@@ -400,14 +400,6 @@ export async function getSessionCookies(wallet: Wallet): Promise<string> {
   return cookieHeader(session.cookies);
 }
 
-// Force a fresh SIWE login (e.g. after a 401), bypassing cache and refresh.
-export async function refreshSiweSession(wallet: Wallet): Promise<string> {
-  sessions.delete(wallet.address.toLowerCase());
-  const session = await loginSiwe(wallet);
-  sessions.set(wallet.address.toLowerCase(), session);
-  return cookieHeader(session.cookies);
-}
-
 // ── Wallet JWT: scoped PAT → access token ───────────────────────────────────
 //
 // The REST drop-eligibility endpoint needs a WALLET token. The SIWE cookie is

@@ -85,28 +85,6 @@ export function resolveRpcsForChain(chainKey: string, manual: string[] = []): Re
   };
 }
 
-// Accept either a full URL or a bare provider API key, which we expand against
-// the chain's Alchemy host. Returns null if it's neither.
-export function toRpcUrl(value: string, chainKey: string): string | null {
-  const raw = value.trim();
-  if (!raw) return null;
-
-  if (raw.includes("://")) {
-    try {
-      new URL(raw);
-      return raw;
-    } catch {
-      return null;
-    }
-  }
-
-  // Bare key — only meaningful if we know where to point it.
-  const host = resolveChain(chainKey)?.rpc.alchemyHost;
-  if (!host) return null;
-  if (!/^[A-Za-z0-9_-]{16,}$/.test(raw)) return null;
-  return `https://${host}/v2/${raw}`;
-}
-
 // Hide the key segment so a shoulder-surf or screenshot doesn't leak it.
 //
 // This used to be a second, weaker implementation that (a) returned the input

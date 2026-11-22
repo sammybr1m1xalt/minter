@@ -176,18 +176,6 @@ function normUuid(u: string | null | undefined): string | null {
 }
 
 /**
- * Do these two describe the same stage?
- *
- * Only compares what BOTH sides state. A payload that carries no stage identity
- * (GraphQL) cannot be checked and returns true — "cannot tell" is not
- * "matches", but refusing every GraphQL payload would stop the primary path.
- * Where a comparison IS possible and the two disagree, this returns false.
- */
-export function stageMatches(payload: FcfsSignedPayload, expected: ExpectedStage | null | undefined): boolean {
-  return stageMismatchReason(payload, expected) == null;
-}
-
-/**
  * Build the refusal for a payload whose stage is known and differs from the
  * selected one, or null when it may proceed. Shared by every place a payload
  * enters the fire set, so the three cannot drift.

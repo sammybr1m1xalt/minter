@@ -220,8 +220,6 @@ export const PRICE_READERS: PriceReader[] = [
 // This address previously held Seaport 1.1
 // (0x00000000006c3852cbef3e08e8df289169ede581) — NOT SeaDrop. Probing it for
 // SeaDrop getters could never produce evidence.
-export const SEADROP_V1 = SEADROP_ADDRESS;
-export const SEADROP_V2 = SEADROP_V1;
 
 // The return types use plain uintN. SeaDrop's documentation writes them as
 // uint16B/uint32B (a byte-width convention), but those are NOT valid Solidity
@@ -231,86 +229,6 @@ const SEADROP_ABI = [
   "function getAllowListMerkleRoot(address nftContract) view returns (bytes32 root)",
   "function getCreatorPayoutAddress(address nftContract) view returns (address)",
 ];
-
-export interface SeaDropDetection {
-  version: "v1" | "v2" | null;
-  /** True when there is POSITIVE evidence the contract is SeaDrop-managed. */
-  managed: boolean;
-  reason: string;
-}
-
-/**
- * Detect whether a contract is managed by a SeaDrop singleton.
- *
- * Requires POSITIVE EVIDENCE, not merely a non-reverting call: SeaDrop returns
- * an all-zero tuple for tokens it does not manage, which would otherwise look
- * like a valid (free, always-open) drop. Evidence is a configured public drop,
- * a non-zero allowlist merkle root, or a registered creator payout address.
- */
-export async function isSeadropContract(
-  nftContract: string,
-  provider: JsonRpcProvider
-): Promise<SeaDropDetection> {
-  // v1 and v2 currently resolve to the one singleton (v2 has no address of its
-  // own), so probe each distinct address exactly once.
-  const singletons: readonly (readonly ["v1" | "v2", string])[] =
-    SEADROP_V2 === SEADROP_V1
-      ? [["v1", SEADROP_V1]]
-      : [
-          ["v2", SEADROP_V2],
-          ["v1", SEADROP_V1],
-        ];
-  for (const [version, singleton] of singletons) {
-    const seadrop = new Interface(SEADROP_ABI);
-    try {
-      // Public drop: mintPrice/startTime/endTime all zero means "not managed".
-      const publicData = seadrop.encodeFunctionData("getPublicDrop", [nftContract]);
-      const publicRaw = await provider.call({ to: singleton, data: publicData });
-      const publicDecoded = seadrop.decodeFunctionResult("getPublicDrop", publicRaw);
-      const mintPrice = publicDecoded.mintPrice ?? 0n;
-      const startTime = publicDecoded.startTime ?? 0n;
-      const endTime = publicDecoded.endTime ?? 0n;
-      const hasPublicDrop = mintPrice > 0n || startTime > 0n || endTime > 0n;
-
-      // Allowlist: a non-zero merkle root means an allowlist is configured.
-      let hasAllowlist = false;
-      try {
-        const rootData = seadrop.encodeFunctionData("getAllowListMerkleRoot", [nftContract]);
-        const rootRaw = await provider.call({ to: singleton, data: rootData });
-        const rootDecoded = seadrop.decodeFunctionResult("getAllowListMerkleRoot", rootRaw);
-        const root: string = rootDecoded.root ?? rootDecoded[0] ?? "0x" + "0".repeat(64);
-        hasAllowlist = root !== "0x" + "0".repeat(64);
-      } catch {
-        hasAllowlist = false;
-      }
-
-      // Creator payout address: a non-zero address means SeaDrop knows the token.
-      let hasPayout = false;
-      try {
-        const payoutData = seadrop.encodeFunctionData("getCreatorPayoutAddress", [nftContract]);
-        const payoutRaw = await provider.call({ to: singleton, data: payoutData });
-        const payoutDecoded = seadrop.decodeFunctionResult("getCreatorPayoutAddress", payoutRaw);
-        const addr = payoutDecoded[0] ?? "0x0000000000000000000000000000000000000000";
-        hasPayout = addr !== "0x0000000000000000000000000000000000000000";
-      } catch {
-        hasPayout = false;
-      }
-
-      if (hasPublicDrop || hasAllowlist || hasPayout) {
-        const reasons = [
-          hasPublicDrop ? "public drop configured" : null,
-          hasAllowlist ? "allowlist merkle root set" : null,
-          hasPayout ? "creator payout registered" : null,
-        ].filter(Boolean);
-        return { version, managed: true, reason: reasons.join(" + ") };
-      }
-    } catch {
-      // Singleton call failed — try the next version.
-    }
-  }
-
-  return { version: null, managed: false, reason: "no SeaDrop evidence (no public drop, no merkle root, no payout)" };
-}
 
 // ── Pre-mint contract safety screen ─────────────────────────────────────────
 //

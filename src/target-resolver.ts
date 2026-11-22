@@ -441,39 +441,4 @@ async function resolveTargetUnchecked(
   }
 }
 
-/**
- * Parse and resolve in one call. Throws with a platform-specific message when
- * the target is unresolvable, so the caller can show something actionable.
- */
-export async function parseAndResolve(
-  input: string,
-  apiKey = "",
-  preferredChain?: string
-): Promise<ResolvedTarget> {
-  const parsed = parseTarget(input);
-  const resolved = await resolveTarget(parsed, apiKey, preferredChain);
-  if (!resolved) {
-    if (parsed.chain && !isSupportedChainKey(parsed.chain)) {
-      throw new Error(
-        `Chain "${parsed.chain}" is not supported by this build. Supported chains: ${supportedChainKeys().join(", ")}.`
-      );
-    }
-    if (parsed.platform === "manifold") {
-      throw new Error(
-        `Manifold claim "${parsed.claimId}" cannot be resolved automatically — ` +
-          `Manifold claims need the claim contract address. Paste the 0x… contract instead.`
-      );
-    }
-    if (!parsed.chain && (parsed.platform === "direct" || parsed.platform === "zora")) {
-      throw new Error(
-        `"${input}" does not name a chain. Pass one with --chain (supported: ${supportedChainKeys().join(", ")}).`
-      );
-    }
-    throw new Error(
-      `Could not resolve "${input}" — the collection may not exist, or it needs an OpenSea API key.`
-    );
-  }
-  return resolved;
-}
-
 export { isSlug };
