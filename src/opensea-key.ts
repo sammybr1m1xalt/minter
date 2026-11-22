@@ -308,6 +308,26 @@ export async function probeKey(
     const resetNum = resetRaw != null ? Number(resetRaw) : NaN;
     const resetAt = Number.isFinite(resetNum) ? resetNum : 0;
     if (res.status === 200) {
+      // /api/v2/collections does NOT enforce key expiry. Measured: a key whose
+      // expires_at had passed six days earlier still returned 200 here, so this
+      // probe alone called a dead key "alive" and the pool ranked it first —
+      // while /api/v2/listings/... returned 401 "API key has expired" for the
+      // same key. Confirm against an endpoint that DOES check before trusting
+      // the verdict. The slug is deliberately nonexistent: 401/403 means the key
+      // was rejected, anything else means auth passed.
+      const authRes = await fetch(
+        `${OPENSEA_BASE}/api/v2/listings/collection/__key_probe__/nfts/1/best`,
+        { signal: controller.signal, headers: { accept: "application/json", "X-API-KEY": apiKey.trim() } }
+      ).catch(() => null);
+      if (authRes) {
+        const authBody = authRes.status === 401 || authRes.status === 403
+          ? await authRes.text().catch(() => "")
+          : "";
+        if (authRes.status === 401) return { status: "dead" as const, latencyMs, remaining, resetAt };
+        if (authRes.status === 403 && !/cloudflare|error\s*10\d\d|access denied|cf-error/i.test(authBody)) {
+          return { status: "dead" as const, latencyMs, remaining, resetAt };
+        }
+      }
       // If remaining is exactly 0, we're exhausted even though this call went
       // through. Mark as "alive_but_exhausted" so scoring deprioritizes it.
       if (remaining === 0) return { status: "alive_but_exhausted" as const, latencyMs, remaining, resetAt };
