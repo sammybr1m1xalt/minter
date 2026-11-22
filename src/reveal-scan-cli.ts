@@ -7,7 +7,13 @@
 import chalk from "chalk";
 import { getValidApiKey } from "./opensea-key";
 import { inspectPublicCid, scanReveal } from "./reveal-scan";
-import { computeRarity, crawlTraits } from "./rarity";
+import { computeRarity, crawlTraits, saveRarityCache } from "./rarity";
+import { fetchBestListing, printListingLine } from "./buy-listings";
+import { resolveContractToSlug } from "./slug-resolver";
+import { executeListingBuy } from "./buy-listings";
+import { promptWalletPassphrase, walletFilePath } from "./wizard";
+import { loadKeysFromFile, readWalletFilePath } from "./wallet-file";
+import { askYesNo } from "./prompt";
 import { resolveChain } from "./chains";
 import { resolveRpcsForChain } from "./rpc-resolver";
 
@@ -24,6 +30,11 @@ function parseArgs(args: string[]): {
   limit: number | null;
   concurrency: number;
   top: number;
+  pick: number;
+  listings: boolean;
+  buy: string | null;
+  yes: boolean;
+  slug: string | null;
 } {
   let contract: string | null = null;
   let chainKey = "ethereum";
@@ -37,6 +48,11 @@ function parseArgs(args: string[]): {
   let limit: number | null = null;
   let concurrency = 6;
   let top = 20;
+  let pick = 0;
+  let listings = false;
+  let buy: string | null = null;
+  let yes = false;
+  let slug: string | null = null;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--chain") chainKey = args[++i] ?? chainKey;
@@ -52,6 +68,11 @@ function parseArgs(args: string[]): {
     else if (a === "--limit") limit = Number(args[++i] ?? 0) || null;
     else if (a === "--concurrency") concurrency = Number(args[++i] ?? 6) || 6;
     else if (a === "--top") top = Number(args[++i] ?? 20) || 20;
+    else if (a === "--pick") pick = Number(args[++i] ?? 0) || 0;
+    else if (a === "--listings") listings = true;
+    else if (a === "--buy") buy = args[++i] ?? null;
+    else if (a === "--yes" || a === "-y") yes = true;
+    else if (a === "--slug") slug = args[++i] ?? null;
     else if (a === "--help" || a === "-h") {
       console.log(`Usage: minter --reveal-scan <contract> [options]
 
@@ -66,6 +87,15 @@ function parseArgs(args: string[]): {
   --limit <n>        with --rarity, stop after n tokens
   --concurrency <n>  with --rarity, parallel metadata fetches (default 6)
   --top <n>          with --rarity, how many rarest ids to list (default 20)
+  --pick <n>         with --rarity, print a ready --token-id command for the nth
+                     rarest token (scanner -> rarity -> position -> fire)
+  --listings         with --rarity, also check whether the rarest ids are listed,
+                     where, and for how much
+  --buy <tokenId>    with --rarity, buy one listed token using the wallet file
+                     (the same encrypted wallets.json the wizard uses)
+  --yes, -y          with --buy, send without asking
+  --slug <slug>      override the collection slug (an address can resolve to
+                     several OpenSea collections; the resolver refuses to guess)
                      (--limit defaults to 500; --limit 0 scores everything)
 
 Reads only public data: the contract's baseURI / contractURI / tokenURI and
@@ -75,7 +105,7 @@ whatever IPFS or Arweave CIDs those already point at.`);
       if (!contract) contract = a;
     }
   }
-  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, ids, gateway, opensea, ipfsLink, rarity, limit, concurrency, top };
+  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, ids, gateway, opensea, ipfsLink, rarity, limit, concurrency, top, pick, listings, buy, yes, slug };
 }
 
 // ── OpenSea comparison (opt-in) ─────────────────────────────────────────────
@@ -198,6 +228,11 @@ async function runRarity(o: {
   limit: number | null;
   concurrency: number;
   top: number;
+  pick: number;
+  listings: boolean;
+  buy: string | null;
+  yes: boolean;
+  slug: string | null;
   contract: string | null;
   chainKey: string;
   rpcs: string[];
@@ -254,6 +289,9 @@ async function runRarity(o: {
   });
   process.stdout.write("\r" + " ".repeat(60) + "\r");
 
+  // Persist what was scored so a throttled run resumes instead of refetching.
+  if (crawl.tokens.length > crawl.fromCache) saveRarityCache(cid, crawl.tokens);
+
   const report = computeRarity(crawl.tokens);
   const listed = crawl.listed;
   const pct = listed > 0 ? (report.scored / listed) * 100 : 0;
@@ -261,9 +299,15 @@ async function runRarity(o: {
   console.log(
     `  listed:    ${listed} entries${crawl.truncated ? ` (sampled ${o.limit ?? 500} spread across the range)` : ""}`
   );
-  console.log(`  scored:    ${report.scored} / ${listed} (${pct.toFixed(1)}%) in ${(crawl.elapsedMs / 1000).toFixed(1)}s`);
+  // Say how much was ATTEMPTED, not just how much exists: "scored 38 / 10000"
+  // reads as though 10000 were tried.
+  console.log(
+    `  attempted: ${crawl.tokens.length} id(s)  (${crawl.fromCache} cached, ${crawl.tokens.length - crawl.fromCache} fetched this run)`
+  );
+  console.log(`  scored:    ${report.scored} / ${listed} collection entries (${pct.toFixed(1)}%) in ${(crawl.elapsedMs / 1000).toFixed(1)}s`);
   if (crawl.failed > 0) console.log(chalk.yellow(`  failed:    ${crawl.failed} entries could not be read`));
   if (crawl.skipped > 0) console.log(chalk.gray(`  skipped:   ${crawl.skipped} non-token entries`));
+  if (crawl.fromCache > 0) console.log(chalk.gray(`  cache:     ${crawl.fromCache} token(s) reused from .minter-cache/rarity`));
   console.log();
 
   if (report.scored === 0) {
@@ -297,6 +341,85 @@ async function runRarity(o: {
   if (report.rows.length > o.top) {
     console.log(chalk.gray(`\n  …and ${report.rows.length - o.top} more`));
   }
+
+  if (o.pick > 0 && report.rows.length > 0) {
+    const row = report.rows[Math.min(o.pick, report.rows.length) - 1];
+    const qty = 1;
+    console.log();
+    console.log(chalk.bold.white(`  pick #${o.pick}: token ${row.tokenId}`));
+    console.log(chalk.gray(`  fire on that position with:`));
+    console.log(chalk.white(`    minter --fcfs <target> --token-id ${row.tokenId} --quantity ${qty}`));
+    console.log(chalk.gray(`  (the mint starts at tokenId - quantity + 1, so quantity shifts the range)`));
+  }
+  // ── Listings check ───────────────────────────────────────────────────────
+  // "Is this rare token already listed, where, and how much?" Only the rarity
+  // table makes the question worth asking: before the reveal nobody knows which
+  // id is rare, so a seller listing one cheap is the actual edge.
+  if ((o.listings || o.buy) && o.contract) {
+    const apiKey = (await getValidApiKey({ timeoutMs: 8000 }).catch(() => null))?.api_key ?? "";
+    if (!apiKey) {
+      console.log(chalk.yellow("\n  Listings: no usable OpenSea key — skipping. Nothing was concluded."));
+    } else {
+      const slug =
+        o.slug ?? (await resolveContractToSlug(o.contract, apiKey, 10000).catch(() => null));
+      if (!slug) {
+        console.log(chalk.yellow(`\n  Listings: could not resolve a slug for ${o.contract} — skipping.`));
+      } else {
+        const ids = o.buy
+          ? [o.buy]
+          : report.rows.slice(0, Math.min(o.top, 10)).map((r) => String(r.tokenId));
+        console.log();
+        console.log(chalk.bold.white("  Listings"));
+        console.log(chalk.gray(`  collection: ${slug}`));
+        for (const id of ids) {
+          const l = await fetchBestListing(slug, id, apiKey).catch((e: any) => ({
+            tokenId: id, orderHash: null, protocolAddress: null, chain: null, maker: null,
+            currency: null, value: null, decimals: null, price: null,
+            error: e?.message ?? "fetch failed",
+          }));
+          console.log(printListingLine(l));
+        }
+        console.log();
+        console.log(chalk.gray("  Only OpenSea is checked. Reservoir — the aggregator that would have"));
+        console.log(chalk.gray("  covered Blur/LooksRare/X2Y2 — was sunset on 2025-10-15."));
+        if (o.buy) {
+          console.log();
+          // The wallet is loaded exactly the way the wizard loads it, so an
+          // encrypted wallets.json works here unchanged.
+          await promptWalletPassphrase();
+          const file = walletFilePath();
+          const text = readWalletFilePath(file);
+          // A missing file is not a malformed one — saying "malformed" sends the
+          // user hunting for a corruption that is not there.
+          const loaded =
+            text == null
+              ? { keys: [] as string[], status: "absent" as const, detail: `${file} does not exist` }
+              : loadKeysFromFile(file, text, process.env.WALLETS_PASSPHRASE ?? null);
+          if (loaded.keys.length === 0) {
+            console.log(chalk.yellow(`  No usable wallet from ${file} (${loaded.status}${loaded.detail ? ": " + loaded.detail : ""}).`));
+            console.log(chalk.yellow("  Set PRIVATE_KEY/PRIVATE_KEYS, or WALLETS_FILE with WALLETS_PASSPHRASE."));
+          } else {
+            const listing = await fetchBestListing(slug, o.buy, apiKey);
+            const out = await executeListingBuy({
+              listing,
+              buyerKey: loaded.keys[0],
+              apiKey,
+              rpcUrl: o.rpcs[0] ?? "",
+              chainId: resolveChain(o.chainKey)?.chainId ?? 1,
+              yes: o.yes,
+              ask: askYesNo,
+            });
+            if (out.sent) {
+              console.log(chalk.green(`  sent: ${out.txHash}`));
+            } else {
+              console.log(chalk.yellow(`  not sent: ${out.reason}`));
+            }
+          }
+        }
+      }
+    }
+  }
+
   console.log();
   console.log(chalk.gray("  Rarity is a property of the metadata, not a market value."));
   console.log(chalk.gray("  Token ids are sequential — pair a target id with --token-id."));
@@ -319,7 +442,7 @@ async function runIpfsView(link: string, gateway: string | null): Promise<number
   console.log();
   if (r.kind === "unfetchable") {
     console.log(chalk.yellow("  No gateway answered. A bot wall or rate limit still returns HTML,"));
-    console.log(chalk.yellow("  so this is \"could not fetch\", not \"does not exist\"."));
+    console.log(chalk.yellow('  so this is "could not fetch", not "does not exist".'));
     console.log();
     return 2;
   }
@@ -347,6 +470,11 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
       limit: parsed.limit,
       concurrency: parsed.concurrency,
       top: parsed.top,
+      pick: parsed.pick,
+      listings: parsed.listings,
+      buy: parsed.buy,
+      yes: parsed.yes,
+      slug: parsed.slug,
       contract: parsed.contract,
       chainKey: parsed.chainKey,
       rpcs: parsed.rpcs,

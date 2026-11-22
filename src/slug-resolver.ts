@@ -338,7 +338,23 @@ export async function resolveContractToSlug(
       // (SIWE, eligibility, payload) would run against the wrong collection.
       // The "chain match is a weaker but usable signal" this comment used to
       // promise is not a substitute for identity.
-      const chosen = hits.find((h) => (h.address || "").toLowerCase() === wanted);
+      //
+      // Even an EXACT match is not unique: OpenSea also indexes "shadow"
+      // collections against the same contract (measured: BAYC's contract
+      // resolves to both boredapeyachtclub and bored-ape-yacht-club-shadow).
+      // Picking the first would silently run every later step against the
+      // derivative, so an ambiguous address is refused and the candidates are
+      // named. Pass the slug explicitly when you know it.
+      const exact = hits.filter((h) => (h.address || "").toLowerCase() === wanted);
+      const exactSlugs = [...new Set(exact.map((h) => h.slug).filter((s): s is string => !!s))];
+      if (exactSlugs.length > 1) {
+        console.error(
+          `[resolveContractToSlug] ${exact.length} collections share the address ${nftContract}: ` +
+            `${exactSlugs.join(", ")} — refusing to pick one. Pass the slug explicitly.`
+        );
+        return null;
+      }
+      const chosen = exact.length === 1 ? exact[0] : undefined;
       if (chosen?.slug) {
         // Reject GraphQL's synthetic placeholder for a contract that is not a
         // collection. Passing it downstream resolves to the wrong chain.

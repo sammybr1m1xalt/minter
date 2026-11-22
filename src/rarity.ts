@@ -11,7 +11,54 @@
 //     were actually read, which is a lower bound when coverage is partial.
 //   - Rarity is a property of the metadata. It is not a market value and is not
 //     a prediction of what anyone will pay.
+import fs from "fs";
+import path from "path";
 import { DEFAULT_GATEWAYS } from "./reveal-scan";
+
+// Scored tokens are cached per directory CID. The gateways throttle a single IP
+// hard, so a full table is usually several runs' worth; without a cache every
+// attempt pays for the tokens it already read.
+const RARITY_CACHE_DIR = path.resolve(__dirname, "..", ".minter-cache", "rarity");
+
+interface RarityCache {
+  cid: string;
+  updatedAt: string;
+  tokens: TokenTraits[];
+}
+
+function cacheFile(cid: string): string {
+  return path.join(RARITY_CACHE_DIR, `${cid.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
+}
+
+export function loadRarityCache(cid: string): TokenTraits[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(cacheFile(cid), "utf-8")) as RarityCache;
+    if (raw?.cid !== cid || !Array.isArray(raw.tokens)) return [];
+    return raw.tokens.filter((t) => Number.isInteger(t.tokenId) && Array.isArray(t.traits));
+  } catch {
+    // No cache, unreadable cache, or a foreign shape: start empty rather than
+    // trusting a file we cannot read.
+    return [];
+  }
+}
+
+export function saveRarityCache(cid: string, tokens: TokenTraits[]): void {
+  try {
+    fs.mkdirSync(RARITY_CACHE_DIR, { recursive: true, mode: 0o700 });
+    const existing = loadRarityCache(cid);
+    const byId = new Map<number, TokenTraits>();
+    for (const t of [...existing, ...tokens]) byId.set(t.tokenId, t);
+    const merged = [...byId.values()].sort((a, b) => a.tokenId - b.tokenId);
+    const tmp = cacheFile(cid) + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify({ cid, updatedAt: new Date().toISOString(), tokens: merged }), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+    fs.renameSync(tmp, cacheFile(cid));
+  } catch {
+    // A cache write failure must not fail the run.
+  }
+}
 
 export interface TokenTraits {
   tokenId: number;
@@ -92,6 +139,8 @@ export interface CrawlOptions {
   limit?: number;
   /** Overall wall-clock budget. */
   timeoutMs?: number;
+  /** Reuse `.minter-cache/rarity/<cid>.json` (default true). */
+  useCache?: boolean;
   /** Per-request timeout. */
   requestTimeoutMs?: number;
   onProgress?: (done: number, ok: number) => void;
@@ -107,6 +156,8 @@ export interface CrawlResult {
   failed: number;
   truncated: boolean;
   elapsedMs: number;
+  /** Tokens carried over from the cache rather than fetched this run. */
+  fromCache: number;
 }
 
 /** Parse the trait list out of a metadata JSON document, tolerating shapes. */
@@ -192,9 +243,13 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
   // collection ever mints in trait order. Spread the sample evenly across the
   // whole range instead: same statistical value, better spread of targets.
   // limit 0 means "no limit".
+  const cached = opts.useCache === false ? [] : loadRarityCache(opts.cid);
+  const cachedIds = new Set(cached.map((t) => t.tokenId));
+  const fresh = numeric.filter((id) => !cachedIds.has(id));
+  // limit 0 means "no limit".
   const targets =
-    opts.limit != null && opts.limit > 0 ? spreadPick(numeric, opts.limit) : numeric;
-  const tokens: TokenTraits[] = [];
+    opts.limit != null && opts.limit > 0 ? spreadPick(fresh, opts.limit) : fresh;
+  const tokens: TokenTraits[] = [...cached];
   let failed = 0;
   let gi = 0;
   let next = 0;
@@ -221,7 +276,11 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
             });
             if (r.status === 429 || r.status === 403) {
               // Back off, then let another gateway have a turn.
-              await new Promise((res) => setTimeout(res, 800 * (retry + 1)));
+              // Exponential with jitter: a fixed backoff makes every worker
+              // retry in lockstep, which keeps the throttle hot.
+              await new Promise((res) =>
+                setTimeout(res, Math.min(8000, 800 * 2 ** retry) + Math.random() * 400)
+              );
               break;
             }
             if (!r.ok) {
@@ -252,5 +311,6 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
     failed,
     truncated: opts.limit != null && opts.limit > 0 && numeric.length > opts.limit,
     elapsedMs: Date.now() - started,
+    fromCache: cached.length,
   };
 }

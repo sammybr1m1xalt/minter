@@ -862,6 +862,68 @@ entry count and a sample. A single file is not automatically the placeholder —
 that depends on whether every id returns the same document. `unfetchable` means
 no gateway answered, which is not the same as "does not exist".
 
+### Rarity (`--rarity`)
+
+    minter --reveal-scan <contract> --rarity [--limit n] [--top n] [--pick n]
+    minter --reveal-scan --ipfs ipfs://<cid> --rarity
+
+Turns a PUBLIC finding into a target list. It reads only the mapping the
+contract already publishes — nothing new is discovered — and scores each token
+as the sum over its traits of `scored / count`. Higher = rarer.
+
+- `--limit` defaults to 500 (`0` = everything). The unbounded version crawls
+  all 10,000 and times out; the gateways throttle a single IP hard.
+- The sample is spread across the whole id range, not a contiguous prefix — a
+  prefix is a strange target set and is biased if a collection mints in trait
+  order.
+- Scored tokens are cached in `.minter-cache/rarity/<cid>.json`, so a throttled
+  run resumes instead of refetching what it already read.
+- `--top <n>` (default 20) lists the rarest; `--pick <n>` prints a ready
+  `--token-id` command for the nth rarest, which is the position trigger.
+
+Honest by construction: it prints `listed`, `attempted`, `scored`, `failed` and
+`cache`, and anything under 100% coverage is labelled a lower bound. Frequencies
+use the scored set as the denominator, never total supply — mixing the two would
+make a partial crawl look like a complete one.
+
+Rarity is a property of the metadata, not a market value.
+
+### Listings (`--listings`, `--buy`)
+
+    minter --reveal-scan <contract> --rarity --slug <slug> --listings
+    minter --reveal-scan <contract> --rarity --slug <slug> --buy <tokenId> [--yes]
+
+Once the table knows which ids are rare, `--listings` asks whether they are
+already listed, and for how much:
+
+    GET /api/v2/listings/collection/{slug}/nfts/{tokenId}/best
+
+A 404 with `No listings found` is a real "not listed", not an error. An
+auth failure is reported as `could not read (HTTP 401 — API key rejected)` and
+never collapsed into "not listed" — that misreading is the expensive one.
+
+`--buy <tokenId>` vends the buy transaction
+(`POST /api/v2/listings/fulfillment_data`), quotes gas, asks, and sends. It
+loads the wallet through the same path the wizard uses, so an encrypted
+`wallets.json` works unchanged (`WALLETS_PASSPHRASE`, or an interactive prompt).
+
+- Only native-priced listings are sent. An ERC20-priced listing returns value
+  `"0"` and pulls payment with `transferFrom`, so it needs a spender approval
+  first — that is reported, not guessed.
+- `calldata_suffix` is **not** the selector: it is the first four bytes of
+  `keccak256("api.opensea.io")` (verified: `0xcdb44011`), appended as trailing
+  calldata so the fill is attributed to OpenSea. Seaport reads arguments by
+  offset and ignores trailing bytes.
+- OpenSea refuses burn and system addresses as payer, so the buyer is derived
+  from the wallet key, not chosen.
+- `--slug` overrides resolution. An address can map to several OpenSea
+  collections — BAYC's contract resolves to ten, including `boredapeyachtclub`
+  and `bored-ape-yacht-club-shadow` — and the resolver refuses to guess between
+  them rather than silently running against the derivative.
+
+Only OpenSea is checked. Reservoir, the aggregator that would have covered
+Blur/LooksRare/X2Y2 in one call, was sunset on 2025-10-15.
+
 `--opensea` also asks OpenSea's public token endpoint for the sampled ids and
 compares the name against the on-chain `tokenURI`, which is the window where
 OpenSea's index has run ahead of the contract (or lagged it). It is a report,
@@ -939,7 +1001,7 @@ waiting for a receipt that will never exist.
 
     cd scripts/verify && ./run-all.sh
 
-Fourteen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+ Fifteen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
 mock JSON-RPC server and the fire-path harness; the others cover the audit
 fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
 scan and the Scatter paths. `npm run build` first.

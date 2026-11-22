@@ -1065,7 +1065,7 @@ async function fetchJsonResult(
 }
 
 /** Back-compatible wrapper: the parsed body, or null for any failure. */
-async function fetchJson(
+export async function fetchJson(
   path: string,
   apiKey: string,
   opts: { timeoutMs?: number; method?: string; body?: unknown; retries?: number } = {}
