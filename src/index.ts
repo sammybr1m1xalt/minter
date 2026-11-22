@@ -132,7 +132,17 @@ function parseFlags(argv: string[]): CliFlags {
       out.maxPrice = value("--max-price", a.split("=").slice(1).join("="));
     } else if (a === "--wallets" || a === "-w") out.wallets = value(a, argv[++i]);
     else if (a === "--chain") out.chain = value(a, argv[++i]);
-    else if (a === "--token-id") out.tokenId = Number(value(a, argv[++i])) || null;
+    else if (a === "--token-id") {
+      // Same treatment as --quantity: refuse rather than silently ignore. The
+      // old `Number(x) || null` turned 0 into "no target" and "abc" into "no
+      // target", so a typo quietly cost the positional snipe.
+      const raw = value(a, argv[++i]);
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1) {
+        throw new Error(`${a} must be a positive integer, got "${raw}".`);
+      }
+      out.tokenId = n;
+    }
     else if (a === "--quantity" || a === "-q") {
       const raw = value(a, argv[++i]);
       const n = Number(raw);
@@ -175,9 +185,6 @@ function validateFlags(flags: CliFlags): string | null {
   }
   if (flags.quantity != null && flags.quantity < 1) {
     return `--quantity must be at least 1.`;
-  }
-  if (flags.tokenId != null && (!Number.isInteger(flags.tokenId) || flags.tokenId < 1)) {
-    return `--token-id must be a positive integer.`;
   }
   return null;
 }
