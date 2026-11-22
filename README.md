@@ -871,8 +871,10 @@ Turns a PUBLIC finding into a target list. It reads only the mapping the
 contract already publishes — nothing new is discovered — and scores each token
 as the sum over its traits of `scored / count`. Higher = rarer.
 
-- `--limit` defaults to 500 (`0` = everything). The unbounded version crawls
-  all 10,000 and times out; the gateways throttle a single IP hard.
+- `--limit` defaults to 100 (`0` = everything). It bounds ATTEMPTS, not
+  successes: measured on BAYC, 100 attempts scored ~10 and 500 attempts scored
+  ~3, because the gateways throttle a single IP. The cache is what makes a
+  large table accumulative rather than a single long run.
 - The sample is spread across the whole id range, not a contiguous prefix — a
   prefix is a strange target set and is biased if a collection mints in trait
   order.

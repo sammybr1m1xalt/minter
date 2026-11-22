@@ -96,7 +96,7 @@ function parseArgs(args: string[]): {
   --yes, -y          with --buy, send without asking
   --slug <slug>      override the collection slug (an address can resolve to
                      several OpenSea collections; the resolver refuses to guess)
-                     (--limit defaults to 500; --limit 0 scores everything)
+                     (--limit defaults to 100; --limit 0 scores everything)
 
 Reads only public data: the contract's baseURI / contractURI / tokenURI and
 whatever IPFS or Arweave CIDs those already point at.`);
@@ -279,7 +279,7 @@ async function runRarity(o: {
     cid,
     gateways: o.gateway ? [o.gateway] : undefined,
     concurrency: o.concurrency,
-    limit: o.limit ?? 500,
+    limit: o.limit ?? 100,
     timeoutMs: 600_000,
     onProgress: (done, ok) => {
       if (done % 200 === 0 || done === ok) {
@@ -297,7 +297,7 @@ async function runRarity(o: {
   const pct = listed > 0 ? (report.scored / listed) * 100 : 0;
 
   console.log(
-    `  listed:    ${listed} entries${crawl.truncated ? ` (sampled ${o.limit ?? 500} spread across the range)` : ""}`
+    `  listed:    ${listed} entries${crawl.truncated ? ` (sampled ${o.limit ?? 100} spread across the range)` : ""}`
   );
   // Say how much was ATTEMPTED, not just how much exists: "scored 38 / 10000"
   // reads as though 10000 were tried.

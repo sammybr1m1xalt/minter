@@ -27,7 +27,15 @@ interface RarityCache {
 }
 
 function cacheFile(cid: string): string {
-  return path.join(RARITY_CACHE_DIR, `${cid.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
+  // Normalise the scheme away: `Qm…` and `ipfs://Qm…` are the same directory, and
+  // without this they wrote two cache files and silently missed each other.
+  const bare = cid
+    .replace(/^ipfs:\/\//i, "")
+    .replace(/^ar:\/\//i, "")
+    .split("?")[0]
+    .split("#")[0]
+    .replace(/\/+$/, "");
+  return path.join(RARITY_CACHE_DIR, `${bare.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
 }
 
 export function loadRarityCache(cid: string): TokenTraits[] {
@@ -194,14 +202,22 @@ export async function listDirectoryEntries(
   timeoutMs = 60_000
 ): Promise<{ entries: string[]; truncated: boolean; gateway: string | null }> {
   const bare = cid.replace(/^ipfs:\/\//, "").replace(/^ar:\/\//, "").replace(/\/+$/, "");
-  for (const gateway of gateways) {
+  // The index is a single large request (BAYC's is 8.3MB) and the gateways
+  // throttle it like any other. One attempt per gateway is not enough: measured,
+  // all four could 429 in the same minute and the run then reported "listed: 0"
+  // and scored nothing.
+  for (let round = 0; round < 3; round++) {
+   for (const gateway of gateways) {
     const base = gateway.replace(/\/+$/, "");
     try {
       const r = await fetch(`${base}/${bare}/`, {
         signal: AbortSignal.timeout(timeoutMs),
         redirect: "follow",
       });
-      if (!r.ok) continue;
+      if (!r.ok) {
+        try { await r.body?.cancel(); } catch { /* ignore */ }
+        continue;
+      }
       const text = await r.text();
       const hrefs = [...text.matchAll(/href=["']?([^"'\s>]+)["']?/g)].map((m) => m[1]);
       const names = hrefs
@@ -211,6 +227,8 @@ export async function listDirectoryEntries(
     } catch {
       // Next gateway.
     }
+   }
+   if (round < 2) await new Promise((res) => setTimeout(res, 2000 * (round + 1)));
   }
   return { entries: [], truncated: false, gateway: null };
 }
