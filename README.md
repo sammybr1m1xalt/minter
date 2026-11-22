@@ -851,9 +851,11 @@ compares the name against the on-chain `tokenURI`, which is the window where
 OpenSea's index has run ahead of the contract (or lagged it). It is a report,
 not a verdict: it prints the keys OpenSea actually returned and only compares
 when both sides yielded a readable name. A missing or dead `OPENSEA_API_KEY` is
-reported as such. **This mode is unverified** — the key on disk returns
-`401 API key has expired`, so it has never seen a successful response; treat
-its output as raw evidence to read, not as a conclusion.
+reported as such. Verified live against BAYC with a working key: HTTP 200 with
+`traits` and `image` for in-range ids, 404 out of range. Note that OpenSea
+serves `name: ""` for most ids of a collection whose name lives on the image,
+so a non-empty name is not a reliable "has metadata" signal — the mode prints
+traits/image presence too.
 
 For a genuine OpenSea Studio drop the answer is `HIDDEN`: OpenSea holds the
 files privately until the reveal, so there is nothing to read before it. The
@@ -916,6 +918,19 @@ If a transaction is rejected by every endpoint, it says so plainly instead of
 waiting for a receipt that will never exist.
 
 ---
+
+## Verification scripts
+
+    cd scripts/verify && ./run-all.sh
+
+Fourteen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+mock JSON-RPC server and the fire-path harness; the others cover the audit
+fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
+scan and the Scatter paths. `npm run build` first.
+
+Three latency probes sit outside the default run because they print timings
+rather than verdicts and need a real endpoint: `t0-cost.js`, `rpc-floor.js`,
+`cold-start.js` (all take `MEASURE_RPC`).
 
 ## Security
 
