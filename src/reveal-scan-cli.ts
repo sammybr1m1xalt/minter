@@ -16,6 +16,7 @@ function parseArgs(args: string[]): {
   blocks: number;
   ids: number[];
   gateway: string | null;
+  opensea: boolean;
 } {
   let contract: string | null = null;
   let chainKey = "ethereum";
@@ -23,6 +24,7 @@ function parseArgs(args: string[]): {
   let blocks = 0;
   let ids: number[] = [];
   let gateway: string | null = null;
+  let opensea = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--chain") chainKey = args[++i] ?? chainKey;
@@ -40,6 +42,7 @@ function parseArgs(args: string[]): {
   --blocks <n>       sweep the last n blocks for metadata-like logs (default off)
   --ids 1,2,3        token ids to sample (default 1..5)
   --gateway <url>    pin a single IPFS gateway
+  --opensea          also ask OpenSea's public token endpoint and compare
 
 Reads only public data: the contract's baseURI / contractURI / tokenURI and
 whatever IPFS or Arweave CIDs those already point at.`);
@@ -48,7 +51,85 @@ whatever IPFS or Arweave CIDs those already point at.`);
       if (!contract) contract = a;
     }
   }
-  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, ids, gateway };
+  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, ids, gateway, opensea };
+}
+
+// ── OpenSea comparison (opt-in) ─────────────────────────────────────────────
+// The window this looks for: the metadata has gone public, but OpenSea's index
+// has not caught up with the contract yet — or has run ahead of it.
+//
+// Deliberately a REPORT, not a verdict. The response shape is not guessed: the
+// mode prints what OpenSea actually returned, and only compares when both sides
+// yielded a readable name. A key that is missing or dead is reported as such
+// rather than being turned into a conclusion.
+interface OpenseaProbe {
+  tokenId: number;
+  status: number | null;
+  error: string | null;
+  name: string | null;
+  image: string | null;
+  rawKeys: string[];
+}
+
+async function probeOpenseaToken(
+  chain: string,
+  contract: string,
+  tokenId: number,
+  apiKey: string,
+  timeoutMs = 15_000
+): Promise<OpenseaProbe> {
+  const out: OpenseaProbe = { tokenId, status: null, error: null, name: null, image: null, rawKeys: [] };
+  const url = `https://api.opensea.io/api/v2/chain/${encodeURIComponent(chain)}/token/${contract}/${tokenId}`;
+  try {
+    const r = await fetch(url, {
+      headers: { accept: "application/json", "x-api-key": apiKey },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    out.status = r.status;
+    const text = await r.text();
+    let body: any = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      out.error = `HTTP ${r.status}, non-JSON body (${text.slice(0, 80)})`;
+      return out;
+    }
+    if (body && typeof body === "object") {
+      out.rawKeys = Object.keys(body).slice(0, 12);
+      out.name = typeof body.name === "string" ? body.name : null;
+      out.image =
+        typeof body.image_url === "string"
+          ? body.image_url
+          : typeof body.image === "string"
+            ? body.image
+            : null;
+      if (!out.name && body.error) out.error = String(body.error);
+    } else {
+      out.error = `HTTP ${r.status}, empty body`;
+    }
+  } catch (e: any) {
+    out.error = e?.message ?? String(e);
+  }
+  return out;
+}
+
+/** Read the JSON a tokenURI points at, when it is reachable. */
+async function readTokenUriJson(uri: string | null, timeoutMs = 15_000): Promise<any | null> {
+  if (!uri) return null;
+  const bare = uri.replace(/^ipfs:\/\//, "").replace(/^ar:\/\//, "");
+  const candidates = bare.includes("/")
+    ? [`https://gateway.pinata.cloud/ipfs/${bare}`, `https://ipfs.io/ipfs/${bare}`]
+    : [`https://gateway.pinata.cloud/ipfs/${bare}`, `https://ipfs.io/ipfs/${bare}`];
+  for (const url of candidates) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: "follow" });
+      if (!r.ok) continue;
+      return JSON.parse(await r.text());
+    } catch {
+      // Next gateway.
+    }
+  }
+  return null;
 }
 
 export async function runRevealScanCli(args: string[]): Promise<number> {
@@ -118,9 +199,10 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
   if (r.error) console.log(chalk.red(`\n  error: ${r.error}\n`));
   console.log();
 
-  // 0 = hidden (nothing leaked), 1 = leaked or undetermined. A scanner that
-  // finds nothing is the success case, so it exits 0.
+  // Exit codes are a scanner's contract: 0 = nothing leaked, 1 = leaked,
+  // 2 = could not tell. "Could not tell" must not read as "clean" — an
+  // unreachable RPC is not evidence that a drop is hidden.
   if (r.verdict === "PUBLIC") return 1;
-  if (r.verdict === "PARTIAL" || r.verdict === "UNKNOWN") return 0;
+  if (r.verdict === "UNKNOWN") return 2;
   return 0;
 }

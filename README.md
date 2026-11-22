@@ -804,10 +804,22 @@ Measured, two wallets with one payload 6s late: the ready wallet fired at
 **T+271ms** instead of T+6s, and the late one still minted at T+6s. With both
 payloads late by 300ms or by 6s, both still leave in a single blast.
 
+### Site scan (`--scan`)
+
+    minter --scan <url> [--timeout ms] [--no-bundles]
+
+Fetches a page, pulls every address-shaped string out of the HTML, the inline
+scripts and the linked bundles, and prints them ranked by where they were found,
+with the evidence — source, JSON key, occurrence count.
+
+Not boxed to OpenSea, and deliberately **not** ranked by volume: a contract that
+has not minted yet has no volume, so that signal would be useless here. A high
+score is evidence, not proof; verify the candidate on-chain before minting it.
+
 ### Reveal scan (`--reveal-scan`)
 
     minter --reveal-scan <contract> [--chain ethereum] [--rpc <url>]
-           [--blocks <n>] [--ids 1,2,3] [--gateway <url>]
+           [--blocks <n>] [--ids 1,2,3] [--gateway <url>] [--opensea]
 
 Answers whether a drop's token-id → artwork mapping is actually private. It
 reads only public data: `baseURI()`, `contractURI()`, a sample of
@@ -829,8 +841,19 @@ The checks, in order:
      (256KB) because a 10,000-entry index is megabytes.
   5. A bounded log sweep (`--blocks`) for `ipfs://` / `ar://` references.
 
-Verdicts: `HIDDEN`, `PARTIAL`, `PUBLIC`, `UNKNOWN`. Exit code 1 only for
-`PUBLIC` — a scanner that finds nothing is the success case.
+Verdicts: `HIDDEN`, `PARTIAL`, `PUBLIC`, `UNKNOWN`. Exit codes are the
+scanner's contract: `0` nothing leaked, `1` leaked (`PUBLIC`), `2` could not
+tell. "Could not tell" must not read as clean — an unreachable RPC is not
+evidence that a drop is hidden.
+
+`--opensea` also asks OpenSea's public token endpoint for the sampled ids and
+compares the name against the on-chain `tokenURI`, which is the window where
+OpenSea's index has run ahead of the contract (or lagged it). It is a report,
+not a verdict: it prints the keys OpenSea actually returned and only compares
+when both sides yielded a readable name. A missing or dead `OPENSEA_API_KEY` is
+reported as such. **This mode is unverified** — the key on disk returns
+`401 API key has expired`, so it has never seen a successful response; treat
+its output as raw evidence to read, not as a conclusion.
 
 For a genuine OpenSea Studio drop the answer is `HIDDEN`: OpenSea holds the
 files privately until the reveal, so there is nothing to read before it. The
