@@ -374,6 +374,83 @@ export interface MintOutcome {
   status: string;
 }
 
+/** The minimal shape the wave-1 sale reads, so it is not tied to SnipeResult. */
+export interface WaveSellable {
+  walletIndex: number;
+  /** SnipeResult calls it walletAddress; a wizard's own MintOutcome calls it address. */
+  walletAddress?: string;
+  address?: string;
+  txHash?: string | null;
+  status?: string | null;
+  receipt?: { status?: string } | null;
+  success?: boolean;
+}
+
+export function toSellOutcomes(rs: WaveSellable[]): MintOutcome[] {
+  return rs.map((r) => ({
+    walletIndex: r.walletIndex,
+    address: r.walletAddress ?? r.address ?? "",
+    txHash: r.txHash ?? null,
+    status:
+      // Prefer the confirmed tri-state from the snipe; fall back to the old
+      // derivation for results built before the receipt stage.
+      r.status ?? (r.receipt?.status === "REVERTED" ? "REVERTED" : r.success ? "SUCCESS" : "FAILED"),
+  }));
+}
+
+export interface WaveSellParams {
+  sellPlan: SellPlan | null;
+  walletKeys: string[];
+  contract: string;
+  slug: string;
+  chainKey: string;
+  apiKey: string;
+  rpcUrl: string;
+  chainId: number;
+  symbol?: string;
+}
+
+/**
+ * The wave-1 sale, shared by both wizards.
+ *
+ * A wallet whose payload never arrives holds the run open for its full retry
+ * window, and the sell step runs after the snipe returns — so one dead wallet
+ * delayed the sale of every wallet that did mint. Selling each wave as it lands
+ * fixes that.
+ *
+ * Only confirmed SUCCESS wallets are sold here; UNKNOWN ones wait for the
+ * post-run receipt re-check, so a late-landing mint is never wrongly skipped.
+ * The sales are chained, never concurrent, so two sales cannot overlap on a
+ * wallet — and `finish()` lets the caller await the tail before the post-run
+ * sale starts.
+ */
+export function createWaveSell(p: WaveSellParams) {
+  const soldWalletIndexes = new Set<number>();
+  let sellChain: Promise<void> = Promise.resolve();
+
+  const onWave = (wave: number, waveResults: WaveSellable[]) => {
+    if (!p.sellPlan || !p.sellPlan.enabled || wave !== 1) return;
+    const outcomes = toSellOutcomes(waveResults).filter(
+      (o) => o.status === "SUCCESS" && o.txHash && !soldWalletIndexes.has(o.walletIndex)
+    );
+    if (outcomes.length === 0) return;
+    for (const o of outcomes) soldWalletIndexes.add(o.walletIndex);
+    const plan = p.sellPlan;
+    sellChain = sellChain.then(() =>
+      runSellAfterMint({ ...p, sellPlan: plan, mintOutcomes: outcomes })
+    );
+  };
+
+  return {
+    onWave,
+    finish: () => sellChain,
+    sold: soldWalletIndexes,
+    /** Outcomes not already sold by a wave, for the post-run sale. */
+    pending: (rs: WaveSellable[]) =>
+      toSellOutcomes(rs).filter((o) => !soldWalletIndexes.has(o.walletIndex)),
+  };
+}
+
 /** Sell each successful wallet's minted tokens, sequentially. */
 export async function runSellAfterMint(params: {
   sellPlan: SellPlan;
