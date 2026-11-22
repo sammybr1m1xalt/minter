@@ -118,6 +118,10 @@ export const DEFAULT_GATEWAYS = [
   "https://gateway.pinata.cloud/ipfs",
   "https://w3s.link/ipfs",
   "https://dweb.link/ipfs",
+  // Measured: these four can ALL 429 in the same minute. gw3.io answered 200
+  // while the others refused, so a fifth is the difference between "runs" and
+  // "reports UNKNOWN". Add more as they prove themselves.
+  "https://gw3.io/ipfs",
 ];
 
 /** How much of a directory index to read before deciding it is one. */
