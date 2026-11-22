@@ -7,6 +7,7 @@
 import chalk from "chalk";
 import { getValidApiKey } from "./opensea-key";
 import { inspectPublicCid, scanReveal } from "./reveal-scan";
+import { computeRarity, crawlTraits } from "./rarity";
 import { resolveChain } from "./chains";
 import { resolveRpcsForChain } from "./rpc-resolver";
 
@@ -19,6 +20,10 @@ function parseArgs(args: string[]): {
   gateway: string | null;
   opensea: boolean;
   ipfsLink: string | null;
+  rarity: boolean;
+  limit: number | null;
+  concurrency: number;
+  top: number;
 } {
   let contract: string | null = null;
   let chainKey = "ethereum";
@@ -28,6 +33,10 @@ function parseArgs(args: string[]): {
   let gateway: string | null = null;
   let opensea = false;
   let ipfsLink: string | null = null;
+  let rarity = false;
+  let limit: number | null = null;
+  let concurrency = 6;
+  let top = 20;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--chain") chainKey = args[++i] ?? chainKey;
@@ -39,6 +48,10 @@ function parseArgs(args: string[]): {
     } else if (a === "--gateway") gateway = args[++i] ?? null;
     else if (a === "--opensea") opensea = true;
     else if (a === "--ipfs") ipfsLink = args[++i] ?? null;
+    else if (a === "--rarity") rarity = true;
+    else if (a === "--limit") limit = Number(args[++i] ?? 0) || null;
+    else if (a === "--concurrency") concurrency = Number(args[++i] ?? 6) || 6;
+    else if (a === "--top") top = Number(args[++i] ?? 20) || 20;
     else if (a === "--help" || a === "-h") {
       console.log(`Usage: minter --reveal-scan <contract> [options]
 
@@ -49,6 +62,11 @@ function parseArgs(args: string[]): {
   --gateway <url>    pin a single IPFS gateway
   --opensea          also ask OpenSea's public token endpoint and compare
   --ipfs <link>      view an ipfs:// link, a CID, or a gateway URL (no contract)
+  --rarity           score the mapping: trait rarities + the rarest token ids
+  --limit <n>        with --rarity, stop after n tokens
+  --concurrency <n>  with --rarity, parallel metadata fetches (default 6)
+  --top <n>          with --rarity, how many rarest ids to list (default 20)
+                     (--limit defaults to 500; --limit 0 scores everything)
 
 Reads only public data: the contract's baseURI / contractURI / tokenURI and
 whatever IPFS or Arweave CIDs those already point at.`);
@@ -57,7 +75,7 @@ whatever IPFS or Arweave CIDs those already point at.`);
       if (!contract) contract = a;
     }
   }
-  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, ids, gateway, opensea, ipfsLink };
+  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, ids, gateway, opensea, ipfsLink, rarity, limit, concurrency, top };
 }
 
 // ── OpenSea comparison (opt-in) ─────────────────────────────────────────────
@@ -167,6 +185,125 @@ function normalizeIpfsLink(link: string): string | null {
   return /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[A-Za-z2-7]{20,})$/.test(cid) ? bare.replace(/\/+$/, "") : null;
 }
 
+/**
+ * Rarity over a published mapping.
+ *
+ * With --ipfs the CID is given directly. With a contract, the reveal scan runs
+ * first and the CID is whatever directory it resolved — so this never reads
+ * anything the contract does not already publish.
+ */
+async function runRarity(o: {
+  cid: string | null;
+  gateway: string | null;
+  limit: number | null;
+  concurrency: number;
+  top: number;
+  contract: string | null;
+  chainKey: string;
+  rpcs: string[];
+  ids: number[];
+  blocks: number;
+}): Promise<number> {
+  let cid = o.cid ? normalizeIpfsLink(o.cid) : null;
+
+  if (!cid && o.contract) {
+    const profile = resolveChain(o.chainKey);
+    if (!profile) {
+      console.error(chalk.red(`\n❌ unknown chain: ${o.chainKey}\n`));
+      return 2;
+    }
+    const rpcs = o.rpcs.length > 0 ? o.rpcs : resolveRpcsForChain(profile.key, []).urls;
+    const r = await scanReveal({
+      rpcUrls: rpcs,
+      chainId: profile.chainId,
+      contract: o.contract,
+      sampleTokenIds: o.ids.length > 0 ? o.ids : undefined,
+      logScanBlocks: o.blocks,
+      ipfsGateways: o.gateway ? [o.gateway] : undefined,
+    });
+    const dir = r.inspections.find((i) => i.kind === "directory");
+    if (!dir) {
+      console.log(chalk.yellow("\n  No published metadata directory for this contract — nothing to score."));
+      console.log(chalk.gray("  Rarity needs the full id -> metadata mapping, not a single placeholder file."));
+      console.log();
+      return 0;
+    }
+    cid = dir.cid;
+    if (r.verdict !== "PUBLIC") {
+      console.log(chalk.yellow(`\n  note: the reveal scan verdict is ${r.verdict}, not PUBLIC.`));
+    }
+  }
+
+  if (!cid) {
+    console.error(chalk.red("\n❌ --rarity needs a published metadata directory: pass --ipfs <link> or a contract.\n"));
+    return 2;
+  }
+
+  console.log(chalk.gray(`\n  rarity: ${cid}\n`));
+  const crawl = await crawlTraits({
+    cid,
+    gateways: o.gateway ? [o.gateway] : undefined,
+    concurrency: o.concurrency,
+    limit: o.limit ?? 500,
+    timeoutMs: 600_000,
+    onProgress: (done, ok) => {
+      if (done % 200 === 0 || done === ok) {
+        process.stdout.write(chalk.gray(`\r    fetched ${done} entries, ${ok} scored...`));
+      }
+    },
+  });
+  process.stdout.write("\r" + " ".repeat(60) + "\r");
+
+  const report = computeRarity(crawl.tokens);
+  const listed = crawl.listed;
+  const pct = listed > 0 ? (report.scored / listed) * 100 : 0;
+
+  console.log(
+    `  listed:    ${listed} entries${crawl.truncated ? ` (sampled ${o.limit ?? 500} spread across the range)` : ""}`
+  );
+  console.log(`  scored:    ${report.scored} / ${listed} (${pct.toFixed(1)}%) in ${(crawl.elapsedMs / 1000).toFixed(1)}s`);
+  if (crawl.failed > 0) console.log(chalk.yellow(`  failed:    ${crawl.failed} entries could not be read`));
+  if (crawl.skipped > 0) console.log(chalk.gray(`  skipped:   ${crawl.skipped} non-token entries`));
+  console.log();
+
+  if (report.scored === 0) {
+    console.log(chalk.yellow("  Nothing could be scored — every gateway refused or timed out."));
+    console.log(chalk.yellow("  That is a network result, not a property of the collection."));
+    console.log();
+    return 2;
+  }
+
+  if (pct < 100) {
+    console.log(chalk.yellow(`  ⚠ Only ${pct.toFixed(1)}% of the mapping was read. "Rarest" below means rarest`));
+    console.log(chalk.yellow("    among the tokens that were actually scored — a lower bound, not the full table."));
+    console.log();
+  }
+
+  const types = Object.keys(report.frequencies);
+  console.log(chalk.gray(`  trait types: ${types.join(", ") || "(none)"}`));
+  console.log();
+  console.log("  rarest tokens:");
+  report.rows.slice(0, o.top).forEach((row, i) => {
+    const traitText = row.traits
+      .slice()
+      .sort((a, b) => a.pct - b.pct)
+      .slice(0, 3)
+      .map((t) => `${t.type}=${t.value} (${t.pct.toFixed(1)}%)`)
+      .join(", ");
+    console.log(
+      `  ${String(i + 1).padStart(2)}. token ${String(row.tokenId).padStart(6)}  score ${row.score.toFixed(1).padStart(8)}  ${traitText}`
+    );
+  });
+  if (report.rows.length > o.top) {
+    console.log(chalk.gray(`\n  …and ${report.rows.length - o.top} more`));
+  }
+  console.log();
+  console.log(chalk.gray("  Rarity is a property of the metadata, not a market value."));
+  console.log(chalk.gray("  Token ids are sequential — pair a target id with --token-id."));
+  console.log();
+  return 0;
+}
+
 async function runIpfsView(link: string, gateway: string | null): Promise<number> {
   const cid = normalizeIpfsLink(link);
   if (!cid) {
@@ -202,6 +339,21 @@ async function runIpfsView(link: string, gateway: string | null): Promise<number
 
 export async function runRevealScanCli(args: string[]): Promise<number> {
   const parsed = parseArgs(args);
+  // --rarity wins over a plain --ipfs view: scoring the directory subsumes it.
+  if (parsed.rarity) {
+    return runRarity({
+      cid: parsed.ipfsLink,
+      gateway: parsed.gateway,
+      limit: parsed.limit,
+      concurrency: parsed.concurrency,
+      top: parsed.top,
+      contract: parsed.contract,
+      chainKey: parsed.chainKey,
+      rpcs: parsed.rpcs,
+      ids: parsed.ids,
+      blocks: parsed.blocks,
+    });
+  }
   if (parsed.ipfsLink) {
     return runIpfsView(parsed.ipfsLink, parsed.gateway);
   }

@@ -113,7 +113,7 @@ function callBig(provider: JsonRpcProvider, to: string, sig: string, args: any[]
 // from a single IP (measured 429 on a handful of requests) and cloudflare-ipfs
 // is often unreachable, so a hard-coded single gateway would report a
 // perfectly public CID as "unfetchable".
-const DEFAULT_GATEWAYS = [
+export const DEFAULT_GATEWAYS = [
   "https://ipfs.io/ipfs",
   "https://gateway.pinata.cloud/ipfs",
   "https://w3s.link/ipfs",
