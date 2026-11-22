@@ -61,6 +61,8 @@ export interface IpfsInspection {
   fileCount: number;
   sample: string[];
   note?: string;
+  /** A URL that actually serves this CID, so the finding is viewable. */
+  url: string | null;
 }
 
 export interface RevealScanResult {
@@ -188,6 +190,7 @@ export async function inspectPublicCid(
             fileCount: entries.length,
             sample: entries.slice(0, 5).map((h) => h.slice(0, 80)),
             note: `via ${gateway}${text.length >= MAX_INDEX_BYTES ? " (prefix only)" : ""}`,
+            url,
           };
         }
         let note: string | undefined;
@@ -197,13 +200,13 @@ export async function inspectPublicCid(
         } catch {
           note = `${text.slice(0, 60)} via ${gateway}`;
         }
-        return { cid, kind: "file", fileCount: 1, sample: [text.slice(0, 120)], note };
+        return { cid, kind: "file", fileCount: 1, sample: [text.slice(0, 120)], note, url };
       } catch {
         // Try the next suffix / gateway.
       }
     }
   }
-  return { cid, kind: "unfetchable", fileCount: 0, sample: [], note: "no gateway answered" };
+  return { cid, kind: "unfetchable", fileCount: 0, sample: [], note: "no gateway answered", url: null };
 }
 
 function extractCids(text: string | null): string[] {

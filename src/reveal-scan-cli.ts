@@ -6,7 +6,7 @@
 // for what it deliberately does not do.
 import chalk from "chalk";
 import { getValidApiKey } from "./opensea-key";
-import { scanReveal } from "./reveal-scan";
+import { inspectPublicCid, scanReveal } from "./reveal-scan";
 import { resolveChain } from "./chains";
 import { resolveRpcsForChain } from "./rpc-resolver";
 
@@ -18,6 +18,7 @@ function parseArgs(args: string[]): {
   ids: number[];
   gateway: string | null;
   opensea: boolean;
+  ipfsLink: string | null;
 } {
   let contract: string | null = null;
   let chainKey = "ethereum";
@@ -26,6 +27,7 @@ function parseArgs(args: string[]): {
   let ids: number[] = [];
   let gateway: string | null = null;
   let opensea = false;
+  let ipfsLink: string | null = null;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--chain") chainKey = args[++i] ?? chainKey;
@@ -36,6 +38,7 @@ function parseArgs(args: string[]): {
       ids = raw.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 0);
     } else if (a === "--gateway") gateway = args[++i] ?? null;
     else if (a === "--opensea") opensea = true;
+    else if (a === "--ipfs") ipfsLink = args[++i] ?? null;
     else if (a === "--help" || a === "-h") {
       console.log(`Usage: minter --reveal-scan <contract> [options]
 
@@ -45,6 +48,7 @@ function parseArgs(args: string[]): {
   --ids 1,2,3        token ids to sample (default 1..5)
   --gateway <url>    pin a single IPFS gateway
   --opensea          also ask OpenSea's public token endpoint and compare
+  --ipfs <link>      view an ipfs:// link, a CID, or a gateway URL (no contract)
 
 Reads only public data: the contract's baseURI / contractURI / tokenURI and
 whatever IPFS or Arweave CIDs those already point at.`);
@@ -53,7 +57,7 @@ whatever IPFS or Arweave CIDs those already point at.`);
       if (!contract) contract = a;
     }
   }
-  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, ids, gateway, opensea };
+  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, ids, gateway, opensea, ipfsLink };
 }
 
 // ── OpenSea comparison (opt-in) ─────────────────────────────────────────────
@@ -141,8 +145,66 @@ async function readTokenUriJson(uri: string | null, timeoutMs = 15_000): Promise
   return null;
 }
 
+// A CIDv0 (Qm…, 46 chars) or a CIDv1 (base32, starts b). Accepts ipfs://,
+// ar://, a bare CID, or a full gateway URL.
+function normalizeIpfsLink(link: string): string | null {
+  const raw = link.trim();
+  if (!raw) return null;
+  if (/^https?:\/\//i.test(raw)) {
+    // Keep everything after /ipfs/, not just the CID: .../ipfs/<cid>/2 is token
+    // 2's file, and reducing it to the CID would show the directory instead.
+    const m = raw.match(/\/ipfs\/([^?#]+)/i);
+    if (!m) return null;
+    const parts = m[1].replace(/\/+$/, "").split("/");
+    return /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[A-Za-z2-7]{20,})$/.test(parts[0])
+      ? parts.join("/")
+      : null;
+  }
+  // Keep any /path after the CID: ipfs://<cid>/1 is token 1's JSON, and dropping
+  // the path would silently show the directory instead of the file.
+  const bare = raw.replace(/^ipfs:\/\//i, "").replace(/^ar:\/\//i, "").split("?")[0].split("#")[0];
+  const cid = bare.split("/")[0];
+  return /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[A-Za-z2-7]{20,})$/.test(cid) ? bare.replace(/\/+$/, "") : null;
+}
+
+async function runIpfsView(link: string, gateway: string | null): Promise<number> {
+  const cid = normalizeIpfsLink(link);
+  if (!cid) {
+    console.error(chalk.red(`\n❌ not an IPFS link or CID: ${link}\n`));
+    return 2;
+  }
+  console.log(chalk.gray(`\n  ipfs: ${link}\n`));
+  const r = await inspectPublicCid(cid, gateway ? [gateway] : undefined);
+  console.log(`  kind:      ${r.kind}  files=${r.fileCount}`);
+  if (r.url) console.log(`  url:       ${r.url}`);
+  if (r.note) console.log(`  note:      ${r.note}`);
+  if (r.sample.length > 0) console.log(`  sample:    ${r.sample.slice(0, 8).join(", ")}`);
+  console.log();
+  if (r.kind === "unfetchable") {
+    console.log(chalk.yellow("  No gateway answered. A bot wall or rate limit still returns HTML,"));
+    console.log(chalk.yellow("  so this is \"could not fetch\", not \"does not exist\"."));
+    console.log();
+    return 2;
+  }
+  if (r.kind === "file") {
+    // One JSON is not automatically the placeholder: it is the placeholder only
+    // when it is the SAME document for every id. Say what it is, not what it
+    // implies.
+    console.log(chalk.gray("  A single file. Whether that is the placeholder depends on whether every"));
+    console.log(chalk.gray("  id returns this same document — compare it against another id."));
+    console.log();
+  } else {
+    console.log(chalk.gray("  A directory of per-token files: the full id -> metadata mapping."));
+    console.log();
+  }
+  return 0;
+}
+
 export async function runRevealScanCli(args: string[]): Promise<number> {
   const parsed = parseArgs(args);
+  if (parsed.ipfsLink) {
+    return runIpfsView(parsed.ipfsLink, parsed.gateway);
+  }
   if (!parsed.contract) {
     console.error(chalk.red("\n❌ reveal-scan needs a contract address: minter --reveal-scan <contract>\n"));
     return 2;
@@ -193,6 +255,7 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
   for (const i of r.inspections) {
     console.log(`  cid:       ${i.cid}`);
     console.log(`    ${i.kind}  files=${i.fileCount}  ${i.note ?? ""}`);
+    if (i.url) console.log(chalk.gray(`    view: ${i.url}`));
     if (i.sample.length > 0) console.log(`    sample: ${i.sample.join(", ")}`);
   }
 

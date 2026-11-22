@@ -820,6 +820,7 @@ score is evidence, not proof; verify the candidate on-chain before minting it.
 
     minter --reveal-scan <contract> [--chain ethereum] [--rpc <url>]
            [--blocks <n>] [--ids 1,2,3] [--gateway <url>] [--opensea]
+           [--ipfs <link>]
 
 Answers whether a drop's token-id → artwork mapping is actually private. It
 reads only public data: `baseURI()`, `contractURI()`, a sample of
@@ -845,6 +846,21 @@ Verdicts: `HIDDEN`, `PARTIAL`, `PUBLIC`, `UNKNOWN`. Exit codes are the
 scanner's contract: `0` nothing leaked, `1` leaked (`PUBLIC`), `2` could not
 tell. "Could not tell" must not read as clean — an unreachable RPC is not
 evidence that a drop is hidden.
+
+Every CID the scan resolves is printed with a `view:` line carrying a URL that
+actually serves it, so a finding is directly openable rather than a bare
+`ipfs://` string.
+
+`--ipfs <link>` views a link without a contract — an `ipfs://` or `ar://` URL,
+a bare CID, a gateway URL, or a path into a directory (`ipfs://<cid>/1` fetches
+token 1's JSON, not the directory):
+
+    minter --reveal-scan --ipfs ipfs://QmeSjSinHpPnmXmspMjwiXyN6zS4E9zccariGR3jxcaWtq
+
+It prints the kind (`directory`, `file`, `unfetchable`), a serving URL, the
+entry count and a sample. A single file is not automatically the placeholder —
+that depends on whether every id returns the same document. `unfetchable` means
+no gateway answered, which is not the same as "does not exist".
 
 `--opensea` also asks OpenSea's public token endpoint for the sampled ids and
 compares the name against the on-chain `tokenURI`, which is the window where
