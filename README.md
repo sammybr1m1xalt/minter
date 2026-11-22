@@ -1,4 +1,4 @@
-# NFT Mint Sniper
+# NFT Sniper
 
 A command-line tool for sniping NFT mints. It targets OpenSea's SeaDrop across
 five chains, and also mints **any** contract with a discoverable mint function —
