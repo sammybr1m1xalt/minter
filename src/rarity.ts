@@ -38,6 +38,48 @@ function cacheFile(cid: string): string {
   return path.join(RARITY_CACHE_DIR, `${bare.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
 }
 
+interface RarityIndexCache {
+  cid: string;
+  updatedAt: string;
+  entries: string[];
+}
+
+function indexCacheFile(cid: string): string {
+  return cacheFile(cid).replace(/\.json$/, ".index.json");
+}
+
+/**
+ * The directory index is a single large request (BAYC's is 8.3MB) and the
+ * gateways throttle it like any other — measured: all four 429'd in the same
+ * minute, and the run reported "listed: 0" and scored nothing. The entry list is
+ * stable for a given CID, so it is cached alongside the tokens and a re-run does
+ * not need to refetch it.
+ */
+export function loadRarityIndex(cid: string): string[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(indexCacheFile(cid), "utf-8")) as RarityIndexCache;
+    if (raw?.cid !== cid || !Array.isArray(raw.entries)) return [];
+    return raw.entries.filter((e: unknown): e is string => typeof e === "string");
+  } catch {
+    return [];
+  }
+}
+
+export function saveRarityIndex(cid: string, entries: string[]): void {
+  try {
+    fs.mkdirSync(RARITY_CACHE_DIR, { recursive: true, mode: 0o700 });
+    const tmp = indexCacheFile(cid) + ".tmp";
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify({ cid, updatedAt: new Date().toISOString(), entries }),
+      { encoding: "utf-8", mode: 0o600 }
+    );
+    fs.renameSync(tmp, indexCacheFile(cid));
+  } catch {
+    // The cache is an optimisation, not a requirement.
+  }
+}
+
 export function loadRarityCache(cid: string): TokenTraits[] {
   try {
     const raw = JSON.parse(fs.readFileSync(cacheFile(cid), "utf-8")) as RarityCache;
@@ -166,6 +208,8 @@ export interface CrawlResult {
   elapsedMs: number;
   /** Tokens carried over from the cache rather than fetched this run. */
   fromCache: number;
+  /** True when the directory entry list came from the cache, not the network. */
+  indexFromCache: boolean;
 }
 
 /** Parse the trait list out of a metadata JSON document, tolerating shapes. */
@@ -249,7 +293,14 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
   const requestTimeoutMs = opts.requestTimeoutMs ?? 20_000;
   const deadline = started + (opts.timeoutMs ?? 180_000);
 
-  const listed = await listDirectoryEntries(opts.cid, gateways);
+  const cachedIndex = opts.useCache === false ? [] : loadRarityIndex(opts.cid);
+  const listed =
+    cachedIndex.length > 0
+      ? { entries: cachedIndex, truncated: false, gateway: "cache" }
+      : await listDirectoryEntries(opts.cid, gateways);
+  // Only overwrite when the fetch found MORE than the cache holds, so a
+  // throttled fetch (0 entries) cannot wipe a good index.
+  if (listed.entries.length > cachedIndex.length) saveRarityIndex(opts.cid, listed.entries);
   const bare = opts.cid.replace(/^ipfs:\/\//, "").replace(/^ar:\/\//, "").replace(/\/+$/, "");
   const numeric = listed.entries
     .map((n) => Number(n.replace(/\.json$/i, "")))
@@ -330,5 +381,6 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
     truncated: opts.limit != null && opts.limit > 0 && numeric.length > opts.limit,
     elapsedMs: Date.now() - started,
     fromCache: cached.length,
+    indexFromCache: cachedIndex.length > 0,
   };
 }

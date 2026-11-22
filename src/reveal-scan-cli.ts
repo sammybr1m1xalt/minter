@@ -46,7 +46,7 @@ function parseArgs(args: string[]): {
   let ipfsLink: string | null = null;
   let rarity = false;
   let limit: number | null = null;
-  let concurrency = 6;
+  let concurrency = 8;
   let top = 20;
   let pick = 0;
   let listings = false;
@@ -85,7 +85,7 @@ function parseArgs(args: string[]): {
   --ipfs <link>      view an ipfs:// link, a CID, or a gateway URL (no contract)
   --rarity           score the mapping: trait rarities + the rarest token ids
   --limit <n>        with --rarity, stop after n tokens
-  --concurrency <n>  with --rarity, parallel metadata fetches (default 6)
+  --concurrency <n>  with --rarity, parallel metadata fetches (default 8)
   --top <n>          with --rarity, how many rarest ids to list (default 20)
   --pick <n>         with --rarity, print a ready --token-id command for the nth
                      rarest token (scanner -> rarity -> position -> fire)
@@ -304,10 +304,21 @@ async function runRarity(o: {
   console.log(
     `  attempted: ${crawl.tokens.length} id(s)  (${crawl.fromCache} cached, ${crawl.tokens.length - crawl.fromCache} fetched this run)`
   );
-  console.log(`  scored:    ${report.scored} / ${listed} collection entries (${pct.toFixed(1)}%) in ${(crawl.elapsedMs / 1000).toFixed(1)}s`);
+  if (listed > 0) {
+    console.log(
+      `  scored:    ${report.scored} / ${listed} collection entries (${pct.toFixed(1)}%) in ${(crawl.elapsedMs / 1000).toFixed(1)}s`
+    );
+  } else {
+    // The index could not be read, so there is no denominator. Scored tokens are
+    // still reported — from the cache — but coverage is unknown, not zero.
+    console.log(
+      `  scored:    ${report.scored} from cache in ${(crawl.elapsedMs / 1000).toFixed(1)}s (directory index unavailable — coverage unknown)`
+    );
+  }
   if (crawl.failed > 0) console.log(chalk.yellow(`  failed:    ${crawl.failed} entries could not be read`));
   if (crawl.skipped > 0) console.log(chalk.gray(`  skipped:   ${crawl.skipped} non-token entries`));
   if (crawl.fromCache > 0) console.log(chalk.gray(`  cache:     ${crawl.fromCache} token(s) reused from .minter-cache/rarity`));
+  if (crawl.indexFromCache) console.log(chalk.gray("  index:     reused from .minter-cache/rarity (no gateway fetch)"));
   console.log();
 
   if (report.scored === 0) {
@@ -317,7 +328,7 @@ async function runRarity(o: {
     return 2;
   }
 
-  if (pct < 100) {
+  if (listed > 0 && pct < 100) {
     console.log(chalk.yellow(`  ⚠ Only ${pct.toFixed(1)}% of the mapping was read. "Rarest" below means rarest`));
     console.log(chalk.yellow("    among the tokens that were actually scored — a lower bound, not the full table."));
     console.log();
