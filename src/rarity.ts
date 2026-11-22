@@ -210,6 +210,10 @@ export interface CrawlResult {
   fromCache: number;
   /** True when the directory entry list came from the cache, not the network. */
   indexFromCache: boolean;
+  /** Where the token metadata came from. */
+  source: "directory" | "aggregate";
+  /** The aggregate file used, when source is "aggregate". */
+  aggregateFile: string | null;
 }
 
 /** Parse the trait list out of a metadata JSON document, tolerating shapes. */
@@ -264,9 +268,10 @@ export async function listDirectoryEntries(
       }
       const text = await r.text();
       const hrefs = [...text.matchAll(/href=["']?([^"'\s>]+)["']?/g)].map((m) => m[1]);
-      const names = hrefs
-        .map((h) => (h.split("/").pop() ?? "").split("?")[0])
-        .filter((n) => /^\d+(?:\.json)?$/i.test(n));
+      const names = hrefs.map((h) => (h.split("/").pop() ?? "").split("?")[0]);
+      // Every name is returned. Filtering to numeric ids here would hide the
+      // aggregate-file case (a single metadata.json), which the caller needs to
+      // see in order to try it.
       return { entries: [...new Set(names)], truncated: false, gateway: base };
     } catch {
       // Next gateway.
@@ -286,6 +291,111 @@ export async function listDirectoryEntries(
  * managed to read. A partial read is a result, not a failure — but it must be
  * visible as one.
  */
+const AGGREGATE_ID_KEYS = ["tokenId", "token_id", "tokenID", "id", "identifier", "edition", "number"];
+const AGGREGATE_LIST_KEYS = ["tokens", "metadata", "items", "nfts", "entries", "assets"];
+
+function aggregateIdOf(item: any, key: string | null = null): number | null {
+  for (const k of AGGREGATE_ID_KEYS) {
+    const v = item?.[k];
+    if (typeof v === "number" && Number.isInteger(v) && v >= 0) return v;
+    if (typeof v === "string" && /^\d+$/.test(v)) return Number(v);
+  }
+  // Keyed-by-id shape: the id is the object key, not a field in the value.
+  if (key != null && /^\d+$/.test(key)) return Number(key);
+  return null;
+}
+
+/**
+ * Pull the token list out of whichever aggregate shape a collection used.
+ * Each entry carries the key it was found under, because a keyed-by-id object
+ * stores the id in the key rather than in the value.
+ */
+function aggregateItemsOf(doc: any): { value: any; key: string | null }[] {
+  if (Array.isArray(doc)) return doc.map((v) => ({ value: v, key: null }));
+  for (const k of AGGREGATE_LIST_KEYS) {
+    if (Array.isArray(doc?.[k])) return doc[k].map((v: any) => ({ value: v, key: null }));
+  }
+  if (doc && typeof doc === "object") {
+    // Keyed by id: { "1": {...}, "2": {...} }. Require the values to look like
+    // metadata, so a settings object is not mistaken for a token list.
+    const entries = Object.entries(doc).filter(([, v]) => v != null && typeof v === "object");
+    if (
+      entries.length > 0 &&
+      entries.some(([, v]) => aggregateIdOf(v) != null || traitsOf(v).length > 0)
+    ) {
+      return entries.map(([k, v]) => ({ value: v, key: k }));
+    }
+  }
+  return [];
+}
+
+export interface AggregateMapping {
+  tokens: TokenTraits[];
+  file: string;
+  shape: "array" | "object";
+}
+
+/**
+ * Some collections publish ONE metadata file containing every token instead of a
+ * directory of per-token files. The directory then has no numeric entries and a
+ * per-id crawl would score nothing, so try the file.
+ *
+ * Refuses to guess: it returns null unless the document parses, yields at least
+ * one token with an id, and at least one token carries a trait. A placeholder
+ * file ("Unrevealed", no attributes) therefore reads as no data, not as a
+ * collection with no traits.
+ */
+export async function readAggregateMapping(
+  cid: string,
+  gateways: string[] = DEFAULT_GATEWAYS,
+  timeoutMs = 60_000,
+  maxBytes = 32 * 1024 * 1024
+): Promise<AggregateMapping | null> {
+  const bare = cid.replace(/^ipfs:\/\//i, "").replace(/^ar:\/\//i, "").replace(/\/+$/, "");
+  const { entries } = await listDirectoryEntries(cid, gateways, timeoutMs);
+  const files = entries.filter((n) => /\.json$/i.test(n));
+  if (files.length === 0) return null;
+  // A directory with many .json files is not an aggregate; picking one would be
+  // a guess.
+  if (files.length > 12) return null;
+
+  for (const file of files) {
+    for (const gateway of gateways) {
+      const base = gateway.replace(/\/+$/, "");
+      try {
+        const r = await fetch(`${base}/${bare}/${file}`, {
+          headers: { accept: "application/json", "user-agent": "Mozilla/5.0" },
+          signal: AbortSignal.timeout(timeoutMs),
+          redirect: "follow",
+        });
+        if (!r.ok) {
+          await r.body?.cancel().catch(() => {});
+          continue;
+        }
+        const text = await r.text();
+        if (text.length > maxBytes) continue;
+        const doc = JSON.parse(text);
+        const items = aggregateItemsOf(doc);
+        if (items.length === 0) continue;
+        const tokens: TokenTraits[] = [];
+        for (const { value, key } of items) {
+          const id = aggregateIdOf(value, key);
+          if (id == null) continue;
+          tokens.push({ tokenId: id, traits: traitsOf(value) });
+        }
+        if (tokens.length === 0) continue;
+        // No traits anywhere means a placeholder, not an aggregate mapping.
+        if (!tokens.some((t) => t.traits.length > 0)) continue;
+        tokens.sort((a, b) => a.tokenId - b.tokenId);
+        return { tokens, file, shape: Array.isArray(doc) ? "array" : "object" };
+      } catch {
+        // Next gateway.
+      }
+    }
+  }
+  return null;
+}
+
 export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
   const started = Date.now();
   const gateways = opts.gateways ?? DEFAULT_GATEWAYS;
@@ -306,13 +416,45 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
     .map((n) => Number(n.replace(/\.json$/i, "")))
     .filter((n) => Number.isInteger(n) && n >= 0)
     .sort((a, b) => a - b);
-  const skipped = listed.entries.length - numeric.length;
+  const nonNumeric = listed.entries.filter((n) => !/^\d+(?:\.json)?$/i.test(n));
+  const skipped = nonNumeric.length;
 
   // A contiguous prefix (ids 0..499) is a strange target set and is biased if a
   // collection ever mints in trait order. Spread the sample evenly across the
   // whole range instead: same statistical value, better spread of targets.
   // limit 0 means "no limit".
   const cached = opts.useCache === false ? [] : loadRarityCache(opts.cid);
+
+  // No per-token files: try a single aggregate metadata file before declaring
+  // the collection unscorable.
+  if (numeric.length === 0 && nonNumeric.length > 0) {
+    const agg = await readAggregateMapping(bare, gateways, requestTimeoutMs);
+    if (agg) {
+      const seen = new Set(cached.map((t) => t.tokenId));
+      const merged = [...cached];
+      for (const t of agg.tokens) {
+        if (!seen.has(t.tokenId)) {
+          seen.add(t.tokenId);
+          merged.push(t);
+        }
+      }
+      merged.sort((a, b) => a.tokenId - b.tokenId);
+      saveRarityCache(opts.cid, merged);
+      return {
+        tokens: merged,
+        listed: agg.tokens.length,
+        skipped,
+        failed: 0,
+        truncated: false,
+        elapsedMs: Date.now() - started,
+        fromCache: cached.length,
+        indexFromCache: cachedIndex.length > 0,
+        source: "aggregate",
+        aggregateFile: agg.file,
+      };
+    }
+  }
+
   const cachedIds = new Set(cached.map((t) => t.tokenId));
   const fresh = numeric.filter((id) => !cachedIds.has(id));
   // limit 0 means "no limit".
@@ -382,5 +524,7 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
     elapsedMs: Date.now() - started,
     fromCache: cached.length,
     indexFromCache: cachedIndex.length > 0,
+    source: "directory",
+    aggregateFile: null,
   };
 }

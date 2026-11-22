@@ -875,6 +875,12 @@ as the sum over its traits of `scored / count`. Higher = rarer.
   successes: measured on BAYC, 100 attempts scored ~10 and 500 attempts scored
   ~3, because the gateways throttle a single IP. The cache is what makes a
   large table accumulative rather than a single long run.
+- A collection that publishes ONE metadata file instead of a directory of
+  per-token files is read too: if the directory has no numeric entries, the
+  single `.json` file is tried (array, `{tokens: [...]}`, or keyed by id).
+  It is refused — not scored — unless at least one token carries a trait, so a
+  pre-reveal placeholder file reads as no data rather than as a trait-less
+  collection.
 - The sample is spread across the whole id range, not a contiguous prefix — a
   prefix is a strange target set and is biased if a collection mints in trait
   order.
@@ -1003,7 +1009,7 @@ waiting for a receipt that will never exist.
 
     cd scripts/verify && ./run-all.sh
 
- Fifteen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+ Sixteen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
 mock JSON-RPC server and the fire-path harness; the others cover the audit
 fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
 scan and the Scatter paths. `npm run build` first.
