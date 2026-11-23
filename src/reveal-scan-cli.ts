@@ -333,6 +333,16 @@ async function runRarity(o: {
   if (crawl.skipped > 0) console.log(chalk.gray(`  skipped:   ${crawl.skipped} non-token entries`));
   if (crawl.fromCache > 0) console.log(chalk.gray(`  cache:     ${crawl.fromCache} token(s) reused from .minter-cache/rarity`));
   if (crawl.indexFromCache) console.log(chalk.gray("  index:     reused from .minter-cache/rarity (no gateway fetch)"));
+  if (crawl.source === "aggregate") {
+    console.log(chalk.gray(`  source:    single aggregate file ${crawl.aggregateFile} (no per-token files)`));
+  }
+  if (crawl.ignoredTraits > 0) {
+    console.log(
+      chalk.gray(
+        `  ignored:   ${crawl.ignoredTraits} attribute entr${crawl.ignoredTraits === 1 ? "y" : "ies"} (no usable value, or an unknown display_type)`
+      )
+    );
+  }
   console.log();
 
   if (report.scored === 0) {

@@ -84,7 +84,21 @@ export function loadRarityCache(cid: string): TokenTraits[] {
   try {
     const raw = JSON.parse(fs.readFileSync(cacheFile(cid), "utf-8")) as RarityCache;
     if (raw?.cid !== cid || !Array.isArray(raw.tokens)) return [];
-    return raw.tokens.filter((t) => Number.isInteger(t.tokenId) && Array.isArray(t.traits));
+    // Entries written before trait classification have no `kind`/`displayType`.
+    // They are re-read as categorical, which is the old behaviour, until the
+    // token is fetched again.
+    return raw.tokens
+      .filter((t) => Number.isInteger(t.tokenId) && Array.isArray(t.traits))
+      .map((t) => ({
+        tokenId: t.tokenId,
+        traits: t.traits.map((tr: any) => ({
+          type: String(tr?.type ?? ""),
+          value: String(tr?.value ?? ""),
+          kind: (tr?.kind as TraitKind) ?? "categorical",
+          maxValue: typeof tr?.maxValue === "number" ? tr.maxValue : undefined,
+          displayType: typeof tr?.displayType === "string" ? tr.displayType : null,
+        })),
+      }));
   } catch {
     // No cache, unreadable cache, or a foreign shape: start empty rather than
     // trusting a file we cannot read.
@@ -110,9 +124,111 @@ export function saveRarityCache(cid: string, tokens: TokenTraits[]): void {
   }
 }
 
+/**
+ * How a trait's value should be read, from ERC-8495's `display_type`.
+ *
+ * The schema says clients MUST treat a `display_type` they do not recognise as
+ * absent, so anything outside the known set lands in `categorical` rather than
+ * being dropped or guessed at.
+ */
+export type TraitKind = "categorical" | "numeric" | "date";
+
+export interface Trait {
+  type: string;
+  value: string;
+  kind: TraitKind;
+  /** Only for numeric traits, and only when the collection published it. */
+  maxValue?: number;
+  /** The published `display_type`, lower-cased, or null when absent. */
+  displayType: string | null;
+}
+
 export interface TokenTraits {
   tokenId: number;
-  traits: { type: string; value: string }[];
+  traits: Trait[];
+}
+
+/** What a metadata document's `attributes` array yielded. */
+export interface ParsedTraits {
+  traits: Trait[];
+  /** Entries with no usable `value`. `value` is REQUIRED, so these are malformed. */
+  missingValue: number;
+  /** Entries with a value but no trait name. Valid per the schema, counted separately. */
+  missingType: number;
+  /** Entries whose `display_type` is not one the schema defines. */
+  unknownDisplayType: number;
+}
+
+const NUMERIC_DISPLAY_TYPES = new Set(["number", "boost_number", "boost_percentage"]);
+const KNOWN_DISPLAY_TYPES = new Set([
+  "",
+  "string",
+  "text",
+  "number",
+  "boost_number",
+  "boost_percentage",
+  "date",
+]);
+
+export function traitKindOf(displayType: string | null): TraitKind {
+  if (displayType == null || displayType === "") return "categorical";
+  if (displayType === "date") return "date";
+  if (NUMERIC_DISPLAY_TYPES.has(displayType)) return "numeric";
+  return "categorical";
+}
+
+/**
+ * Read the `attributes` array per ERC-8495.
+ *
+ * `value` is REQUIRED and may be a string or a number; `trait_type` SHOULD be
+ * present. An earlier version required `trait_type` and dropped anything without
+ * one, which silently skewed every frequency count.
+ */
+export function parseTraits(doc: any): ParsedTraits {
+  const list = Array.isArray(doc?.attributes)
+    ? doc.attributes
+    : Array.isArray(doc?.traits)
+      ? doc.traits
+      : [];
+  const traits: Trait[] = [];
+  let missingValue = 0;
+  let missingType = 0;
+  let unknownDisplayType = 0;
+
+  for (const a of list) {
+    if (a == null || typeof a !== "object") {
+      missingValue++;
+      continue;
+    }
+    const raw = a.value;
+    let value: string;
+    if (typeof raw === "string") value = raw;
+    else if (typeof raw === "number" && Number.isFinite(raw)) value = String(raw);
+    else {
+      missingValue++;
+      continue;
+    }
+    if (value === "") {
+      missingValue++;
+      continue;
+    }
+
+    const rawType = a.trait_type ?? a.type ?? a.name;
+    const type = rawType == null ? "" : String(rawType);
+    if (type === "") missingType++;
+
+    const displayType =
+      typeof a.display_type === "string" && a.display_type !== ""
+        ? a.display_type.toLowerCase()
+        : null;
+    if (displayType != null && !KNOWN_DISPLAY_TYPES.has(displayType)) unknownDisplayType++;
+
+    const maxValue =
+      typeof a.max_value === "number" && Number.isFinite(a.max_value) ? a.max_value : undefined;
+
+    traits.push({ type: type || "(unnamed)", value, kind: traitKindOf(displayType), maxValue, displayType });
+  }
+  return { traits, missingValue, missingType, unknownDisplayType };
 }
 
 export interface TraitFrequency {
@@ -130,7 +246,7 @@ export interface RarityRow {
    */
   score: number;
   rarest: { type: string; value: string; pct: number } | null;
-  traits: { type: string; value: string; pct: number }[];
+  traits: { type: string; value: string; kind: TraitKind; pct: number }[];
 }
 
 export interface RarityReport {
@@ -138,6 +254,10 @@ export interface RarityReport {
   /** Trait type -> value -> frequency, over the scored set only. */
   frequencies: Record<string, Record<string, TraitFrequency>>;
   rows: RarityRow[];
+  /** Date traits left out of the score, across all tokens. */
+  excludedDateTraits: number;
+  /** Tokens carrying at least one date trait. */
+  tokensWithDateTraits: number;
 }
 
 /**
@@ -148,12 +268,25 @@ export interface RarityReport {
 export function computeRarity(tokens: TokenTraits[]): RarityReport {
   const scored = tokens.length;
   const counts = new Map<string, Map<string, number>>();
+  let excludedDateTraits = 0;
+  let tokensWithDateTraits = 0;
+
   for (const t of tokens) {
+    let tokenHadDate = false;
     for (const tr of t.traits) {
+      // A `date` trait is a timestamp, not a category. It is usually unique per
+      // token, so scoring it by frequency would hand every token the maximum
+      // possible score for the wrong reason.
+      if (tr.kind === "date") {
+        excludedDateTraits++;
+        tokenHadDate = true;
+        continue;
+      }
       if (!counts.has(tr.type)) counts.set(tr.type, new Map());
       const m = counts.get(tr.type)!;
       m.set(tr.value, (m.get(tr.value) ?? 0) + 1);
     }
+    if (tokenHadDate) tokensWithDateTraits++;
   }
 
   const frequencies: Record<string, Record<string, TraitFrequency>> = {};
@@ -166,18 +299,20 @@ export function computeRarity(tokens: TokenTraits[]): RarityReport {
 
   const rows: RarityRow[] = tokens.map((t) => {
     const traits = t.traits.map((tr) => {
-      const f = frequencies[tr.type]?.[tr.value];
-      return { type: tr.type, value: tr.value, pct: f?.pct ?? 0 };
+      const f = tr.kind === "date" ? undefined : frequencies[tr.type]?.[tr.value];
+      return { type: tr.type, value: tr.value, kind: tr.kind, pct: f?.pct ?? 0 };
     });
+    const scorable = t.traits.filter((tr) => tr.kind !== "date");
     const score = scored > 0
-      ? t.traits.reduce((acc, tr) => acc + scored / (frequencies[tr.type]?.[tr.value]?.count ?? 1), 0)
+      ? scorable.reduce((acc, tr) => acc + scored / (frequencies[tr.type]?.[tr.value]?.count ?? 1), 0)
       : 0;
-    const rarest = traits.length > 0 ? traits.reduce((a, b) => (b.pct < a.pct ? b : a)) : null;
+    const ranked = traits.filter((tr) => tr.kind !== "date");
+    const rarest = ranked.length > 0 ? ranked.reduce((a, b) => (b.pct < a.pct ? b : a)) : null;
     return { tokenId: t.tokenId, score, rarest, traits };
   });
 
   rows.sort((a, b) => b.score - a.score || a.tokenId - b.tokenId);
-  return { scored, frequencies, rows };
+  return { scored, frequencies, rows, excludedDateTraits, tokensWithDateTraits };
 }
 
 export interface CrawlOptions {
@@ -204,6 +339,8 @@ export interface CrawlResult {
   skipped: number;
   /** Requests that failed outright (429/403/timeout). */
   failed: number;
+  /** Attribute entries ignored because they had no usable value, or an unknown display_type. */
+  ignoredTraits: number;
   truncated: boolean;
   elapsedMs: number;
   /** Tokens carried over from the cache rather than fetched this run. */
@@ -216,23 +353,12 @@ export interface CrawlResult {
   aggregateFile: string | null;
 }
 
-/** Parse the trait list out of a metadata JSON document, tolerating shapes. */
+/**
+ * Flat trait list, for callers that only need type/value pairs.
+ * @deprecated use {@link parseTraits}, which classifies and counts.
+ */
 export function traitsOf(doc: any): { type: string; value: string }[] {
-  const list = Array.isArray(doc?.attributes)
-    ? doc.attributes
-    : Array.isArray(doc?.traits)
-      ? doc.traits
-      : [];
-  const out: { type: string; value: string }[] = [];
-  for (const a of list) {
-    const type = a?.trait_type ?? a?.type ?? a?.name;
-    const value = a?.value;
-    if (type == null || value == null) continue;
-    const v = typeof value === "string" ? value : String(value);
-    if (v === "") continue;
-    out.push({ type: String(type), value: v });
-  }
-  return out;
+  return parseTraits(doc).traits.map((t) => ({ type: t.type, value: t.value }));
 }
 
 /** Pick `limit` ids spread evenly across the sorted list. */
@@ -386,7 +512,7 @@ export async function readAggregateMapping(
         for (const { value, key } of items) {
           const id = aggregateIdOf(value, key);
           if (id == null) continue;
-          tokens.push({ tokenId: id, traits: traitsOf(value) });
+          tokens.push({ tokenId: id, traits: parseTraits(value).traits });
         }
         if (tokens.length === 0) continue;
         // No traits anywhere means a placeholder, not an aggregate mapping.
@@ -451,6 +577,7 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
         listed: agg.tokens.length,
         skipped,
         failed: 0,
+        ignoredTraits: 0,
         truncated: false,
         elapsedMs: Date.now() - started,
         fromCache: cached.length,
@@ -468,6 +595,7 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
     opts.limit != null && opts.limit > 0 ? spreadPick(fresh, opts.limit) : fresh;
   const tokens: TokenTraits[] = [...cached];
   let failed = 0;
+  let ignoredTraits = 0;
   let gi = 0;
   let next = 0;
 
@@ -505,7 +633,9 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
               break;
             }
             const doc = JSON.parse(await r.text());
-            got = { tokenId: id, traits: traitsOf(doc) };
+            const parsed = parseTraits(doc);
+            ignoredTraits += parsed.missingValue + parsed.unknownDisplayType;
+            got = { tokenId: id, traits: parsed.traits };
             break;
           } catch {
             // Timeout or network: try once more, then give up on this token.
@@ -526,6 +656,7 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
     listed: listed.entries.length,
     skipped,
     failed,
+    ignoredTraits,
     truncated: opts.limit != null && opts.limit > 0 && numeric.length > opts.limit,
     elapsedMs: Date.now() - started,
     fromCache: cached.length,

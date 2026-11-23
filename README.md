@@ -895,6 +895,20 @@ Honest by construction: it prints `listed`, `attempted`, `scored`, `failed` and
 use the scored set as the denominator, never total supply — mixing the two would
 make a partial crawl look like a complete one.
 
+Traits are read per ERC-8495's metadata schema: `value` is REQUIRED (string or
+number) and `trait_type` SHOULD be present, so an entry with a value but no name
+is counted, not dropped. `display_type` decides how a value is read —
+`number`, `boost_number`, `boost_percentage` are numeric, `date` is a timestamp,
+and an unrecognised value is treated as absent, as the schema requires.
+
+**`date` traits are excluded from the score.** A timestamp is usually unique per
+token, so scoring it by frequency would hand every token the maximum possible
+score for the wrong reason. They are listed on the token but reported as
+`excluded`, not silently counted.
+
+Entries with no usable `value`, or an unknown `display_type`, are reported on an
+`ignored:` line rather than disappearing into the counts.
+
 Rarity is a property of the metadata, not a market value.
 
 ### Listings (`--listings`, `--buy`)
@@ -1010,7 +1024,7 @@ waiting for a receipt that will never exist.
 
     cd scripts/verify && ./run-all.sh
 
- Sixteen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+ Seventeen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
 mock JSON-RPC server and the fire-path harness; the others cover the audit
 fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
 scan and the Scatter paths. `npm run build` first.
