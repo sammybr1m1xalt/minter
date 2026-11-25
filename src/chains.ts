@@ -89,6 +89,20 @@ export const CHAINS: ChainProfile[] = [
     },
   },
   {
+    // Ink mainnet — verified live 2026-11-25: eth_chainId 0xdef1 = 57073 and
+    // eth_getLogs answered on https://rpc-gel.inkonchain.com. No alchemyHost is
+    // listed because "ink-mainnet.g.alchemy.com" was never verified; an invented
+    // host would fail only at run time, so the public endpoint is the entry.
+    key: "ink",
+    chainId: 57073,
+    name: "Ink",
+    explorer: "https://explorer.inkonchain.com",
+    nativeSymbol: "ETH",
+    rpc: {
+      public: ["https://rpc-gel.inkonchain.com"],
+    },
+  },
+  {
     // Soneium mainnet — verified live 2026-11-08: chain id 1868 (0x74c), ETH
     // gas, SeaDrop singleton deployed at the same address as every other chain
     // (eth_getCode returned bytecode). OpenSea lists it as "soneium" in

@@ -816,6 +816,54 @@ Not boxed to OpenSea, and deliberately **not** ranked by volume: a contract that
 has not minted yet has no volume, so that signal would be useless here. A high
 score is evidence, not proof; verify the candidate on-chain before minting it.
 
+### Hot contracts (`--hot`)
+
+    minter --hot [--window 5m] [--chain ethereum] [--chain all]
+            [--top 10] [--target N] [--new hours] [--yes]
+
+Builds its own ranking from ranged mint logs — there is no explorer endpoint
+that ranks contracts by activity. Two log shapes are scanned: ERC-721
+`Transfer` with `from = 0`, and ERC-1155 `TransferSingle`/`TransferBatch` with
+`from = 0`. Logs are grouped by contract and ranked by **distinct minters**,
+not event count: a batch minter or an airdrop claim can produce hundreds of
+events from one address. Definite ERC-20 mints are excluded from the target
+list (most ERC-20s do not implement ERC-165, so detection is by `decimals()` +
+`balanceOf()`, not an interface query).
+
+Each chain is ranked **separately** — volumes across a mainnet and an L2 are
+not comparable, so there is no merged top-10. Windows are `5m`, `15m`, `30m`
+and `1h`; `6h` and `12h` are **refused with a reason** rather than silently
+truncated. A chain whose logs cannot be read is reported as `UNKNOWN`, never
+as "no hot contracts".
+
+Cost is always labelled: `0.005 ETH`, `free`, or `unknown`. Only SeaDrop's
+`getPublicDrop` is authoritative; a name-matched price getter is printed with
+`guess: <getter>` attached. A failed probe never becomes `0`.
+
+    minter --hot --window 15m --chain ink
+    minter --hot --window 5m --chain ethereum --target 2 --yes
+    minter --hot --window 1h --chain all --new 2
+
+`--new <hours>` filters to contracts deployed in the last N hours using
+Etherscan's `contractcreation` index. It is Ethereum-only with a free key and
+refuses on other chains; an unreadable deploy time is excluded, never guessed
+as "old".
+
+With a TTY the command offers a picker. Headless runs must pass `--target N`
+or they refuse — a picker that blocks a cron job is a bug. Targeting loads the
+same wallet file as the wizard (encrypted files work via
+`WALLETS_PASSPHRASE`), **re-runs the full pre-mint screen** on the chosen
+contract, prints recipient/value/calldata source, and waits for confirmation
+unless `--yes`. The scanner's output is not a safety signal: a hot contract is
+where rugs live. Nothing is broadcast when the screen refuses or simulation
+reverts.
+
+Etherscan V2 free serves Ethereum only; Base, Arc and Robinhood are refused
+with `Free API access is not supported for this chain`, and Ink is absent from
+its chainlist. Those chains are scanned through their own RPCs. Enabling the
+missing networks and lifting the free-tier log cap is an Alchemy console
+action, not a code change.
+
 ### Reveal scan (`--reveal-scan`)
 
     minter --reveal-scan <contract> [--chain ethereum] [--rpc <url>]
@@ -1024,7 +1072,7 @@ waiting for a receipt that will never exist.
 
     cd scripts/verify && ./run-all.sh
 
- Seventeen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+ Eighteen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
 mock JSON-RPC server and the fire-path harness; the others cover the audit
 fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
 scan and the Scatter paths. `npm run build` first.
