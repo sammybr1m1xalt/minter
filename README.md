@@ -987,13 +987,18 @@ Entries with no usable `value`, or an unknown `display_type`, are reported on an
 
 Rarity is a property of the metadata, not a market value.
 
-### Listings (`--listings`, `--buy`)
+### Listings (`--listings`, `--snipe`, `--buy`)
 
     minter --reveal-scan <contract> --rarity --slug <slug> --listings
+    minter --reveal-scan <contract> --rarity --slug <slug> --snipe [--yes]
     minter --reveal-scan <contract> --rarity --slug <slug> --buy <tokenId> [--yes]
 
 Once the table knows which ids are rare, `--listings` asks whether they are
-already listed, and for how much:
+already listed, and for how much. The price is printed **in the rarity row**,
+next to that token's score and traits — not in a separate list you have to
+cross-reference by hand. `not listed` is printed as `not listed`, never as
+`listed not listed`; a price whose decimals are unknown stays labelled rather
+than being divided by a guessed exponent.
 
     GET /api/v2/listings/collection/{slug}/nfts/{tokenId}/best
 
@@ -1003,8 +1008,14 @@ never collapsed into "not listed" — that misreading is the expensive one.
 
 `--buy <tokenId>` vends the buy transaction
 (`POST /api/v2/listings/fulfillment_data`), quotes gas, asks, and sends. It
-loads the wallet through the same path the wizard uses, so an encrypted
+loads the wallet through the wizard's own loader, so an encrypted
 `wallets.json` works unchanged (`WALLETS_PASSPHRASE`, or an interactive prompt).
+
+`--snipe` adds the interactive step: after the priced rarity table it asks
+which of those reported token ids to buy, loads the wallet the same wizard
+way, then re-reads that token's listing and asks for confirmation before any
+send. Headless runs must use `--buy <tokenId>` — a picker that blocks a cron
+job is a bug. Only ids present in the reported rarity table can be chosen.
 
 - Only native-priced listings are sent. An ERC20-priced listing returns value
   `"0"` and pulls payment with `transferFrom`, so it needs a spender approval
@@ -1100,7 +1111,7 @@ waiting for a receipt that will never exist.
 
     cd scripts/verify && ./run-all.sh
 
- Twenty-four checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+ Twenty-five checks, no framework — each prints its own PASS/FAIL. `run.js` is the
 mock JSON-RPC server and the fire-path harness; the others cover the audit
 fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
 scan and the Scatter paths. `npm run build` first.

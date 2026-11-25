@@ -251,6 +251,11 @@ export function formatListingPrice(l: ListingSummary): string {
   return `${l.price} ${sym}`;
 }
 
+/** Inline price cell for a rarity row: an answer or an honest reason, never both. */
+export function formatRarityListing(l: ListingSummary): string {
+  return l.error ? l.error : `listed ${formatListingPrice(l)}`;
+}
+
 /** One line per token, for the rarity table. */
 export function printListingLine(l: ListingSummary): string {
   const who = l.maker ? ` seller ${l.maker.slice(0, 10)}…` : "";
