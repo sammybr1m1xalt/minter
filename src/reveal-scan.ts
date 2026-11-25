@@ -63,6 +63,8 @@ export interface IpfsInspection {
   cid: string;
   kind: "directory" | "file" | "unfetchable";
   fileCount: number;
+  /** The gateway that actually answered, so rarity can stick to it. */
+  gateway: string | null;
   sample: string[];
   note?: string;
   /** A URL that actually serves this CID, so the finding is viewable. */
@@ -198,6 +200,7 @@ export async function inspectPublicCid(
             fileCount: entries.length,
             sample: entries.slice(0, 5).map((h) => h.slice(0, 80)),
             note: `via ${gateway}${text.length >= MAX_INDEX_BYTES ? " (prefix only)" : ""}`,
+            gateway,
             url,
           };
         }
@@ -208,13 +211,13 @@ export async function inspectPublicCid(
         } catch {
           note = `${text.slice(0, 60)} via ${gateway}`;
         }
-        return { cid, kind: "file", fileCount: 1, sample: [text.slice(0, 120)], note, url };
+        return { cid, kind: "file", fileCount: 1, gateway, sample: [text.slice(0, 120)], note, url };
       } catch {
         // Try the next suffix / gateway.
       }
     }
   }
-  return { cid, kind: "unfetchable", fileCount: 0, sample: [], note: "no gateway answered", url: null };
+  return { cid, kind: "unfetchable", fileCount: 0, gateway: null, sample: [], note: "no gateway answered", url: null };
 }
 
 function extractCids(text: string | null): string[] {
@@ -425,9 +428,13 @@ export async function scanReveal(opts: RevealScanOptions): Promise<RevealScanRes
         "No baseURI, contractURI or tokenURI could be read. The contract may be non-standard (an ERC-1155 needs a token id that already exists before uri(id) will answer), or every endpoint is refusing eth_call."
       );
     } else if (bigDirectory) {
-      res.verdict = "PUBLIC";
+      const supply = res.totalSupply ? Number(res.totalSupply) : null;
+      const isFull = supply != null && bigDirectory.fileCount >= supply;
+      res.verdict = isFull ? "PUBLIC" : "PARTIAL";
       res.findings.push(
-        `${bigDirectory.cid} resolves to a DIRECTORY of ${bigDirectory.fileCount} entries — the full id -> metadata mapping is published, whether or not the contract calls itself revealed.`
+        isFull
+          ? `${bigDirectory.cid} resolves to a DIRECTORY of ${bigDirectory.fileCount} entries — the full id -> metadata mapping is published, whether or not the contract calls itself revealed.`
+          : `${bigDirectory.cid} resolves to a DIRECTORY showing ${bigDirectory.fileCount} entries while totalSupply is ${supply ?? "unknown"}. That is a PARTIAL/prefix listing, not proof of the full id -> metadata mapping.`
       );
     } else if (res.revealedBySlash === true) {
       res.verdict = "PUBLIC";

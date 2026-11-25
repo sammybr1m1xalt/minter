@@ -377,34 +377,65 @@ export async function listDirectoryEntries(
   timeoutMs = 60_000
 ): Promise<{ entries: string[]; truncated: boolean; gateway: string | null }> {
   const bare = cid.replace(/^ipfs:\/\//, "").replace(/^ar:\/\//, "").replace(/\/+$/, "");
-  // The index is a single large request (BAYC's is 8.3MB) and the gateways
-  // throttle it like any other. One attempt per gateway is not enough: measured,
-  // all four could 429 in the same minute and the run then reported "listed: 0"
-  // and scored nothing.
-  for (let round = 0; round < 3; round++) {
-   for (const gateway of gateways) {
-    const base = gateway.replace(/\/+$/, "");
-    try {
-      const r = await fetch(`${base}/${bare}/`, {
-        signal: AbortSignal.timeout(timeoutMs),
-        redirect: "follow",
-      });
-      if (!r.ok) {
-        try { await r.body?.cancel(); } catch { /* ignore */ }
-        continue;
+  const parse = (text: string, gateway: string) => {
+    const hrefs = [...text.matchAll(/href=["']?([^"'\s>]+)["']?/g)].map((m) => m[1]);
+    const names = hrefs.map((h) => (h.split("/").pop() ?? "").split("?")[0]);
+    // Every name is returned. Filtering to numeric ids here would hide the
+    // aggregate-file case (a single metadata.json), which the caller needs to
+    // see in order to try it.
+    return { entries: [...new Set(names)], truncated: false, gateway };
+  };
+
+  // A serial walk of five gateways at a 60s timeout each was measured at
+  // ~10 minutes for a large directory. Probe them together with a short
+  // deadline; the first answer wins, and only a total miss falls back to the
+  // long single-gateway read a large index may need.
+  const probeMs = Math.min(timeoutMs, 8_000);
+  const probes = await Promise.all(
+    gateways.map(async (g) => {
+      const base = g.replace(/\/+$/, "");
+      try {
+        const r = await fetch(`${base}/${bare}/`, {
+          signal: AbortSignal.timeout(probeMs),
+          redirect: "follow",
+        });
+        if (!r.ok) {
+          try { await r.body?.cancel(); } catch { /* ignore */ }
+          return null;
+        }
+        return { base, text: await r.text() };
+      } catch {
+        return null;
       }
-      const text = await r.text();
-      const hrefs = [...text.matchAll(/href=["']?([^"'\s>]+)["']?/g)].map((m) => m[1]);
-      const names = hrefs.map((h) => (h.split("/").pop() ?? "").split("?")[0]);
-      // Every name is returned. Filtering to numeric ids here would hide the
-      // aggregate-file case (a single metadata.json), which the caller needs to
-      // see in order to try it.
-      return { entries: [...new Set(names)], truncated: false, gateway: base };
-    } catch {
-      // Next gateway.
+    })
+  );
+  // First success is not enough: one gateway answered with a 2-entry HTML
+  // stub while another held the real 11558-entry index. Pick the fullest
+  // answer, never the fastest partial one.
+  const answered = probes
+    .filter((p): p is { base: string; text: string } => p != null)
+    .map((p) => parse(p.text, p.base))
+    .sort((a, b) => b.entries.length - a.entries.length);
+  if (answered.length > 0) return answered[0];
+
+  for (let round = 0; round < 3; round++) {
+    for (const gateway of gateways) {
+      const base = gateway.replace(/\/+$/, "");
+      try {
+        const r = await fetch(`${base}/${bare}/`, {
+          signal: AbortSignal.timeout(timeoutMs),
+          redirect: "follow",
+        });
+        if (!r.ok) {
+          try { await r.body?.cancel(); } catch { /* ignore */ }
+          continue;
+        }
+        return parse(await r.text(), base);
+      } catch {
+        // Next gateway.
+      }
     }
-   }
-   if (round < 2) await new Promise((res) => setTimeout(res, 2000 * (round + 1)));
+    if (round < 2) await new Promise((res) => setTimeout(res, 1000 * (round + 1)));
   }
   return { entries: [], truncated: false, gateway: null };
 }
@@ -612,7 +643,10 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
       for (let attempt = 0; attempt < 3 && !got; attempt++) {
         const gateway = gateways[gi++ % gateways.length].replace(/\/+$/, "");
         const url = `${gateway}/${bare}/${id}`;
-        for (let retry = 0; retry < 2; retry++) {
+        // One retry per gateway is enough: another gateway is the real
+        // fallback. Two retries here made a cold 2-token run spend 20s just
+        // waiting on throttled endpoints.
+        for (let retry = 0; retry < 1; retry++) {
           if (Date.now() > deadline) return;
           try {
             const r = await fetch(url, {

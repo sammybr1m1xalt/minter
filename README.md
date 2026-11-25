@@ -1032,6 +1032,17 @@ probes and the event sweeps now run in bounded parallel pools. The event sweep
 is skipped when the contract already stated a pointer, since events are the
 fallback for a silent contract rather than a tax on every scan.
 
+A cold directory listing probes gateways in parallel and keeps the FULL answer,
+not the fastest partial one — one gateway can return a two-entry stub while
+another holds eleven thousand. Rarity then uses that answering gateway first
+with short per-request deadlines. Measured on `official-rebelkin`: a cold run
+dropped from roughly ten minutes to under a minute. A directory listing smaller
+than `totalSupply` is reported as PARTIAL, not as proof of the full mapping.
+
+Before gas estimation, the vended buy transaction is checked for null/invalid
+addresses and bytes32 fields. A null tuple field now names itself instead of
+appearing as `gas estimate failed: invalid address value=null`.
+
 - Only native-priced listings are sent. An ERC20-priced listing returns value
   `"0"` and pulls payment with `transferFrom`, so it needs a spender approval
   first — that is reported, not guessed.

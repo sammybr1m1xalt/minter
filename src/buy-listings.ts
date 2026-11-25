@@ -267,6 +267,37 @@ import { Interface, JsonRpcProvider, Wallet } from "ethers";
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
+/**
+ * Validate the vended transaction BEFORE encoding or estimating gas.
+ * ethers throws "invalid address value=null" for a null tuple field, and the
+ * broad try around estimateGas used to mislabel that as a gas failure. Name
+ * the offending field instead; an unknown value is not a gas problem.
+ */
+function buyTxProblem(tx: BuyTransaction): string | null {
+  if (!tx.to || !/^0x[0-9a-fA-F]{40}$/.test(tx.to)) {
+    return `buy transaction has no valid 'to' address (got ${tx.to || "null"})`;
+  }
+  const p = (tx.inputData as any)?.parameters;
+  if (!p || typeof p !== "object") {
+    return "buy transaction has no input_data.parameters — nothing was sent";
+  }
+  const addresses = ["offerer", "zone", "offerToken"];
+  for (const field of addresses) {
+    const value = p[field];
+    if (value == null || !/^0x[0-9a-fA-F]{40}$/.test(String(value))) {
+      return `buy transaction has null/invalid ${field} in order parameters — nothing was sent`;
+    }
+  }
+  const bytes32 = ["zoneHash", "offererConduitKey", "fulfillerConduitKey"];
+  for (const field of bytes32) {
+    const value = p[field];
+    if (value == null || !/^0x[0-9a-fA-F]{64}$/.test(String(value))) {
+      return `buy transaction has null/invalid ${field} in order parameters — nothing was sent`;
+    }
+  }
+  return null;
+}
+
 export interface BuyOutcome {
   sent: boolean;
   txHash: string | null;
@@ -310,6 +341,8 @@ export async function executeListingBuy(o: {
   const buyer = new Wallet(o.buyerKey);
   const tx = await fetchListingBuyTransaction(o.listing, buyer.address, o.apiKey);
   if (!tx) return fail("OpenSea would not vend a buy transaction for this listing");
+  const problem = buyTxProblem(tx);
+  if (problem) return fail(problem);
 
   // An ERC20-priced listing sends no native value and needs an approval first.
   const value = BigInt(tx.value ?? "0");

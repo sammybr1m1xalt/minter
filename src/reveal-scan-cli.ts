@@ -8,6 +8,7 @@ import chalk from "chalk";
 import { getValidApiKey } from "./opensea-key";
 import { inspectPublicCid, scanReveal, type RevealScanResult } from "./reveal-scan";
 import { computeRarity, crawlTraits, crawlOnchainTraits, saveRarityCache, type CrawlResult } from "./rarity";
+import { DEFAULT_GATEWAYS } from "./reveal-scan";
 import { fetchBestListing, fetchCollectionListings, printListingLine, formatRarityListing, type ListingSummary } from "./buy-listings";
 import { resolveContractToSlug } from "./slug-resolver";
 import { executeListingBuy } from "./buy-listings";
@@ -360,6 +361,7 @@ async function runRarity(o: {
   ids: number[];
 }): Promise<number> {
   let cid = o.cid ? normalizeIpfsLink(o.cid) : null;
+  let dir: { cid: string; gateway: string | null } | null = null;
   let onchain: RevealScanResult | null = null;
   let rpcs: string[] = o.rpcs;
   let listingByToken = new Map<string, ListingSummary>();
@@ -382,7 +384,7 @@ async function runRarity(o: {
       deep: o.deep,
       etherscanKey: process.env.ETHERSCAN_API_KEY,
     });
-    const dir = r.inspections.find((i) => i.kind === "directory");
+    dir = r.inspections.find((i) => i.kind === "directory") ?? null;
     // A single metadata FILE is also usable: rarity reads it as an aggregate.
     const file = r.inspections.find((i) => i.kind === "file");
     if (!dir && !file) {
@@ -457,7 +459,10 @@ async function runRarity(o: {
     .filter((l) => !l.error && Number.isFinite(Number(l.tokenId)))
     .map((l) => Number(l.tokenId))
     .filter((id, i, all) => all.indexOf(id) === i)
-    .slice(0, 10);
+    // Cheapest orders are not the rarest ones. The old cap of 10 missed a
+    // listed token that was rare but not in the first ten orders; keep the
+    // fan-out bounded but wide enough to cover a real listing page.
+    .slice(0, 50);
   let crawl: CrawlResult;
   if (onchain) {
     crawl = await crawlOnchainTraits({
@@ -475,7 +480,16 @@ async function runRarity(o: {
   } else {
     crawl = await crawlTraits({
       cid: cid!,
-      gateways: o.gateway ? [o.gateway] : undefined,
+      // Put the gateway that answered the reveal inspection FIRST, keeping the
+      // others as fallbacks. Trying five dead gateways serially was the
+      // 10-minute run; retrying one throttled gateway alone was a 40s wait for
+      // a single token. Short per-request deadlines keep both bounded.
+      gateways: o.gateway
+        ? [o.gateway]
+        : dir?.gateway
+          ? [dir.gateway, ...DEFAULT_GATEWAYS.filter((g) => g !== dir.gateway)]
+          : undefined,
+      requestTimeoutMs: 8_000,
       concurrency: o.concurrency,
       limit: o.limit ?? 100,
       timeoutMs: 600_000,
