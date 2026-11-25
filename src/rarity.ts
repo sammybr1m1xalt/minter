@@ -706,6 +706,10 @@ export interface OnchainCrawlOptions {
   probeTokenId?: number;
   /** Test seam: an already-resolved provider; production resolves rpcUrls. */
   provider?: JsonRpcProvider;
+  /** Explicit ids (e.g. the listed tokens) instead of a spread sample. */
+  ids?: number[];
+  /** Extra ids appended to the spread sample, deduplicated. */
+  extraIds?: number[];
   concurrency: number;
   timeoutMs: number;
   onProgress?: (done: number, ok: number) => void;
@@ -776,20 +780,34 @@ export async function crawlOnchainTraits(opts: OnchainCrawlOptions): Promise<Cra
     if (detected) break;
   }
 
-  const take = opts.limit > 0 ? Math.min(opts.limit, opts.totalSupply) : opts.totalSupply;
-  const targets: number[] = [];
-  for (let i = 0; i < take; i++) {
-    // ERC-721A ids start at 1; id 0 reverts on most collections.
-    targets.push(
-      take === opts.totalSupply ? i + 1 : Math.floor((i * opts.totalSupply) / take) + 1
-    );
+  let targets: number[];
+  if (opts.ids?.length) {
+    targets = [...opts.ids];
+  } else {
+    const take = opts.limit > 0 ? Math.min(opts.limit, opts.totalSupply) : opts.totalSupply;
+    targets = [];
+    for (let i = 0; i < take; i++) {
+      // ERC-721A ids start at 1; id 0 reverts on most collections.
+      targets.push(
+        take === opts.totalSupply ? i + 1 : Math.floor((i * opts.totalSupply) / take) + 1
+      );
+    }
   }
-  out.truncated = take < opts.totalSupply;
+  if (opts.extraIds?.length) {
+    const seen = new Set(targets);
+    for (const id of opts.extraIds) {
+      if (Number.isFinite(id) && id >= 1 && !seen.has(id)) {
+        targets.push(id);
+        seen.add(id);
+      }
+    }
+  }
+  out.truncated = targets.length < opts.totalSupply;
 
   const workers = Math.max(1, Math.min(16, opts.concurrency || 8));
   let next = 0;
   let done = 0;
-  const perCall = Math.min(12_000, Math.max(1000, Math.floor(opts.timeoutMs / Math.max(1, take)) * workers));
+  const perCall = Math.min(12_000, Math.max(1000, Math.floor(opts.timeoutMs / Math.max(1, targets.length)) * workers));
   const worker = async () => {
     for (;;) {
       if (Date.now() > deadline) return;

@@ -65,6 +65,22 @@ const HOP_IFACE = new Interface([
   "function baseURI() view returns (string)",
 ]);
 
+/** Bounded concurrency: a flat Promise.all over 30 getters throttles most RPCs. */
+async function pooled<T, R>(items: T[], workers: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(workers, items.length)) }, async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= items.length) return;
+        out[i] = await fn(items[i]);
+      }
+    })
+  );
+  return out;
+}
+
 async function readStringGetter(
   provider: JsonRpcProvider,
   iface: Interface,
@@ -124,29 +140,35 @@ export async function collectDeepPointers(opts: {
     })
     .slice(0, MAX_GETTER_CALLS);
 
+  const getterValues = await pooled(getters, 6, async (f: any) => ({
+    name: f.name,
+    type: String(f.outputs?.[0]?.type ?? "").toLowerCase(),
+    value: await readStringGetter(provider, iface, contract, f.name, timeoutMs),
+  }));
   const followUps: { address: string; source: string }[] = [];
-  for (const f of getters) {
-    const value = await readStringGetter(provider, iface, contract, (f as any).name, timeoutMs);
-    if (!value) continue;
-    out.sources.push(`${(f as any).name}() -> ${value.slice(0, 160)}`);
-    out.uris.push(value);
+  for (const g of getterValues) {
+    if (!g.value) continue;
+    out.sources.push(`${g.name}() -> ${g.value.slice(0, 160)}`);
+    out.uris.push(g.value);
     // One hop only: a metadata renderer is a common indirection; chasing a
     // chain of addresses would make the scan unbounded.
-    const outputType = String((f as any).outputs?.[0]?.type ?? "").toLowerCase();
-    if (outputType === "address" && /^0x[0-9a-fA-F]{40}$/.test(value)) {
-      followUps.push({ address: value, source: (f as any).name });
+    if (g.type === "address" && /^0x[0-9a-fA-F]{40}$/.test(g.value)) {
+      followUps.push({ address: g.value, source: g.name });
     }
   }
-  for (const hop of followUps) {
-    // The hop target is a DIFFERENT contract: checking the NFT's ABI for these
-    // names skips every renderer that does not duplicate them. Probe the
-    // standard getters directly instead; a missing one just reverts.
-    for (const name of ["contractURI", "metadataURI", "baseURI"]) {
-      const value = await readStringGetter(provider, HOP_IFACE, hop.address, name, timeoutMs);
-      if (!value) continue;
-      out.sources.push(`${hop.source}() -> ${hop.address.slice(0, 10)}… .${name}() -> ${value.slice(0, 160)}`);
-      out.uris.push(value);
-    }
+  // The hop target is a DIFFERENT contract: checking the NFT's ABI for these
+  // names skips every renderer that does not duplicate them. Probe the
+  // standard getters directly instead; a missing one just reverts.
+  const hopJobs = followUps.flatMap((hop) =>
+    ["contractURI", "metadataURI", "baseURI"].map((name) => ({ hop, name }))
+  );
+  const hopValues = await pooled(hopJobs, 6, async ({ hop, name }) => ({
+    hop, name, value: await readStringGetter(provider, HOP_IFACE, hop.address, name, timeoutMs),
+  }));
+  for (const h of hopValues) {
+    if (!h.value) continue;
+    out.sources.push(`${h.hop.source}() -> ${h.hop.address.slice(0, 10)}… .${h.name}() -> ${h.value.slice(0, 160)}`);
+    out.uris.push(h.value);
   }
 
   // 2. Events with a string payload. Old scan only looked for printable
@@ -157,8 +179,8 @@ export async function collectDeepPointers(opts: {
       try {
         const head = await provider.getBlockNumber();
         const from = Math.max(0, head - logScanBlocks);
-        for (const ev of events) {
-          const topic = (ev as any).topicHash;
+        const eventLogs = await pooled(events, 4, async (ev: any) => {
+          const topic = ev.topicHash;
           let logs: any[] = [];
           try {
             logs = await provider.getLogs({ address: contract, fromBlock: from, toBlock: head, topics: [topic] });
@@ -166,7 +188,7 @@ export async function collectDeepPointers(opts: {
             // Etherscan V2 serves ranged getLogs on Ethereum where free RPCs
             // refuse them. Keep the fallback key-free when unavailable.
             const key = opts.etherscanKey;
-            if (chainId !== 1 || !key) continue;
+            if (chainId !== 1 || !key) return { ev, logs };
             const q = new URLSearchParams({
               chainid: "1", module: "logs", action: "getLogs",
               fromBlock: String(from), toBlock: String(head), topic0: topic, apikey: key,
@@ -178,18 +200,21 @@ export async function collectDeepPointers(opts: {
               const j: any = await r.json();
               if (j.status === "1" && Array.isArray(j.result)) logs = j.result;
             } catch {
-              continue;
+              // A refused event sweep is not evidence the event never fired.
             }
           }
+          return { ev, logs };
+        });
+        for (const { ev, logs } of eventLogs) {
           for (const log of logs) {
             try {
-              const decoded = iface.decodeEventLog(ev as any, log.data, log.topics);
+              const decoded = iface.decodeEventLog(ev, log.data, log.topics);
               const strings = decoded
                 .map((v: any) => (typeof v === "string" ? v : null))
                 .filter((v: string | null): v is string => v !== null);
-              for (const s of strings) {
-                out.sources.push(`${(ev as any).name}@${log.blockNumber} -> ${s.slice(0, 160)}`);
-                out.uris.push(s);
+              for (const val of strings) {
+                out.sources.push(`${ev.name}@${log.blockNumber} -> ${val.slice(0, 160)}`);
+                out.uris.push(val);
               }
             } catch {
               // Another event can share a topic prefix; ignore undecodable rows.

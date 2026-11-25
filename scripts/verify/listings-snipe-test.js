@@ -58,6 +58,31 @@ ok("unknown decimals stay labelled", B.formatRarityListing(base({ decimals: null
   ok("fetches the listing for the chosen token", captured?.listing?.tokenId === "1", captured?.listing?.tokenId);
   ok("no send is claimed when the buy was not sent", captured !== null);
 
+  // One collection page prices every row; absent ids are honestly "not listed".
+  const realFetch2 = globalThis.fetch;
+  let calls = 0;
+  const collectionBody = JSON.stringify({
+    listings: [
+      { order_hash: "0xa", chain: "ethereum", protocol_address: "0xb",
+        protocol_data: { parameters: { offerer: "0x" + "aa".repeat(20) } },
+        asset: { identifier: "4752" },
+        price: { current: { currency: "ETH", decimals: 18, value: "500000000000000" } } },
+    ],
+  });
+  globalThis.fetch = async () => {
+    calls++;
+    return { ok: true, status: 200, text: async () => collectionBody };
+  };
+  try {
+    const got = await C.fetchListingPrices("slug", "key", ["4752", "9"]);
+    ok("one collection page prices all ids", calls === 1, String(calls));
+    ok("listed token keeps its price", got.byToken.get("4752")?.price === 0.0005, String(got.byToken.get("4752")?.price));
+    ok("absent token is not listed", got.byToken.get("9")?.error === "not listed");
+    ok("source labelled", got.source === "collection", got.source);
+  } finally {
+    globalThis.fetch = realFetch2;
+  }
+
   console.log(`\n--- ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

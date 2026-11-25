@@ -61,6 +61,20 @@ const provider = {
   ok("reports the on-chain source", result.source === "onchain", result.source);
   ok("listed count is the supply", result.listed === 4, String(result.listed));
   ok("traits were parsed", result.tokens.every((t) => t.traits.some((x) => x.type === "Stage")));
+
+  const withExtra = await R.crawlOnchainTraits({
+    contract,
+    rpcUrls: [],
+    chainId: 1,
+    totalSupply: 4,
+    probeTokenId: 1,
+    limit: 1,
+    extraIds: [2, 4],
+    concurrency: 2,
+    timeoutMs: 20_000,
+    provider,
+  });
+  ok("extra ids are crawled in the same pass", withExtra.tokens.map((t) => t.tokenId).join(",") === "1,2,4", withExtra.tokens.map((t) => t.tokenId).join(","));
   console.log(`\n--- ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

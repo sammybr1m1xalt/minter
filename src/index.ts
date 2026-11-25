@@ -51,7 +51,7 @@ import { runHotCli } from "./hot-cli";
 import { runDropUriCli } from "./dropuri-cli";
 import { runWizard, runFcfsBranchCli, runEligibilityCheck } from "./wizard";
 import { runScatterBranchCli } from "./scatter-mint";
-import { closePrompts } from "./prompt";
+import { askText, closePrompts } from "./prompt";
 import { parseWhen, isValidWhen } from "./schedule";
 import { parsePriceSpec, extractMaxPriceSpec } from "./price-protection";
 import { parseTarget, resolveTarget } from "./target-resolver";
@@ -74,7 +74,7 @@ function isWalletFileCommand(arg: string | undefined): boolean {
   return arg === "wallet" || arg === "wallets" || arg === "--wallet";
 }
 
-const HELP = `\nNFT Mint Sniper\n\n  Mints public SeaDrop stages AND FCFS/allowlist/OVR stages, plus any\n  contract with a discoverable mint function (ERC721/ERC1155, Manifold,\n  Zora, Scatter, or a bespoke mint).\n  Public mints need no OpenSea account; FCFS stages fetch a signed\n  payload from OpenSea (free API key, auto-managed).\n\nUsage\n  npm start                          run the interactive wizard\n  npm start -- --fcfs <target>       run the FCFS/allowlist/OVR branch directly\n  npm start -- --scatter <target>    mint a Scatter.art collection directly\n  npm start -- --eligibility <ca>   poll eligibility + gas for a contract (no mint)\n  npm start -- --doctor             health report: keys, wallets, sessions, RPC per chain\n  npm start -- --hot --window 15m  rank contracts by distinct minters, then target one\n  npm start -- --drop-uri [--blocks n]  read SeaDrop DropURIUpdated event history\n  npm start -- --logger [file]      read a run log as a digest (newest, or - for stdin)
+const HELP = `\nNFT Mint Sniper\n\n  Mints public SeaDrop stages AND FCFS/allowlist/OVR stages, plus any\n  contract with a discoverable mint function (ERC721/ERC1155, Manifold,\n  Zora, Scatter, or a bespoke mint).\n  Public mints need no OpenSea account; FCFS stages fetch a signed\n  payload from OpenSea (free API key, auto-managed).\n\nUsage\n  npm start                          run the interactive wizard\n  npm start -- --fcfs <target>       run the FCFS/allowlist/OVR branch directly\n  npm start -- --scatter <target>    mint a Scatter.art collection directly\n  npm start -- --eligibility <ca>   poll eligibility + gas for a contract (no mint)\n  npm start -- --doctor             health report: keys, wallets, sessions, RPC per chain\n  npm start -- --hot --window 15m  rank contracts by distinct minters, then target one\n  npm start -- --snipe [target]      rarity + listing prices, then ask which to buy\n  npm start -- --drop-uri [--blocks n]  read SeaDrop DropURIUpdated event history\n  npm start -- --logger [file]      read a run log as a digest (newest, or - for stdin)
   npm start -- --confirm <tx…>      ask the chain whether a transaction landed
   npm start -- --confirm --last     … using the newest run log's transactions\n  npm start -- wallet <cmd>        status | encrypt | decrypt the wallet file
   npm start -- --wallet <cmd>      same, dashed\n  npm start -- --help                show this message\n\nTarget\n  An OpenSea / Scatter / Zora / Manifold link, a collection slug, or a contract\n  address. Chain aliases work: "0xabc… on base", "slug on arc", "slug eth".\n\nOptions\n  --at <time>           ISO 8601, unix seconds/ms, "in 5m", "30s", or "HH:MM"\n                        (HH:MM is read in this machine's local timezone)\n  --when-open           poll the chain and fire the moment the stage opens\n  --max-price <price>   max total price in ETH, "free", "0.05/unit", "0.05total",\n                        or "any" (no cap)\n  --wallets <spec>      all | N | 1,3,4  (1-based; an invalid spec is refused)\n  --chain <key>         ${SUPPORTED_CHAINS}\n  --quantity <n>        NFTs per wallet (default 1)\n  --token-id <n>        hold the fire until the minted supply puts the mint on\n                        this token id (a POSITION target; needs the id -> artwork\n                        mapping from --reveal-scan)\n\n  A target may also be given positionally (npm start -- <target>) when it is not\n  passed to --fcfs.\n\nExamples\n  npm start -- --fcfs de-bots\n  npm start -- --fcfs de-bots --at "in 5m" --max-price 0.01\n  npm start -- --eligibility 0x8d80efb61341e4b8459fbb52b213d5c25a1af179\n  npm start -- --fcfs 0xabc… on base --quantity 3 --wallets all\n\nEverything not passed as a flag is asked interactively: keys, chain, quantity,\nNFT link, RPC, gas and timing. Optional defaults can be set in .env.\n`;
@@ -289,6 +289,38 @@ async function main(): Promise<void> {
       process.exit(code);
     } catch (e: any) {
       console.error(chalk.red(`\n❌ drop-uri failed: ${e?.message ?? e}\n`));
+      closePrompts();
+      process.exit(1);
+    }
+  }
+
+  // Bare --snipe is the wizard-shaped entry: ask for the target, then run the
+  // rarity + listings report with the snipe prompt. It used to die as an
+  // unknown option because --snipe was only a modifier on --reveal-scan.
+  if (args.includes("--snipe") && !args.includes("--reveal-scan")) {
+    try {
+      const rest = args.filter((a) => a !== "--snipe");
+      let target = rest.find((a) => !a.startsWith("--") && !a.includes("="));
+      if (!target) {
+        target = (await askText("Contract address to scan for rares and listings", "")).trim();
+      }
+      if (!target) {
+        console.log(chalk.yellow("\n  No target — nothing was scanned or sent.\n"));
+        closePrompts();
+        process.exit(2);
+      }
+      const cliArgs = [
+        ...rest.filter((a) => a !== target),
+        "--rarity",
+        "--listings",
+        "--snipe",
+        target,
+      ];
+      const code = await runRevealScanCli(cliArgs);
+      closePrompts();
+      process.exit(code);
+    } catch (e: any) {
+      console.error(chalk.red(`\n❌ snipe failed: ${e?.message ?? e}\n`));
       closePrompts();
       process.exit(1);
     }

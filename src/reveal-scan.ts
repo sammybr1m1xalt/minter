@@ -298,58 +298,59 @@ export async function scanReveal(opts: RevealScanOptions): Promise<RevealScanRes
   }
 
   try {
-    // ── 1. baseURI / uri ────────────────────────────────────────────────────
-    let base = await callString(provider, contract, "baseURI()");
-    if (typeof base !== "string") base = null;
-    if (base == null) {
-      // ERC-1155 style: uri(id) with the {id} substitution. Try a real id.
-      const u = await callString(provider, contract, "uri(uint256)", [1]);
-      if (typeof u === "string") {
-        base = u;
-        res.standard = "erc1155";
-      }
-    } else {
-      res.standard = "erc721";
-    }
+    // ── 1-3. Independent reads, issued together ────────────────────────────
+    // These used to be four serial eth_calls. On a 100ms endpoint that alone
+    // cost 400ms before any metadata work started. Each keeps its own catch,
+    // so one missing getter cannot reject the batch.
+    const [baseRaw, uriRaw, curi, ts] = await Promise.all([
+      callString(provider, contract, "baseURI()"),
+      callString(provider, contract, "uri(uint256)", [1]),
+      callString(provider, contract, "contractURI()"),
+      callBig(provider, contract, "totalSupply()"),
+    ]);
+    const base = typeof baseRaw === "string" ? baseRaw : typeof uriRaw === "string" ? uriRaw : null;
+    res.standard =
+      typeof baseRaw === "string" ? "erc721" : typeof uriRaw === "string" ? "erc1155" : "unknown";
     res.baseURI = base;
-    if (base != null) {
-      res.revealedBySlash = base.endsWith("/");
-    }
-
-    // ── 2. contractURI ──────────────────────────────────────────────────────
-    const curi = await callString(provider, contract, "contractURI()");
+    if (base != null) res.revealedBySlash = base.endsWith("/");
     res.contractURI = typeof curi === "string" ? curi : null;
-
-    // ── 3. totalSupply (context for how much is minted) ─────────────────────
-    const ts = await callBig(provider, contract, "totalSupply()");
     res.totalSupply = ts != null ? ts.toString() : null;
 
     // ── 4. per-token sample ────────────────────────────────────────────────
     const sig = res.standard === "erc1155" ? "uri(uint256)" : "tokenURI(uint256)";
     const sampledIds = sampleTokenIds?.length ? sampleTokenIds : sampleIdsFromSupply(ts);
     const seen = new Set<string>();
-    for (const id of sampledIds) {
-      let uri: string | null = null;
-      let err: string | null = null;
-      try {
-        uri = await callString(provider, contract, sig, [id]);
-        if (typeof uri !== "string") uri = null;
-        if (uri != null) seen.add(uri);
-      } catch (e: any) {
-        err = e?.shortMessage ?? e?.message ?? String(e);
-      }
-      res.sampledTokenUris.push({ tokenId: id, uri, error: err });
-    }
+    res.sampledTokenUris = await Promise.all(
+      sampledIds.map(async (id) => {
+        let uri: string | null = null;
+        let err: string | null = null;
+        try {
+          uri = await callString(provider, contract, sig, [id]);
+          if (typeof uri !== "string" || !uri) uri = null;
+          if (uri != null) seen.add(uri);
+        } catch (e: any) {
+          err = e?.shortMessage ?? e?.message ?? String(e);
+        }
+        return { tokenId: id, uri, error: err };
+      })
+    );
     res.distinctTokenUris = seen.size;
 
     // ── 4b. deep pointer discovery ────────────────────────────────────────
     let deepCids: string[] = [];
     if (deep) {
+      // A log sweep costs a ranged getLogs (and often an Etherscan fallback).
+      // Skip it when the contract already stated a pointer: events are the
+      // fallback for contracts that expose nothing, not a tax on every scan.
+      const alreadyStated =
+        (res.baseURI != null && res.baseURI !== "") ||
+        (res.contractURI != null && res.contractURI !== "") ||
+        res.distinctTokenUris > 1;
       const pointers = await collectDeepPointers({
         provider,
         chainId,
         contract,
-        logScanBlocks,
+        logScanBlocks: alreadyStated ? 0 : logScanBlocks,
         timeoutMs,
         etherscanKey: opts.etherscanKey,
       });
@@ -360,15 +361,28 @@ export async function scanReveal(opts: RevealScanOptions): Promise<RevealScanRes
     }
 
     // ── 5. resolve every CID the contract publishes ────────────────────────
-    const cids = new Set<string>([
-      ...extractCids(res.baseURI),
-      ...extractCids(res.contractURI),
-      ...res.sampledTokenUris.flatMap((s) => extractCids(s.uri)),
-      ...deepCids,
-    ]);
-    for (const cid of cids) {
-      res.inspections.push(await inspectPublicCid(cid, ipfsGateways, timeoutMs));
-    }
+    const cids = [
+      ...new Set<string>([
+        ...extractCids(res.baseURI),
+        ...extractCids(res.contractURI),
+        ...res.sampledTokenUris.flatMap((s) => extractCids(s.uri)),
+        ...deepCids,
+      ]),
+    ];
+    // Gateways are rate-limited, so do NOT parallelise the gateway axis; the
+    // CID axis is independent and bounded to four workers.
+    const inspections: IpfsInspection[] = new Array(cids.length);
+    let nextCid = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(4, cids.length) }, async () => {
+        for (;;) {
+          const i = nextCid++;
+          if (i >= cids.length) return;
+          inspections[i] = await inspectPublicCid(cids[i], ipfsGateways, timeoutMs);
+        }
+      })
+    );
+    res.inspections = inspections;
 
     // ── 6. bounded log sweep for metadata-like payloads ────────────────────
     if (logScanBlocks > 0) {

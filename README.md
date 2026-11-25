@@ -1011,11 +1011,26 @@ never collapsed into "not listed" — that misreading is the expensive one.
 loads the wallet through the wizard's own loader, so an encrypted
 `wallets.json` works unchanged (`WALLETS_PASSPHRASE`, or an interactive prompt).
 
+Prices come from ONE collection-level listing page, not one request per row,
+and the cheapest order per token wins. Listed ids are added to the rarity
+sample in the same pass, so a cheap listed token gets a real rarity score next
+to its price instead of a bare "listed" line with no context. A `rare + listed`
+table collects those rows. No OpenSea key means prices stay unknown — never
+"not listed".
+
 `--snipe` adds the interactive step: after the priced rarity table it asks
 which of those reported token ids to buy, loads the wallet the same wizard
 way, then re-reads that token's listing and asks for confirmation before any
-send. Headless runs must use `--buy <tokenId>` — a picker that blocks a cron
-job is a bug. Only ids present in the reported rarity table can be chosen.
+send. `--listings` in a TTY offers the same prompt; `--no-snipe` suppresses it.
+Bare `minter --snipe [target]` works too — it asks for the target when none is
+given. Headless runs must use `--buy <tokenId>`; only ids present in the
+reported rarity table can be chosen.
+
+The independent reads in the reveal scan (baseURI, uri, contractURI,
+totalSupply and the tokenURI sample), the CID inspections, the ABI getter
+probes and the event sweeps now run in bounded parallel pools. The event sweep
+is skipped when the contract already stated a pointer, since events are the
+fallback for a silent contract rather than a tax on every scan.
 
 - Only native-priced listings are sent. An ERC20-priced listing returns value
   `"0"` and pulls payment with `transferFrom`, so it needs a spender approval
