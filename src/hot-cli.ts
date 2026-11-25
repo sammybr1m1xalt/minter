@@ -19,8 +19,7 @@ import { resolveRpcsForChain } from "./rpc-resolver";
 import { askChoice, askYesNo } from "./prompt";
 import { screenMintContract, detectPrice, buildGenericMintTx, isPlanBroadcastable } from "./mint-generic";
 import { fetchPublicDrop } from "./seadrop-public";
-import { promptWalletPassphrase, walletFilePath } from "./wizard";
-import { loadKeysFromFile, readWalletFilePath } from "./wallet-file";
+import { loadEnvKeys, promptWalletPassphrase, walletFilePath } from "./wizard";
 
 const ZERO_TOPIC = "0x" + "0".repeat(64);
 const ERC721_TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -655,26 +654,23 @@ function printTable(chainKey: string, window: string, rows: Enriched[]): void {
 
 // ── Targeting ───────────────────────────────────────────────────────────────
 
-async function loadFirstWalletKey(): Promise<{ key: string; address: string } | null> {
+export async function loadFirstWalletKey(): Promise<{ key: string; address: string } | null> {
+  // Use the wizard's loader, not a parallel copy of it. promptWalletPassphrase
+  // stores the typed passphrase in the wizard's session state; passing only
+  // process.env.WALLETS_PASSPHRASE here made every interactive entry fail.
   await promptWalletPassphrase();
-  const file = walletFilePath();
-  const text = readWalletFilePath(file);
-  if (text === null) {
-    console.error(chalk.red(`\n❌ No wallet file at ${file}. Create one with: minter wallet status\n`));
+  const loaded = loadEnvKeys();
+  if (!loaded.length) {
+    console.error(
+      chalk.red(
+        `\n❌ No usable wallet key from ${walletFilePath()} or the environment. ` +
+          `Keys from the environment are still accepted; nothing was sent.\n`
+      )
+    );
     return null;
   }
-  const loaded = loadKeysFromFile(file, text, process.env.WALLETS_PASSPHRASE ?? null);
-  if (loaded.status !== "plain" && loaded.status !== "encrypted") {
-    console.error(chalk.red(`\n❌ Could not load ${file}: ${loaded.detail ?? loaded.status}\n`));
-    return null;
-  }
-  if (!loaded.keys.length) {
-    console.error(chalk.red(`\n❌ ${file} holds no keys.\n`));
-    return null;
-  }
-  const key = loaded.keys[0]; // one wallet at a time, in file order
-  const w = new Wallet(key);
-  return { key, address: w.address };
+  const first = loaded[0]; // one wallet at a time, in the wizard's file order
+  return { key: first.privateKey, address: first.address };
 }
 
 async function targetOne(
