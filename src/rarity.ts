@@ -13,6 +13,7 @@
 //     a prediction of what anyone will pay.
 import fs from "fs";
 import path from "path";
+import { Interface, JsonRpcProvider } from "ethers";
 import { DEFAULT_GATEWAYS } from "./reveal-scan";
 
 // Scored tokens are cached per directory CID. The gateways throttle a single IP
@@ -348,7 +349,7 @@ export interface CrawlResult {
   /** True when the directory entry list came from the cache, not the network. */
   indexFromCache: boolean;
   /** Where the token metadata came from. */
-  source: "directory" | "aggregate";
+  source: "directory" | "aggregate" | "onchain";
   /** The aggregate file used, when source is "aggregate". */
   aggregateFile: string | null;
 }
@@ -664,4 +665,165 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
     source: "directory",
     aggregateFile: null,
   };
+}
+
+
+// ── On-chain metadata (data: URIs) ───────────────────────────────────────────
+// Some collections embed each token's JSON directly in tokenURI(id) as a
+// data: URI. There is no CID to resolve and no directory to crawl, so the
+// mapping is fully public but the CID-based path sees "nothing to score".
+// This reads the same public tokenURI calls the reveal scan already made,
+// spread across the supply and bounded like any other crawl.
+
+export function decodeOnchainMetadata(uri: string | null | undefined): any | null {
+  if (!uri) return null;
+  let json: string | null = null;
+  if (uri.startsWith("data:application/json;base64,")) {
+    try { json = Buffer.from(uri.slice("data:application/json;base64,".length), "base64").toString("utf8"); }
+    catch { return null; }
+  } else if (uri.startsWith("data:application/json,")) {
+    try { json = decodeURIComponent(uri.slice("data:application/json,".length)); }
+    catch { return null; }
+  }
+  if (!json) return null;
+  try {
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface OnchainCrawlOptions {
+  contract: string;
+  rpcUrls: string[];
+  chainId: number;
+  /** totalSupply() from the reveal scan. */
+  totalSupply: number;
+  /** 0 means every id; otherwise a spread sample. */
+  limit: number;
+  /** A token id known to answer tokenURI/uri, from the reveal scan. */
+  probeTokenId?: number;
+  /** Test seam: an already-resolved provider; production resolves rpcUrls. */
+  provider?: JsonRpcProvider;
+  concurrency: number;
+  timeoutMs: number;
+  onProgress?: (done: number, ok: number) => void;
+}
+
+export async function crawlOnchainTraits(opts: OnchainCrawlOptions): Promise<CrawlResult> {
+  const started = Date.now();
+  const deadline = started + opts.timeoutMs;
+  const out: CrawlResult = {
+    tokens: [],
+    listed: opts.totalSupply,
+    skipped: 0,
+    failed: 0,
+    ignoredTraits: 0,
+    truncated: false,
+    elapsedMs: 0,
+    fromCache: 0,
+    indexFromCache: false,
+    source: "onchain",
+    aggregateFile: null,
+  };
+  if (opts.totalSupply <= 0) {
+    out.failed = 0;
+    out.elapsedMs = Date.now() - started;
+    return out;
+  }
+
+  let provider: JsonRpcProvider | null = opts.provider ?? null;
+  for (const url of provider ? [] : opts.rpcUrls) {
+    try {
+      const p = new JsonRpcProvider(url, opts.chainId, { staticNetwork: true });
+      await p.getBlockNumber();
+      provider = p;
+      break;
+    } catch {
+      // Next endpoint: pinning [0] disables the redundancy.
+    }
+  }
+  if (!provider) {
+    out.failed = opts.totalSupply;
+    out.elapsedMs = Date.now() - started;
+    return out;
+  }
+
+  const iface = new Interface([
+    "function tokenURI(uint256) view returns (string)",
+    "function uri(uint256) view returns (string)",
+  ]);
+  let fn = "tokenURI";
+  let detected = false;
+  // id 0 often reverts (many collections start at 1), so probing only 0 once
+  // picked `uri()` and made every later call fail. Try both flavours over a
+  // few real ids before choosing.
+  for (const name of ["tokenURI", "uri"]) {
+    for (const id of [opts.probeTokenId ?? 1, 1, 0, 2]) {
+      try {
+        const raw = await provider.call({ to: opts.contract, data: iface.encodeFunctionData(name, [id]) });
+        const value = iface.decodeFunctionResult(name, raw)[0];
+        if (typeof value === "string") {
+          fn = name;
+          detected = true;
+          break;
+        }
+      } catch {
+        // Next name / id.
+      }
+    }
+    if (detected) break;
+  }
+
+  const take = opts.limit > 0 ? Math.min(opts.limit, opts.totalSupply) : opts.totalSupply;
+  const targets: number[] = [];
+  for (let i = 0; i < take; i++) {
+    // ERC-721A ids start at 1; id 0 reverts on most collections.
+    targets.push(
+      take === opts.totalSupply ? i + 1 : Math.floor((i * opts.totalSupply) / take) + 1
+    );
+  }
+  out.truncated = take < opts.totalSupply;
+
+  const workers = Math.max(1, Math.min(16, opts.concurrency || 8));
+  let next = 0;
+  let done = 0;
+  const perCall = Math.min(12_000, Math.max(1000, Math.floor(opts.timeoutMs / Math.max(1, take)) * workers));
+  const worker = async () => {
+    for (;;) {
+      if (Date.now() > deadline) return;
+      const i = next++;
+      if (i >= targets.length) return;
+      const tokenId = targets[i];
+      let uri: string | null = null;
+      try {
+        const raw = await Promise.race([
+          provider!.call({ to: opts.contract, data: iface.encodeFunctionData(fn, [tokenId]) }),
+          new Promise<string>((_, rej) => setTimeout(() => rej(new Error("tokenURI timeout")), perCall)),
+        ]);
+        uri = iface.decodeFunctionResult(fn, raw)[0] as string;
+      } catch {
+        out.failed++;
+        done++;
+        opts.onProgress?.(done, out.tokens.length);
+        continue;
+      }
+      const doc = decodeOnchainMetadata(uri);
+      if (doc) {
+        const parsed = parseTraits(doc);
+        out.tokens.push({ tokenId, traits: parsed.traits });
+        out.ignoredTraits += parsed.missingValue + parsed.unknownDisplayType + parsed.missingType;
+      } else {
+        out.failed++;
+      }
+      done++;
+      opts.onProgress?.(done, out.tokens.length);
+    }
+  };
+  await Promise.all(Array.from({ length: workers }, worker));
+  out.tokens.sort((a, b) => a.tokenId - b.tokenId);
+  out.elapsedMs = Date.now() - started;
+  try { provider.destroy(); } catch { /* already gone */ }
+  return out;
 }

@@ -6,8 +6,8 @@
 // for what it deliberately does not do.
 import chalk from "chalk";
 import { getValidApiKey } from "./opensea-key";
-import { inspectPublicCid, scanReveal } from "./reveal-scan";
-import { computeRarity, crawlTraits, saveRarityCache } from "./rarity";
+import { inspectPublicCid, scanReveal, type RevealScanResult } from "./reveal-scan";
+import { computeRarity, crawlTraits, crawlOnchainTraits, saveRarityCache, type CrawlResult } from "./rarity";
 import { fetchBestListing, printListingLine } from "./buy-listings";
 import { resolveContractToSlug } from "./slug-resolver";
 import { executeListingBuy } from "./buy-listings";
@@ -245,6 +245,8 @@ async function runRarity(o: {
   ids: number[];
 }): Promise<number> {
   let cid = o.cid ? normalizeIpfsLink(o.cid) : null;
+  let onchain: RevealScanResult | null = null;
+  let rpcs: string[] = o.rpcs;
 
   if (!cid && o.contract) {
     const profile = resolveChain(o.chainKey);
@@ -252,7 +254,7 @@ async function runRarity(o: {
       console.error(chalk.red(`\n❌ unknown chain: ${o.chainKey}\n`));
       return 2;
     }
-    const rpcs = o.rpcs.length > 0 ? o.rpcs : resolveRpcsForChain(profile.key, []).urls;
+    rpcs = o.rpcs.length > 0 ? o.rpcs : resolveRpcsForChain(profile.key, []).urls;
     const r = await scanReveal({
       rpcUrls: rpcs,
       chainId: profile.chainId,
@@ -276,10 +278,19 @@ async function runRarity(o: {
         console.log();
         return 2;
       }
-      console.log(chalk.yellow("\n  No published metadata directory for this contract — nothing to score."));
-      console.log(chalk.gray("  Rarity needs the full id -> metadata mapping, not a single placeholder file."));
-      console.log();
-      return 0;
+      const dataUris = [
+        ...(r.deepPointers?.uris ?? []),
+        ...r.sampledTokenUris.map((s) => s.uri ?? ""),
+      ].filter((u) => u.startsWith("data:application/json"));
+      if (dataUris.length > 0 && r.totalSupply) {
+        console.log(chalk.gray("\n  On-chain metadata: tokenURI(id) embeds JSON; scoring from the contract."));
+        onchain = r;
+      } else {
+        console.log(chalk.yellow("\n  No published metadata directory for this contract — nothing to score."));
+        console.log(chalk.gray("  Rarity needs the full id -> metadata mapping, not a single placeholder file."));
+        console.log();
+        return 0;
+      }
     }
     cid = dir?.cid ?? file?.cid ?? null;
     if (!dir && file) {
@@ -290,28 +301,44 @@ async function runRarity(o: {
     }
   }
 
-  if (!cid) {
+  if (!cid && !onchain) {
     console.error(chalk.red("\n❌ --rarity needs a published metadata directory: pass --ipfs <link> or a contract.\n"));
     return 2;
   }
 
-  console.log(chalk.gray(`\n  rarity: ${cid}\n`));
-  const crawl = await crawlTraits({
-    cid,
-    gateways: o.gateway ? [o.gateway] : undefined,
-    concurrency: o.concurrency,
-    limit: o.limit ?? 100,
-    timeoutMs: 600_000,
-    onProgress: (done, ok) => {
-      if (done % 200 === 0 || done === ok) {
-        process.stdout.write(chalk.gray(`\r    fetched ${done} entries, ${ok} scored...`));
-      }
-    },
-  });
+  console.log(chalk.gray(`\n  rarity: ${cid ?? "on-chain tokenURI"}\n`));
+  const progress = (done: number, ok: number) => {
+    if (done % 200 === 0 || done === ok) {
+      process.stdout.write(chalk.gray(`\r    fetched ${done} entries, ${ok} scored...`));
+    }
+  };
+  let crawl: CrawlResult;
+  if (onchain) {
+    crawl = await crawlOnchainTraits({
+      contract: onchain.contract,
+      rpcUrls: rpcs,
+      chainId: onchain.chainId,
+      totalSupply: Number(onchain.totalSupply),
+      probeTokenId: onchain.sampledTokenUris.find((s) => s.uri?.startsWith("data:"))?.tokenId,
+      limit: o.limit ?? 100,
+      concurrency: o.concurrency,
+      timeoutMs: 600_000,
+      onProgress: progress,
+    });
+  } else {
+    crawl = await crawlTraits({
+      cid: cid!,
+      gateways: o.gateway ? [o.gateway] : undefined,
+      concurrency: o.concurrency,
+      limit: o.limit ?? 100,
+      timeoutMs: 600_000,
+      onProgress: progress,
+    });
+  }
   process.stdout.write("\r" + " ".repeat(60) + "\r");
 
   // Persist what was scored so a throttled run resumes instead of refetching.
-  if (crawl.tokens.length > crawl.fromCache) saveRarityCache(cid, crawl.tokens);
+  if (cid && crawl.tokens.length > crawl.fromCache) saveRarityCache(cid, crawl.tokens);
 
   const report = computeRarity(crawl.tokens);
   const listed = crawl.listed;

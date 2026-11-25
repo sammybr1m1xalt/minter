@@ -947,6 +947,10 @@ as the sum over its traits of `scored / count`. Higher = rarer.
   successes: measured on BAYC, 100 attempts scored ~10 and 500 attempts scored
   ~3, because the gateways throttle a single IP. The cache is what makes a
   large table accumulative rather than a single long run.
+- A collection whose `tokenURI(id)` embeds the JSON as a `data:` URI needs no
+  CID at all. The reveal scan detects it, and `--rarity` scores directly from
+  on-chain `tokenURI` reads with the same spread sample, coverage and refusal
+  rules. It reports the source as `on-chain tokenURI` rather than a directory.
 - A collection that publishes ONE metadata file instead of a directory of
   per-token files is read too: if the directory has no numeric entries, the
   single `.json` file is tried (array, `{tokens: [...]}`, or keyed by id), and
@@ -1096,7 +1100,7 @@ waiting for a receipt that will never exist.
 
     cd scripts/verify && ./run-all.sh
 
- Twenty-three checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+ Twenty-four checks, no framework — each prints its own PASS/FAIL. `run.js` is the
 mock JSON-RPC server and the fire-path harness; the others cover the audit
 fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
 scan and the Scatter paths. `npm run build` first.
