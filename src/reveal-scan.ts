@@ -28,6 +28,7 @@
 // correct answer, not a failure.
 
 import { Interface, JsonRpcProvider } from "ethers";
+import { collectDeepPointers, extractUris, type DeepPointers } from "./reveal-deep";
 
 const META_IFACE = new Interface([
   "function baseURI() view returns (string)",
@@ -53,6 +54,9 @@ export interface RevealScanOptions {
   /** How many recent blocks to sweep for metadata-like logs. 0 disables. */
   logScanBlocks?: number;
   timeoutMs?: number;
+  /** ABI-driven pointer discovery: getters, address hops and metadata events. */
+  deep?: boolean;
+  etherscanKey?: string;
 }
 
 export interface IpfsInspection {
@@ -79,11 +83,11 @@ export interface RevealScanResult {
   distinctTokenUris: number;
   inspections: IpfsInspection[];
   logHits: { blockNumber: number; txHash: string; name: string; metadataLike: string[] }[];
+  /** Deep-discovery provenance: where each extra pointer came from. */
+  deepPointers: DeepPointers | null;
   findings: string[];
   error: string | null;
 }
-
-const CID_RE = /\b(ipfs:\/\/|ar:\/\/)([A-Za-z0-9]{20,})/g;
 
 async function callString(
   provider: JsonRpcProvider,
@@ -215,8 +219,26 @@ export async function inspectPublicCid(
 
 function extractCids(text: string | null): string[] {
   if (!text) return [];
-  const out = new Set<string>();
-  for (const m of text.matchAll(CID_RE)) out.add(`${m[1]}${m[2]}`);
+  // One extractor for getters, events and bare CIDs. Paths are kept in the
+  // normalised link but the CID itself is the directory key the resolver needs.
+  return extractUris(text).map((link) =>
+    link.replace(/^ipfs:\/\//, "").replace(/^ar:\/\//, "").split("/")[0]
+  );
+}
+
+/** Ids that exist now, spread across the range; unminted low ids just revert. */
+function sampleIdsFromSupply(total: bigint | null): number[] {
+  if (total == null || total <= 0n) return [1, 2, 3, 4, 5];
+  if (total <= 5n) {
+    const out: number[] = [];
+    for (let i = 1n; i <= total; i++) out.push(Number(i));
+    return out;
+  }
+  const out = new Set<number>();
+  for (let i = 0; i < 5; i++) {
+    const id = 1n + ((total - 1n) * BigInt(i)) / 4n;
+    out.add(Number(id));
+  }
   return [...out];
 }
 
@@ -225,10 +247,11 @@ export async function scanReveal(opts: RevealScanOptions): Promise<RevealScanRes
     rpcUrls,
     chainId,
     contract,
-    sampleTokenIds = [1, 2, 3, 4, 5],
+    sampleTokenIds,
     ipfsGateways = DEFAULT_GATEWAYS,
     logScanBlocks = 0,
     timeoutMs = 20_000,
+    deep = true,
   } = opts;
 
   const res: RevealScanResult = {
@@ -244,6 +267,7 @@ export async function scanReveal(opts: RevealScanOptions): Promise<RevealScanRes
     distinctTokenUris: 0,
     inspections: [],
     logHits: [],
+    deepPointers: null,
     findings: [],
     error: null,
   };
@@ -302,8 +326,9 @@ export async function scanReveal(opts: RevealScanOptions): Promise<RevealScanRes
 
     // ── 4. per-token sample ────────────────────────────────────────────────
     const sig = res.standard === "erc1155" ? "uri(uint256)" : "tokenURI(uint256)";
+    const sampledIds = sampleTokenIds?.length ? sampleTokenIds : sampleIdsFromSupply(ts);
     const seen = new Set<string>();
-    for (const id of sampleTokenIds) {
+    for (const id of sampledIds) {
       let uri: string | null = null;
       let err: string | null = null;
       try {
@@ -317,11 +342,29 @@ export async function scanReveal(opts: RevealScanOptions): Promise<RevealScanRes
     }
     res.distinctTokenUris = seen.size;
 
+    // ── 4b. deep pointer discovery ────────────────────────────────────────
+    let deepCids: string[] = [];
+    if (deep) {
+      const pointers = await collectDeepPointers({
+        provider,
+        chainId,
+        contract,
+        logScanBlocks,
+        timeoutMs,
+        etherscanKey: opts.etherscanKey,
+      });
+      res.deepPointers = pointers;
+      deepCids = pointers.cids;
+      for (const src of pointers.sources.slice(0, 12)) res.findings.push(`pointer: ${src}`);
+      for (const err of pointers.errors) res.findings.push(`deep scan: ${err}`);
+    }
+
     // ── 5. resolve every CID the contract publishes ────────────────────────
     const cids = new Set<string>([
       ...extractCids(res.baseURI),
       ...extractCids(res.contractURI),
       ...res.sampledTokenUris.flatMap((s) => extractCids(s.uri)),
+      ...deepCids,
     ]);
     for (const cid of cids) {
       res.inspections.push(await inspectPublicCid(cid, ipfsGateways, timeoutMs));
@@ -355,9 +398,14 @@ export async function scanReveal(opts: RevealScanOptions): Promise<RevealScanRes
 
     // ── verdict ────────────────────────────────────────────────────────────
     const directoryInspections = res.inspections.filter((i) => i.kind === "directory");
-    const bigDirectory = directoryInspections.find((i) => i.fileCount >= Math.max(2, sampleTokenIds.length));
+    const bigDirectory = directoryInspections.find((i) => i.fileCount >= Math.max(2, sampledIds.length));
 
-    if (res.baseURI == null && res.contractURI == null && res.inspections.length === 0) {
+    if (
+      res.baseURI == null &&
+      res.contractURI == null &&
+      res.inspections.length === 0 &&
+      !(res.deepPointers?.uris.length)
+    ) {
       res.verdict = "UNKNOWN";
       res.findings.push(
         "No baseURI, contractURI or tokenURI could be read. The contract may be non-standard (an ERC-1155 needs a token id that already exists before uri(id) will answer), or every endpoint is refusing eth_call."
@@ -398,6 +446,11 @@ export async function scanReveal(opts: RevealScanOptions): Promise<RevealScanRes
           "A metadata URI is published but it is a single file rather than a per-token directory; the mapping is not readable from it."
         );
       }
+    } else if (res.deepPointers?.uris.length) {
+      res.verdict = "PARTIAL";
+      res.findings.push(
+        `${res.deepPointers.uris.length} metadata pointer(s) were found in the ABI surface or events, but none resolved to a readable directory. Retry the CID with --gateway or inspect the links directly.`
+      );
     } else {
       res.verdict = "UNKNOWN";
       res.findings.push("The contract answered, but nothing metadata-shaped was found.");

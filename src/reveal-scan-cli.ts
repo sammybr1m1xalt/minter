@@ -22,6 +22,7 @@ function parseArgs(args: string[]): {
   chainKey: string;
   rpcs: string[];
   blocks: number;
+  deep: boolean;
   ids: number[];
   gateway: string | null;
   opensea: boolean;
@@ -39,9 +40,10 @@ function parseArgs(args: string[]): {
   let contract: string | null = null;
   let chainKey = "ethereum";
   let rpcs: string[] = [];
-  let blocks = 0;
+  let blocks = 2000;
   let ids: number[] = [];
   let gateway: string | null = null;
+  let noDeep = false;
   let opensea = false;
   let ipfsLink: string | null = null;
   let rarity = false;
@@ -55,7 +57,8 @@ function parseArgs(args: string[]): {
   let slug: string | null = null;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--chain") chainKey = args[++i] ?? chainKey;
+    if (a === "--no-deep") noDeep = true;
+    else if (a === "--chain") chainKey = args[++i] ?? chainKey;
     else if (a === "--rpc") rpcs.push(args[++i] ?? "");
     else if (a === "--blocks") blocks = Number(args[++i] ?? 0) || 0;
     else if (a === "--ids") {
@@ -78,7 +81,8 @@ function parseArgs(args: string[]): {
 
   --chain <key>      chain key or id (default ethereum)
   --rpc <url>        add an RPC endpoint (repeatable)
-  --blocks <n>       sweep the last n blocks for metadata-like logs (default off)
+  --blocks <n>       sweep the last n blocks for metadata-like logs (default 2000)
+  --no-deep          disable ABI getters / address hops / event decoding
   --ids 1,2,3        token ids to sample (default 1..5)
   --gateway <url>    pin a single IPFS gateway
   --opensea          also ask OpenSea's public token endpoint and compare
@@ -105,7 +109,7 @@ whatever IPFS or Arweave CIDs those already point at.`);
       if (!contract) contract = a;
     }
   }
-  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, ids, gateway, opensea, ipfsLink, rarity, limit, concurrency, top, pick, listings, buy, yes, slug };
+  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, deep: !noDeep, ids, gateway, opensea, ipfsLink, rarity, limit, concurrency, top, pick, listings, buy, yes, slug };
 }
 
 // ── OpenSea comparison (opt-in) ─────────────────────────────────────────────
@@ -236,8 +240,9 @@ async function runRarity(o: {
   contract: string | null;
   chainKey: string;
   rpcs: string[];
-  ids: number[];
   blocks: number;
+  deep: boolean;
+  ids: number[];
 }): Promise<number> {
   let cid = o.cid ? normalizeIpfsLink(o.cid) : null;
 
@@ -255,6 +260,8 @@ async function runRarity(o: {
       sampleTokenIds: o.ids.length > 0 ? o.ids : undefined,
       logScanBlocks: o.blocks,
       ipfsGateways: o.gateway ? [o.gateway] : undefined,
+      deep: o.deep,
+      etherscanKey: process.env.ETHERSCAN_API_KEY,
     });
     const dir = r.inspections.find((i) => i.kind === "directory");
     // A single metadata FILE is also usable: rarity reads it as an aggregate.
@@ -515,6 +522,7 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
       rpcs: parsed.rpcs,
       ids: parsed.ids,
       blocks: parsed.blocks,
+      deep: parsed.deep,
     });
   }
   if (parsed.ipfsLink) {
@@ -548,6 +556,8 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
     sampleTokenIds: parsed.ids.length > 0 ? parsed.ids : undefined,
     logScanBlocks: parsed.blocks,
     ipfsGateways: parsed.gateway ? [parsed.gateway] : undefined,
+    deep: parsed.deep,
+    etherscanKey: process.env.ETHERSCAN_API_KEY,
   });
 
   const colour =
@@ -574,6 +584,16 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
     if (i.sample.length > 0) console.log(`    sample: ${i.sample.join(", ")}`);
   }
 
+  if (r.deepPointers?.sources.length) {
+    console.log(`  pointers:  ${r.deepPointers.sources.length} from the ABI / events`);
+    for (const p of r.deepPointers.sources.slice(0, 5)) console.log(chalk.gray(`    ${p}`));
+  }
+
+  if (r.deepPointers?.sources.length) {
+    console.log(`  pointers:  ${r.deepPointers.sources.length} from the ABI / events`);
+    for (const p of r.deepPointers.sources.slice(0, 5)) console.log(chalk.gray(`    ${p}`));
+  }
+
   if (r.logHits.length > 0) {
     console.log(`  log hits:  ${r.logHits.length}`);
     for (const h of r.logHits.slice(0, 5)) {
@@ -582,7 +602,11 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
   }
 
   console.log();
-  for (const f of r.findings) console.log(`  ${f}`);
+  for (const f of r.findings) {
+    // Provenance is printed in the dedicated pointers block above.
+    if (f.startsWith("pointer: ") && r.deepPointers?.sources.length) continue;
+    console.log(`  ${f}`);
+  }
   if (r.error) console.log(chalk.red(`\n  error: ${r.error}\n`));
   // ── OpenSea comparison (opt-in) ───────────────────────────────────────────
   if (parsed.opensea) {

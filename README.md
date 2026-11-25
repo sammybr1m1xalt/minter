@@ -883,14 +883,22 @@ prints `UNKNOWN` and exits 2, never "no such event". Etherscan caps a page at
 ### Reveal scan (`--reveal-scan`)
 
     minter --reveal-scan <contract> [--chain ethereum] [--rpc <url>]
-           [--blocks <n>] [--ids 1,2,3] [--gateway <url>] [--opensea]
+           [--blocks <n>] [--no-deep] [--ids 1,2,3] [--gateway <url>] [--opensea]
            [--ipfs <link>]
 
 Answers whether a drop's token-id → artwork mapping is actually private. It
-reads only public data: `baseURI()`, `contractURI()`, a sample of
-`tokenURI(id)`, and whatever IPFS/Arweave CIDs those already point at. It does
-not call a non-public endpoint, enumerate unpublished data, or try to reach
-anything that is not already world-readable.
+reads only public data and does not try to reach anything that is not already
+world-readable.
+
+By default it also runs **deep discovery**: it fetches the verified ABI and
+calls every no-arg view getter whose name suggests a pointer — so a collection
+that publishes `baseTokenURI()`, `metadataURI()` or a `metadataRenderer()`
+address is no longer reported as UNKNOWN just because it has no `baseURI()`.
+Address-valued getters are followed one hop. Events carrying a string payload
+are decoded over `--blocks` recent blocks (default 2000), with Etherscan's
+ranged `getLogs` as the Ethereum fallback. Every pointer found is printed with
+its source, then resolved like any other CID. `--no-deep` restores the old
+three-getter behaviour.
 
 The checks, in order:
 
@@ -1088,7 +1096,7 @@ waiting for a receipt that will never exist.
 
     cd scripts/verify && ./run-all.sh
 
- Twenty-two checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+ Twenty-three checks, no framework — each prints its own PASS/FAIL. `run.js` is the
 mock JSON-RPC server and the fire-path harness; the others cover the audit
 fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
 scan and the Scatter paths. `npm run build` first.
