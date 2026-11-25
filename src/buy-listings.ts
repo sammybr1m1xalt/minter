@@ -279,7 +279,11 @@ function buyTxProblem(tx: BuyTransaction): string | null {
   }
   const p = (tx.inputData as any)?.parameters;
   if (!p || typeof p !== "object") {
-    return "buy transaction has no input_data.parameters — nothing was sent";
+    const keys = Object.keys(tx.inputData ?? {}).join(",") || "none";
+    return (
+      `buy transaction has no input_data.parameters (function=${tx.function || "unknown"}, ` +
+      `input_data keys: ${keys}) — nothing was sent`
+    );
   }
   const addresses = ["offerer", "zone", "offerToken"];
   for (const field of addresses) {

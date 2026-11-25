@@ -102,6 +102,30 @@ function stubFulfillment(overrides = {}) {
     JSON.stringify(toOut)
   );
 
+  // A vended tx with no parameters is refused with a useful shape, not a gas error.
+  const missingBody = JSON.stringify({
+    fulfillment_data: { transaction: {
+      function: "unknownFunction", chain: 1,
+      to: "0x0000000000000068f116a894984e2db1123eb395", value: "1",
+      input_data: {},
+    } },
+  });
+  const realFetch2 = globalThis.fetch;
+  globalThis.fetch = async () => ({ status: 200, text: async () => missingBody });
+  let missingOut;
+  try {
+    missingOut = await B.executeListingBuy({
+      listing, buyerKey: KEY, apiKey: "x", rpcUrl: RPC, chainId: 1, yes: true,
+    });
+  } finally { globalThis.fetch = realFetch2; }
+  check(
+    "missing parameters names the function and key set",
+    missingOut.sent === false && /input_data\.parameters/.test(missingOut.reason || "") &&
+      /unknownFunction/.test(missingOut.reason || "") && /keys: none/.test(missingOut.reason || "") &&
+      !/gas estimate failed/.test(missingOut.reason || ""),
+    JSON.stringify(missingOut)
+  );
+
   console.log(`\n--- ${pass} passed, ${fail} failed`);
   process.exitCode = fail ? 1 : 0;
 })().catch((e) => { console.error(e); process.exitCode = 1; });

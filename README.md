@@ -1042,6 +1042,13 @@ than `totalSupply` is reported as PARTIAL, not as proof of the full mapping.
 Before gas estimation, the vended buy transaction is checked for null/invalid
 addresses and bytes32 fields. A null tuple field now names itself instead of
 appearing as `gas estimate failed: invalid address value=null`.
+`buy transaction has no input_data.parameters — nothing was sent` means the
+fulfillment endpoint answered but did not include the Seaport order parameters
+the encoder needs (an expired/changed order or an unfamiliar fulfillment shape).
+It is a refusal before any RPC call or send, not a wallet-balance error.
+
+Successful scan, IPFS-view and rarity+listings reports print their elapsed time
+at the end, e.g. `rarity + listings report completed in 10.2s`.
 
 - Only native-priced listings are sent. An ERC20-priced listing returns value
   `"0"` and pulls payment with `transferFrom`, so it needs a spender approval

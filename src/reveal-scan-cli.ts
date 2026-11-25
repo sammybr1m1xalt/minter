@@ -235,6 +235,12 @@ function normalizeIpfsLink(link: string): string | null {
  * first and the CID is whatever directory it resolved — so this never reads
  * anything the contract does not already publish.
  */
+/** Print the elapsed time only for runs that actually produced a report. */
+function elapsedLine(started: number, label: string): void {
+  const seconds = (Date.now() - started) / 1000;
+  console.log(chalk.gray(`\n  ${label} completed in ${seconds.toFixed(1)}s`));
+}
+
 function emptyListing(tokenId: string, error: string): ListingSummary {
   return {
     tokenId, orderHash: null, protocolAddress: null, chain: null, maker: null,
@@ -360,6 +366,7 @@ async function runRarity(o: {
   deep: boolean;
   ids: number[];
 }): Promise<number> {
+  const started = Date.now();
   let cid = o.cid ? normalizeIpfsLink(o.cid) : null;
   let dir: { cid: string; gateway: string | null } | null = null;
   let onchain: RevealScanResult | null = null;
@@ -645,10 +652,12 @@ async function runRarity(o: {
   console.log(chalk.gray("  Rarity is a property of the metadata, not a market value."));
   console.log(chalk.gray("  Token ids are sequential — pair a target id with --token-id."));
   console.log();
+  elapsedLine(started, "rarity + listings report");
   return 0;
 }
 
 async function runIpfsView(link: string, gateway: string | null): Promise<number> {
+  const started = Date.now();
   const cid = normalizeIpfsLink(link);
   if (!cid) {
     console.error(chalk.red(`\n❌ not an IPFS link or CID: ${link}\n`));
@@ -675,13 +684,16 @@ async function runIpfsView(link: string, gateway: string | null): Promise<number
     console.log(chalk.gray("  id returns this same document — compare it against another id."));
     console.log();
   } else {
-    console.log(chalk.gray("  A directory of per-token files: the full id -> metadata mapping."));
+    console.log(chalk.gray("  A directory of per-token files. Compare its entry count with totalSupply"));
+    console.log(chalk.gray("  before treating it as the full id -> metadata mapping."));
     console.log();
   }
+  elapsedLine(started, "ipfs view");
   return 0;
 }
 
 export async function runRevealScanCli(args: string[]): Promise<number> {
+  const started = Date.now();
   const parsed = parseArgs(args);
   // --rarity wins over a plain --ipfs view: scoring the directory subsumes it.
   if (parsed.rarity) {
@@ -824,6 +836,8 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
   }
 
   console.log();
+
+  elapsedLine(started, "reveal scan");
 
   // Exit codes are a scanner's contract: 0 = nothing leaked, 1 = leaked,
   // 2 = could not tell. "Could not tell" must not read as "clean" — an
