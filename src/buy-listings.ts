@@ -277,27 +277,61 @@ function buyTxProblem(tx: BuyTransaction): string | null {
   if (!tx.to || !/^0x[0-9a-fA-F]{40}$/.test(tx.to)) {
     return `buy transaction has no valid 'to' address (got ${tx.to || "null"})`;
   }
-  const p = (tx.inputData as any)?.parameters;
-  if (!p || typeof p !== "object") {
-    const keys = Object.keys(tx.inputData ?? {}).join(",") || "none";
-    return (
-      `buy transaction has no input_data.parameters (function=${tx.function || "unknown"}, ` +
-      `input_data keys: ${keys}) — nothing was sent`
-    );
-  }
-  const addresses = ["offerer", "zone", "offerToken"];
-  for (const field of addresses) {
-    const value = p[field];
-    if (value == null || !/^0x[0-9a-fA-F]{40}$/.test(String(value))) {
-      return `buy transaction has null/invalid ${field} in order parameters — nothing was sent`;
+  const d = tx.inputData as any;
+  const shape = Object.keys(d ?? {}).join(",") || "none";
+  const missing = (what: string) =>
+    `buy transaction has no ${what} (function=${tx.function || "unknown"}, input_data keys: ${shape}) — nothing was sent`;
+  const address = (value: unknown, field: string) =>
+    value == null || !/^0x[0-9a-fA-F]{40}$/.test(String(value))
+      ? `buy transaction has null/invalid ${field} — nothing was sent`
+      : null;
+  const bytes32 = (value: unknown, field: string) =>
+    value == null || !/^0x[0-9a-fA-F]{64}$/.test(String(value))
+      ? `buy transaction has null/invalid ${field} — nothing was sent`
+      : null;
+
+  // Seaport 1.6 hands OpenSea two DIFFERENT fulfillment shapes. A collection
+  // whose items use criteria/resolvers gets fulfillAdvancedOrder, whose data
+  // has `advancedOrder` instead of `parameters`. Refusing it as "missing
+  // parameters" is not ignorance — it is a vocabulary mismatch in this tool.
+  if (d?.advancedOrder) {
+    const p = d.advancedOrder.parameters;
+    if (!p || typeof p !== "object") return missing("advancedOrder.parameters");
+    for (const [field, value] of [
+      ["offerer", p.offerer], ["zone", p.zone], ["recipient", d.recipient],
+    ] as [string, unknown][]) {
+      const bad = address(value, field);
+      if (bad) return bad;
     }
-  }
-  const bytes32 = ["zoneHash", "offererConduitKey", "fulfillerConduitKey"];
-  for (const field of bytes32) {
-    const value = p[field];
-    if (value == null || !/^0x[0-9a-fA-F]{64}$/.test(String(value))) {
-      return `buy transaction has null/invalid ${field} in order parameters — nothing was sent`;
+    // Conduit keys are bytes32, not addresses — validating them as addresses
+    // refused every advanced-order fill with a false null/invalid field.
+    for (const [field, value] of [
+      ["zoneHash", p.zoneHash], ["conduitKey", p.conduitKey],
+      ["fulfillerConduitKey", d.fulfillerConduitKey],
+    ] as [string, unknown][]) {
+      const bad = bytes32(value, field);
+      if (bad) return bad;
     }
+    for (const item of [...(p.offer ?? []), ...(p.consideration ?? [])]) {
+      const bad = address(item?.token, "item.token");
+      if (bad) return bad;
+      if (item?.recipient != null) {
+        const badRecipient = address(item.recipient, "item.recipient");
+        if (badRecipient) return badRecipient;
+      }
+    }
+    return null;
+  }
+
+  const p = d?.parameters;
+  if (!p || typeof p !== "object") return missing("input_data.parameters");
+  for (const field of ["offerer", "zone", "offerToken"]) {
+    const bad = address(p[field], field);
+    if (bad) return bad;
+  }
+  for (const field of ["zoneHash", "offererConduitKey", "fulfillerConduitKey"]) {
+    const bad = bytes32(p[field], field);
+    if (bad) return bad;
   }
   return null;
 }
@@ -413,7 +447,15 @@ export async function executeListingBuy(o: {
  * Verified live: the re-encoded selector matches the vendored `calldata_suffix`
  * (0xcdb44011 for fulfillBasicOrder_efficient_6GL6yc).
  */
-export function encodeBuyInput(tx: BuyTransaction): string {
+const BASIC_FULFILL =
+  "function fulfillBasicOrder_efficient_6GL6yc((address,uint256,uint256,address,address,address,uint256,uint256,uint8,uint256,uint256,bytes32,uint256,bytes32,bytes32,uint256,(uint256,address)[],bytes))";
+// Verified from OpenSea's own vended `function` string for an advanced-order
+// collection; keccak256 of it is 0xe7acab24, which is the real selector. The
+// `calldata_suffix` 0xcdb44011 is trailing attribution, NOT the selector.
+const ADVANCED_FULFILL =
+  "function fulfillAdvancedOrder(((address,address,(uint8,address,uint256,uint256,uint256)[],(uint8,address,uint256,uint256,uint256,address)[],uint8,uint256,uint256,bytes32,uint256,bytes32,uint256),uint120,uint120,bytes,bytes),(uint256,uint8,uint256,uint256,bytes32[])[],bytes32,address)";
+
+function encodeBasicInput(tx: BuyTransaction): string {
   const p = (tx.inputData as any)?.parameters ?? {};
   const tuple = [
     p.considerationToken ?? ZERO_ADDRESS,
@@ -435,10 +477,59 @@ export function encodeBuyInput(tx: BuyTransaction): string {
     (p.additionalRecipients ?? []).map((r: any) => [BigInt(r.amount ?? 0), r.recipient]),
     p.signature ?? "0x",
   ];
-  const iface = new Interface([
-    "function fulfillBasicOrder_efficient_6GL6yc((address,uint256,uint256,address,address,address,uint256,uint256,uint8,uint256,uint256,bytes32,uint256,bytes32,bytes32,uint256,(uint256,address)[],bytes))",
+  return new Interface([BASIC_FULFILL]).encodeFunctionData("fulfillBasicOrder_efficient_6GL6yc", [tuple]);
+}
+
+function encodeAdvancedInput(tx: BuyTransaction): string {
+  const d = tx.inputData as any;
+  const adv = d.advancedOrder;
+  const p = adv.parameters;
+  const item = (i: any, withRecipient: boolean) => [
+    Number(i.itemType),
+    i.token,
+    BigInt(i.identifierOrCriteria),
+    BigInt(i.startAmount),
+    BigInt(i.endAmount),
+    ...(withRecipient ? [i.recipient] : []),
+  ];
+  const order = [
+    [
+      p.offerer,
+      p.zone,
+      (p.offer ?? []).map((i: any) => item(i, false)),
+      (p.consideration ?? []).map((i: any) => item(i, true)),
+      Number(p.orderType),
+      BigInt(p.startTime),
+      BigInt(p.endTime),
+      p.zoneHash,
+      BigInt(p.salt),
+      p.conduitKey,
+      BigInt(p.totalOriginalConsiderationItems ?? 0),
+    ],
+    BigInt(adv.numerator ?? 1),
+    BigInt(adv.denominator ?? 1),
+    adv.signature ?? "0x",
+    adv.extraData ?? "0x",
+  ];
+  const resolvers = (d.criteriaResolvers ?? []).map((r: any) => [
+    BigInt(r.orderIndex),
+    Number(r.side),
+    BigInt(r.index),
+    BigInt(r.identifier),
+    (r.criteriaProof ?? []).map((proof: string) => proof),
   ]);
-  const encoded = iface.encodeFunctionData("fulfillBasicOrder_efficient_6GL6yc", [tuple]);
+  return new Interface([ADVANCED_FULFILL]).encodeFunctionData("fulfillAdvancedOrder", [
+    order,
+    resolvers,
+    d.fulfillerConduitKey,
+    d.recipient,
+  ]);
+}
+
+/** Rebuild the calldata from whichever fulfillment shape OpenSea vended. */
+export function encodeBuyInput(tx: BuyTransaction): string {
+  const d = tx.inputData as any;
+  const encoded = d?.advancedOrder ? encodeAdvancedInput(tx) : encodeBasicInput(tx);
   // `calldata_suffix` is NOT the selector: it is the first four bytes of
   // keccak256("api.opensea.io") (verified: 0xcdb44011), appended as TRAILING
   // calldata so the fill is attributed to OpenSea onchain. Seaport reads its

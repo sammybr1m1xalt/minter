@@ -1,0 +1,65 @@
+{
+  "function": "fulfillAdvancedOrder(((address,address,(uint8,address,uint256,uint256,uint256)[],(uint8,address,uint256,uint256,uint256,address)[],uint8,uint256,uint256,bytes32,uint256,bytes32,uint256),uint120,uint120,bytes,bytes),(uint256,uint8,uint256,uint256,bytes32[])[],bytes32,address)",
+  "chain": 1,
+  "to": "0x0000000000000068f116a894984e2db1123eb395",
+  "value": "3300000000000000",
+  "value_hex": "0xbb9551fc24000",
+  "input_data": {
+    "advancedOrder": {
+      "parameters": {
+        "offerer": "0x33aaec8f773a0023f929eb075dc68053b6c4f5ed",
+        "zone": "0x000056f7000000ece9003ca63978907a00ffd100",
+        "offer": [
+          {
+            "itemType": 2,
+            "token": "0xf061ce71fb0371316e256b45c0b21b35d0e32f21",
+            "identifierOrCriteria": "58",
+            "startAmount": "1",
+            "endAmount": "1"
+          }
+        ],
+        "consideration": [
+          {
+            "itemType": 0,
+            "token": "0x0000000000000000000000000000000000000000",
+            "identifierOrCriteria": "0",
+            "startAmount": "3102000000000000",
+            "endAmount": "3102000000000000",
+            "recipient": "0x33aaec8f773a0023f929eb075dc68053b6c4f5ed"
+          },
+          {
+            "itemType": 0,
+            "token": "0x0000000000000000000000000000000000000000",
+            "identifierOrCriteria": "0",
+            "startAmount": "33000000000000",
+            "endAmount": "33000000000000",
+            "recipient": "0x0000a26b00c1f0df003000390027140000faa719"
+          },
+          {
+            "itemType": 0,
+            "token": "0x0000000000000000000000000000000000000000",
+            "identifierOrCriteria": "0",
+            "startAmount": "165000000000000",
+            "endAmount": "165000000000000",
+            "recipient": "0x860636fb25a702aebe22b50c68b82f98063e2ae6"
+          }
+        ],
+        "orderType": 2,
+        "startTime": "1795637629",
+        "endTime": "1795638289",
+        "zoneHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "salt": "27855337018906766782546881864045825683096516384821792734235867911478020493641",
+        "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
+        "totalOriginalConsiderationItems": "3"
+      },
+      "numerator": 1,
+      "denominator": 1,
+      "signature": "0x5549c7982a3c00cf50f708b43b8ed0c0eef89e19432edfe5076271fd20bb1aa767ee03e6ac5b7c2bcb822bceda6256f96088dbdd84e795821a8de5f89482dbfd1c",
+      "extraData": "0x001111111111111111111111111111111111111111000000006b0743bff0e581f530124a27b28ae33fec95ea2a6105754e0af90a5a13e1e82cbd10f14750710beddebede1f1ae073367f921d7d869a41af81fb447300cc6eedc4982d1e080000000000000000000000000000000000000000000000000000000000000000721c008fdff27bf06e7e123956e2fe03b63342e3"
+    },
+    "criteriaResolvers": [],
+    "fulfillerConduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
+    "recipient": "0x1111111111111111111111111111111111111111"
+  },
+  "calldata_suffix": "0xcdb44011"
+}

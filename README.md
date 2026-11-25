@@ -1042,10 +1042,15 @@ than `totalSupply` is reported as PARTIAL, not as proof of the full mapping.
 Before gas estimation, the vended buy transaction is checked for null/invalid
 addresses and bytes32 fields. A null tuple field now names itself instead of
 appearing as `gas estimate failed: invalid address value=null`.
-`buy transaction has no input_data.parameters — nothing was sent` means the
-fulfillment endpoint answered but did not include the Seaport order parameters
-the encoder needs (an expired/changed order or an unfamiliar fulfillment shape).
-It is a refusal before any RPC call or send, not a wallet-balance error.
+`buy transaction has no input_data.parameters — nothing was sent` meant the
+fulfillment endpoint answered with a DIFFERENT Seaport shape: `fulfillAdvancedOrder`
+carries `advancedOrder`, `criteriaResolvers`, `fulfillerConduitKey` and
+`recipient`, with no flat `parameters`. Collections using criteria/resolvers
+(such as `official-rebelkin`) hit this every time. Both shapes are encoded now;
+the advanced selector is `0xe7acab24` (computed from the vended function string),
+with the same trailing `0xcdb44011` attribution suffix. Conduit keys are bytes32,
+not addresses. Nothing was ever sent on the refusal — it happened before gas
+estimation.
 
 Successful scan, IPFS-view and rarity+listings reports print their elapsed time
 at the end, e.g. `rarity + listings report completed in 10.2s`.
