@@ -864,6 +864,22 @@ its chainlist. Those chains are scanned through their own RPCs. Enabling the
 missing networks and lifting the free-tier log cap is an Alchemy console
 action, not a code change.
 
+### Drop URI history (`--drop-uri`)
+
+    minter --drop-uri [--from-block n] [--to-block n] [--blocks n] [--top n]
+
+SeaDrop's `updateDropURI(string)` only emits — it stores nothing and has no
+getter — so the metadata pointer exists on-chain **only as a log**. This reads
+`DropURIUpdated(address indexed nftContract, string newDropURI)` from Etherscan's
+ranged `getLogs` (public RPCs refused the large range), and prints the NFT
+contract, block and URI.
+
+`topic0` is computed from the real event declaration in SeaDrop's
+`SeaDropErrorsAndEvents.sol`, not typed from memory. The chain stores the
+pointer, not the metadata — resolve the URI separately. An unanswered scan
+prints `UNKNOWN` and exits 2, never "no such event". Etherscan caps a page at
+1000 results; a full page is reported as truncated rather than complete.
+
 ### Reveal scan (`--reveal-scan`)
 
     minter --reveal-scan <contract> [--chain ethereum] [--rpc <url>]
@@ -1072,7 +1088,7 @@ waiting for a receipt that will never exist.
 
     cd scripts/verify && ./run-all.sh
 
- Eighteen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+ Nineteen checks, no framework — each prints its own PASS/FAIL. `run.js` is the
 mock JSON-RPC server and the fire-path harness; the others cover the audit
 fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
 scan and the Scatter paths. `npm run build` first.

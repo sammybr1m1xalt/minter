@@ -180,6 +180,14 @@ export const MINT_SIGNATURES: MintSelector[] = [
   sel("purchase(address,uint256,uint256)", ["to", "amount", "id"], "structured", 50),
   sel("mintBaseNew(address,uint256,uint256,uint256,bytes)", ["to", "amount", "id", "data"], "structured", 49),
   sel("claim(address,uint256,uint256,uint256,bytes)", ["to", "amount", "id", "data"], "structured", 48),
+
+  // ── ERC-5679 (Final) ───────────────────────────────────────────────────
+  // Deliberately LAST and below every incumbent weight: inserting a new entry
+  // above an existing one silently changes which selector wins for contracts
+  // that already work. Both encode `data` as 0x, which buildArgs already does.
+  // safeMintBatch is omitted: it needs a caller-supplied id list we do not have.
+  sel("safeMint(address,uint256,bytes)", ["to", "amount", "data"], undefined, 10),
+  sel("mint(address,uint256,bytes)", ["to", "amount", "data"], undefined, 9),
 ];
 
 // ── Price readers ───────────────────────────────────────────────────────────
@@ -276,6 +284,8 @@ export interface ContractScreen {
   erc721: boolean;
   erc1155: boolean;
   erc20: boolean;
+  /** ERC-5679 declaration when the contract answers supportsInterface. */
+  erc5679: "erc721" | "erc1155" | "erc20" | null;
   /** owner() when the contract exposes one; null when absent or unreadable. */
   owner: string | null;
   ownerRenounced: boolean | null;
@@ -308,6 +318,11 @@ const ERC165_INTERFACE_IDS = {
   erc721: "0x80ac58cd",
   erc1155: "0xd9b67a26",
   erc20: "0x36372b07",
+  // ERC-5679 Final mint/burn extension ids. Detection only: these are probed
+  // alongside the standard ids but never change the "is this an NFT" verdict.
+  erc5679Erc721: "0xcce39764",
+  erc5679Erc1155: "0xf4cedd5a",
+  erc5679Erc20: "0xd0017968",
 } as const;
 
 /**
@@ -407,6 +422,7 @@ export async function screenMintContract(
     erc721: false,
     erc1155: false,
     erc20: false,
+    erc5679: null,
     owner: null,
     ownerRenounced: null,
     paused: null,
@@ -474,11 +490,15 @@ export async function screenMintContract(
       )
     );
 
-  const [erc721Raw, erc1155Raw, erc20Raw] = await Promise.all([
-    supports(ERC165_INTERFACE_IDS.erc721),
-    supports(ERC165_INTERFACE_IDS.erc1155),
-    supports(ERC165_INTERFACE_IDS.erc20),
-  ]);
+  const [erc721Raw, erc1155Raw, erc20Raw, erc5679_721Raw, erc5679_1155Raw, erc5679_20Raw] =
+    await Promise.all([
+      supports(ERC165_INTERFACE_IDS.erc721),
+      supports(ERC165_INTERFACE_IDS.erc1155),
+      supports(ERC165_INTERFACE_IDS.erc20),
+      supports(ERC165_INTERFACE_IDS.erc5679Erc721),
+      supports(ERC165_INTERFACE_IDS.erc5679Erc1155),
+      supports(ERC165_INTERFACE_IDS.erc5679Erc20),
+    ]);
 
   // `0x` is NOT an ERC165 answer — the contract returned no data at all.
   // Counting it as "answered, claims nothing" refused every contract whose
@@ -498,6 +518,27 @@ export async function screenMintContract(
   screen.erc1155 = erc1155 === true;
   screen.erc20 = erc20 === true;
   screen.erc165Supported = erc721 !== null || erc1155 !== null || erc20 !== null;
+
+  // ERC-5679 is detection-only. It never changes the NFT verdict and it never
+  // reorders the weighted selector table, because a contract that declares it
+  // may also expose a selector an existing deployment already uses safely.
+  const erc5679_721 = decodeSupport(erc5679_721Raw);
+  const erc5679_1155 = decodeSupport(erc5679_1155Raw);
+  const erc5679_20 = decodeSupport(erc5679_20Raw);
+  screen.erc5679 = erc5679_721 === true
+    ? "erc721"
+    : erc5679_1155 === true
+      ? "erc1155"
+      : erc5679_20 === true
+        ? "erc20"
+        : null;
+  if (screen.erc5679) {
+    findings.push({
+      level: "info",
+      code: "erc5679",
+      detail: `ERC165 declares the ERC-5679 ${screen.erc5679} mint/burn extension; a bytes mint may be available.`,
+    });
+  }
 
   if (screen.erc165Supported) {
     if (erc721) {
