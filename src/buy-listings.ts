@@ -392,7 +392,15 @@ export async function executeListingBuy(o: {
 
   const provider = new JsonRpcProvider(o.rpcUrl, o.chainId, { staticNetwork: true });
   try {
-    const gas = await provider.estimateGas({ to: tx.to, data: encodeBuyInput(tx), value });
+    // Seaport validates msg.sender against the fulfiller encoded in the order.
+    // Without `from`, eth_estimateGas runs as the zero address and reverts even
+    // when the very same wallet can fill the order. Pass the buyer explicitly.
+    const gas = await provider.estimateGas({
+      from: buyer.address,
+      to: tx.to,
+      data: encodeBuyInput(tx),
+      value,
+    });
     const fee = await provider.getFeeData();
     const gasCost = gas * (fee.maxFeePerGas ?? fee.gasPrice ?? 0n);
     console.log(chalk.gray(`    gas estimate: ${gas} (≈ ${gasCost} wei at current fees)`));

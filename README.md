@@ -1055,6 +1055,13 @@ estimation.
 Successful scan, IPFS-view and rarity+listings reports print their elapsed time
 at the end, e.g. `rarity + listings report completed in 10.2s`.
 
+`gas estimate failed: execution reverted` on a valid order was caused by calling
+`eth_estimateGas` without `from`. Seaport checks `msg.sender` against the
+fulfiller encoded in the order; with no `from` the node simulates the zero
+address and reverts. The real send already used the wallet, so the estimate now
+passes the buyer address explicitly. Verified on a live advanced order: the
+same calldata estimated at 205787 gas with `from` and reverted without it.
+
 - Only native-priced listings are sent. An ERC20-priced listing returns value
   `"0"` and pulls payment with `transferFrom`, so it needs a spender approval
   first — that is reported, not guessed.
