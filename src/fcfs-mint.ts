@@ -30,6 +30,7 @@
 // This is the same speed as public mint for signed phases too — the only difference
 // is that you need to have done the API round-trip BEFORE the window opens.
 
+import { formatLocalTime } from "./time-format";
 import chalk from "chalk";
 import { Wallet, JsonRpcProvider, Interface } from "ethers";
 import { parseRpcEndpoints, prepareBlast, blastToAll, waitForReceipt, type PreparedBlast, type BlastResult } from "./rpc-blast";
@@ -257,7 +258,7 @@ export function stageMismatchReason(payload: FcfsSignedPayload, expected: Expect
   // into mintParams, so the payload states them even though the response does
   // not. This is the comparison that separates two stages of the SAME type —
   // the uuid is absent on that surface and the type is equal by construction.
-  const fmt = (t: number) => new Date(t * 1000).toISOString().replace("T", " ").slice(0, 19);
+  const fmt = (t: number) => formatLocalTime(new Date(t * 1000));
   const sStart = s.startTime != null && s.startTime > 0 ? s.startTime : null;
   const eStart = expected.startTime != null && expected.startTime > 0 ? expected.startTime : null;
   const sEnd = s.endTime != null && s.endTime > 0 ? s.endTime : null;

@@ -1,3 +1,4 @@
+import { formatLocalTime } from "./time-format";
 // ── Scatter.art launchpad integration ──────────────────────────────────────
 //
 // Scatter contracts use a custom mint(auth, quantity, affiliate, signature)
@@ -213,10 +214,10 @@ export function listWindow(list: ScatterList, nowMs: number = Date.now()): ListW
   const startsAt = Number.isNaN(start) ? null : start;
   const endsAt = Number.isNaN(end) ? null : end;
   if (startsAt != null && nowMs < startsAt) {
-    return { open: false, startsAt, endsAt, reason: `opens ${new Date(startsAt).toISOString()}` };
+    return { open: false, startsAt, endsAt, reason: `opens ${formatLocalTime(new Date(startsAt))}` };
   }
   if (endsAt != null && nowMs >= endsAt) {
-    return { open: false, startsAt, endsAt, reason: `ended ${new Date(endsAt).toISOString()}` };
+    return { open: false, startsAt, endsAt, reason: `ended ${formatLocalTime(new Date(endsAt))}` };
   }
   return { open: true, startsAt, endsAt, reason: null };
 }

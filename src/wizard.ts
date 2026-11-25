@@ -82,7 +82,7 @@ import { ScatterCollection, getScatterCollection } from "./scatter";
 import { getMintMechanisms } from "./seadrop-public";
 import { verifyContract } from "./contract-verify";
 import { simulateTx, classifyRevert, type SimulateResult } from "./simulate";
-import { formatRemaining } from "./time-format";
+import { formatRemaining, formatLocalTime } from "./time-format";
 import { blastToAll } from "./rpc-blast";
 import { parsePriceToWei } from "./opensea-gql";
 import {
@@ -681,7 +681,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
       const unix = parseWhen(opts.at);
       targetStart = new Date(unix * 1000);
       timingLabel = `--at ${opts.at}`;
-      console.log(chalk.gray(`  Scheduled for ${targetStart.toISOString()} (${timingLabel})`));
+      console.log(chalk.gray(`  Scheduled for ${formatLocalTime(targetStart)} (${timingLabel})`));
     } else if (opts.whenOpen) {
       if (!knownStart) {
         throw new Error("Cannot use --when-open: the opening time is unknown for this phase.");
@@ -712,7 +712,7 @@ export async function runWizard(log: RunLogger, opts: WizardOptions = {}): Promi
         timingLabel = "immediately (opening time unknown)";
       } else {
         targetStart = new Date(parseWhen(answer) * 1000);
-        timingLabel = `at ${targetStart.toISOString()}`;
+        timingLabel = `at ${formatLocalTime(targetStart)}`;
       }
     }
     // ── 12b. Price protection ───────────────────────────────────────────────

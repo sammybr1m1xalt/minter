@@ -1,22 +1,52 @@
-// Mint times get announced in IST, so every command prints them that way.
+// Every human-facing timestamp is rendered in the machine's LOCAL timezone.
+// There is no fixed offset here: a host set to WAT, IST or EST reports its own
+// wall clock, and the zone abbreviation is printed so the reader knows which.
+//
+// Machine-readable timestamps (ISO strings in API payloads and on-disk caches)
+// intentionally stay UTC — they are not reports and must remain parseable.
 
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+const ZONE_FORMATTER =
+  typeof Intl !== "undefined"
+    ? new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+    : null;
 
-export function toIST(date: Date): string {
-  const ist = new Date(date.getTime() + IST_OFFSET_MS);
-  const day = ist.getUTCDate().toString().padStart(2, "0");
-  const month = (ist.getUTCMonth() + 1).toString().padStart(2, "0");
-  const year = ist.getUTCFullYear();
-  const hours = ist.getUTCHours();
-  const minutes = ist.getUTCMinutes().toString().padStart(2, "0");
-  const seconds = ist.getUTCSeconds().toString().padStart(2, "0");
-  const ampm = hours >= 12 ? "PM" : "AM";
-  const h12 = hours % 12 || 12;
-  return `${day}/${month}/${year}, ${h12}:${minutes}:${seconds} ${ampm}`;
+function zoneLabel(date: Date): string {
+  if (!ZONE_FORMATTER) return "";
+  try {
+    return (
+      ZONE_FORMATTER.formatToParts(date).find((p) => p.type === "timeZoneName")
+        ?.value ?? ""
+    );
+  } catch {
+    return "";
+  }
 }
 
+function localParts(date: Date) {
+  const day = date.getDate().toString().padStart(2, "0");
+  const month = (date.getMonth() + 1).toString().padStart(2, "0");
+  const year = date.getFullYear();
+  const hours = date.getHours();
+  const minutes = date.getMinutes().toString().padStart(2, "0");
+  const seconds = date.getSeconds().toString().padStart(2, "0");
+  const ampm = hours >= 12 ? "PM" : "AM";
+  const h12 = hours % 12 || 12;
+  return { day, month, year, h12, hours, minutes, seconds, ampm, zone: zoneLabel(date) };
+}
 
-// Format a duration in milliseconds as "Xh Ym Zs", "Ym Zs", or "Zs".
+/** Full local wall-clock stamp, e.g. "25/11/2026, 4:03:19 PM WAT". */
+export function formatLocalTime(date: Date): string {
+  const p = localParts(date);
+  return `${p.day}/${p.month}/${p.year}, ${p.h12}:${p.minutes}:${p.seconds} ${p.ampm}${p.zone ? ` ${p.zone}` : ""}`;
+}
+
+/** Compact local stamp for table columns, e.g. "25/11/2026, 4:03 PM WAT". */
+export function formatLocalMinute(date: Date): string {
+  const p = localParts(date);
+  return `${p.day}/${p.month}/${p.year}, ${p.h12}:${p.minutes} ${p.ampm}${p.zone ? ` ${p.zone}` : ""}`;
+}
+
+/** Format a duration in milliseconds as "Xh Ym Zs", "Ym Zs", or "Zs". */
 export function formatRemaining(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000));
   const h = Math.floor(total / 3600);

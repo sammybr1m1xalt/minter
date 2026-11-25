@@ -8,6 +8,7 @@
 // Also includes gas-state polling so the bot can recommend max fee / priority
 // fee settings based on current chain conditions.
 
+import { formatLocalMinute } from "./time-format";
 import chalk from "chalk";
 import { formatEther } from "ethers";
 import { fetchOnChainDrops } from "./seadrop-onchain";
@@ -1743,7 +1744,7 @@ export function printDropsInventory(
     console.log(chalk.gray(`  ${sep}`));
     console.log(chalk.gray(`    Type:       ${typeBadge}`));
     console.log(chalk.gray(`    Drop ID:    ${drop.dropId}`));
-    const windowLabel = `${startsAt ? startsAt.toISOString().slice(0, 16).replace("T", " ") : "unknown"} → ${endsAt ? endsAt.toISOString().slice(0, 16).replace("T", " ") : "unknown"}`;
+    const windowLabel = `${startsAt ? formatLocalMinute(startsAt) : "unknown"} → ${endsAt ? formatLocalMinute(endsAt) : "unknown"}`;
     console.log(chalk.gray(`    Window:     ${windowLabel}`));
     console.log(statusColor(`    Status:     ${statusLabel}`));
     console.log(chalk.gray(`    Price:      ${priceEth} ETH × ${perWallet}`));
@@ -1801,7 +1802,7 @@ export function printDropsInventory(
       console.log(chalk.gray(`    • ${d.name || "unnamed"} [${d.type || "unknown"}] — ${d.dropId}`));
       // A 0 timestamp means "unknown", never 1970-01-01.
       const fmt = (sec: number) =>
-        sec > 0 ? new Date(sec * 1000).toISOString().slice(0, 16).replace("T", " ") : "unknown";
+        sec > 0 ? formatLocalMinute(new Date(sec * 1000)) : "unknown";
       console.log(chalk.gray(`      ${fmt(d.startTime)} → ${fmt(d.endTime)}`));
       console.log(chalk.gray(`      price: ${formatEther(d.mintPrice)} ETH, ${d.maxTotalMintableByWallet || "unlimited"} per wallet`));
       if (d.gasLimit) console.log(chalk.gray(`      OpenSea gas: ${d.gasLimit} gas`));

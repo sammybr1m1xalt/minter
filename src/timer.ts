@@ -1,3 +1,4 @@
+import { formatLocalTime } from "./time-format";
 import chalk from "chalk";
 import ora from "ora";
 
@@ -18,11 +19,11 @@ export async function waitForMintTime(mintTime: Date, earlyFireMs: number = 0): 
     return;
   }
 
-  console.log(chalk.bold.white(`\n⏰ Mint time: ${mintTime.toISOString()}`));
+  console.log(chalk.bold.white(`\n⏰ Mint time: ${formatLocalTime(mintTime)}`));
   if (earlyFireMs > 0) {
-    console.log(chalk.bold.yellow(`  🔥 Early fire: ${earlyFireMs}ms before mint → firing at ${fireTime.toISOString()}`));
+    console.log(chalk.bold.yellow(`  🔥 Early fire: ${earlyFireMs}ms before mint → firing at ${formatLocalTime(fireTime)}`));
   }
-  console.log(chalk.gray(`  Now: ${now.toISOString()} | Waiting ${Math.ceil(diff / 1000)}s...\n`));
+  console.log(chalk.gray(`  Now: ${formatLocalTime(now)} | Waiting ${Math.ceil(diff / 1000)}s...\n`));
 
   // If more than 10 seconds away, show a countdown spinner
   if (diff > 10000) {

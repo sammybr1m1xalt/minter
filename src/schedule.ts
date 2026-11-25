@@ -13,10 +13,9 @@
 //
 // Returns UNIX SECONDS, matching the rest of the codebase.
 
-// The UI announces mint times in IST (time-format.ts), so a wall-clock time
-// typed by the user must be read in that zone — not the server's local zone.
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-
+// HH:MM is read in the MACHINE'S LOCAL timezone, the same zone the reports
+// are printed in. A fixed offset made a time typed from the screen resolve to
+// a different instant on hosts in other zones.
 /** Parse a "when" spec into an absolute unix-seconds timestamp. */
 export function parseWhen(spec: string, nowMs: number = Date.now()): number {
   const s = String(spec).trim().toLowerCase();
@@ -36,23 +35,23 @@ export function parseWhen(spec: string, nowMs: number = Date.now()): number {
   // Unix seconds — 10 digits.
   if (/^\d{10}$/.test(s)) return Number(s);
 
-  // HH:MM — the next occurrence of that wall-clock time in IST (UTC+5:30),
-  // matching what the wizard prints. Reading it in the server's local zone
-  // meant a user who typed the time shown on screen got a different instant.
+  // HH:MM — the next occurrence of that wall-clock time locally, matching
+  // what the wizard prints. setHours rolls out-of-range values over into the
+  // next day, so "25:00" and "0:99" are refused before we get here.
   m = s.match(/^(\d{1,2}):(\d{2})$/);
   if (m) {
     const hh = Number(m[1]);
     const mm = Number(m[2]);
-    // setUTCHours rolls out-of-range values over into the next day, so "25:00"
-    // and "0:99" used to pass validation and fire at a different instant.
     if (hh > 23 || mm > 59) {
       throw new Error(`cannot parse time: "${spec}" (hours 0-23, minutes 0-59)`);
     }
-    const d = new Date(nowMs + IST_OFFSET_MS);
-    d.setUTCHours(Number(m[1]), Number(m[2]), 0, 0);
-    let t = Math.floor((d.getTime() - IST_OFFSET_MS) / 1000);
-    if (t * 1000 <= nowMs) t += 86400; // already passed today → tomorrow
-    return t;
+    const d = new Date(nowMs);
+    d.setHours(hh, mm, 0, 0);
+    if (d.getTime() <= nowMs) {
+      d.setDate(d.getDate() + 1);
+      d.setHours(hh, mm, 0, 0); // re-apply across a DST boundary
+    }
+    return Math.floor(d.getTime() / 1000);
   }
 
   // ISO / Date-parseable.

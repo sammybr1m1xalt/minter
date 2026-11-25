@@ -194,7 +194,7 @@ neither loses your keys nor scatters logs:
 
 | Flag | Meaning |
 |---|---|
-| `--at <time>` | ISO 8601, unix seconds/ms, `"in 5m"`, `"30s"`, or `"HH:MM"` (HH:MM is read in IST, matching the times the wizard prints) |
+| `--at <time>` | ISO 8601, unix seconds/ms, `"in 5m"`, `"30s"`, or `"HH:MM"` (HH:MM is read in this machine's local timezone) |
 | `--when-open` | Poll the chain and fire the moment the stage opens |
 | `--max-price <price>` | Max total price in ETH, `"free"`, `"0.05/unit"`, `"0.05total"`, or `"any"` (no cap) |
 | `--wallets <spec>` | `all` \| `N` \| `1,3,4` — 1-based. An unknown spec, an out-of-range index, a duplicate or `0` is **refused** naming the problem, not clamped or silently narrowed. Indices are applied in wallet order however you type them |
@@ -1088,7 +1088,7 @@ waiting for a receipt that will never exist.
 
     cd scripts/verify && ./run-all.sh
 
- Twenty-one checks, no framework — each prints its own PASS/FAIL. `run.js` is the
+ Twenty-two checks, no framework — each prints its own PASS/FAIL. `run.js` is the
 mock JSON-RPC server and the fire-path harness; the others cover the audit
 fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
 scan and the Scatter paths. `npm run build` first.
@@ -1206,8 +1206,11 @@ Fixed — a provider cleanup hook now runs on every exit path. If you still see 
 upgrade; you're on an older build.
 
 **`--at "HH:MM"` fires at the wrong time**
-`HH:MM` is interpreted in IST, matching the times the wizard prints. Use an
-explicit ISO 8601 timestamp or unix seconds for anything else.
+`HH:MM` is interpreted in the machine's local timezone, matching the times the
+wizard prints. Use an explicit ISO 8601 timestamp or unix seconds for anything
+else. All human-facing time reports (mint time, scheduled fire, stage open/close
+windows, run-log messages) use that same local wall clock and print the zone
+label; ISO strings remain only in machine-readable API payloads and caches.
 
 ---
 

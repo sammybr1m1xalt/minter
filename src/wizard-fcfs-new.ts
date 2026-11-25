@@ -54,7 +54,7 @@ import {
   promptTiming,
   confirmSnipe,
 } from "./wizard-helpers";
-import { formatRemaining, toIST } from "./time-format";
+import { formatRemaining, formatLocalTime } from "./time-format";
 
 // ── Main FCFS branch entry ──────────────────────────────────────────────────
 
@@ -285,7 +285,7 @@ export async function runFcfsBranch(
       const eMs = d.endTime > 0 ? d.endTime * 1000 : null;
       const isLive = sMs != null && eMs != null && Date.now() >= sMs && Date.now() < eMs;
       const liveMark = isLive ? chalk.green("LIVE") : chalk.gray("waiting");
-      const fmt = (ms: number | null) => (ms != null ? toIST(new Date(ms)) : "unknown");
+      const fmt = (ms: number | null) => (ms != null ? formatLocalTime(new Date(ms)) : "unknown");
       console.log(
         chalk.gray(`    [${i + 1}] ${d.name || `phase #${i + 1}`}`)
       );
@@ -364,7 +364,7 @@ export async function runFcfsBranch(
         console.log(chalk.yellow(`\n  This phase is not open yet.`));
         console.log(
           chalk.gray(
-            `    It opens ${toIST(new Date(phaseStartMs!))} — OpenSea will not sign a mint\n` +
+            `    It opens ${formatLocalTime(new Date(phaseStartMs!))} — OpenSea will not sign a mint\n` +
               `    for a stage that is not live, so no signed payload exists yet.`
           )
         );
@@ -427,7 +427,7 @@ export async function runFcfsBranch(
       console.log(chalk.gray(`    name:       ${drop0.name || "unnamed"}`));
       console.log(chalk.gray(`    type:       ${drop0.type || "unknown"}`));
       console.log(chalk.gray(`    drop ID:    ${drop0.dropId}`));
-      const fmt0 = (sec: number) => (sec > 0 ? toIST(new Date(sec * 1000)) : "unknown");
+      const fmt0 = (sec: number) => (sec > 0 ? formatLocalTime(new Date(sec * 1000)) : "unknown");
       console.log(chalk.gray(`    window:     ${fmt0(drop0.startTime)} → ${fmt0(drop0.endTime)}`));
       console.log(chalk.gray(`    price:      ${formatEther(drop0.mintPrice)} ETH`));
       console.log(chalk.gray(`    per wallet: ${drop0.maxTotalMintableByWallet || "unlimited"}`));
@@ -504,7 +504,7 @@ export async function runFcfsBranch(
   // a run aimed at one phase ends up aimed at another.
   if (payload?.stage?.startTime && payload.stage.startTime > 0 && selectedDrop.startTime > 0) {
     if (payload.stage.startTime !== selectedDrop.startTime) {
-      const fmt = (t: number) => toIST(new Date(t * 1000));
+      const fmt = (t: number) => formatLocalTime(new Date(t * 1000));
       console.log(
         chalk.yellow(
           `\n  ⚠ The payload OpenSea signed is for a stage opening ${fmt(payload.stage.startTime)}, not the ` +
@@ -539,7 +539,7 @@ export async function runFcfsBranch(
     console.log(chalk.gray(`    Max per wallet: ${selectedDrop.maxTotalMintableByWallet || "unlimited"}`));
     console.log(chalk.gray(`    Calldata:      fetched at T-0, per wallet`));
   }
-  const fmtWhen = (d: Date | null) => (d ? toIST(d) : "unknown");
+  const fmtWhen = (d: Date | null) => (d ? formatLocalTime(d) : "unknown");
   const nowMs = Date.now();
   const timingNote = live
     ? chalk.green("(live)")
@@ -618,14 +618,14 @@ export async function runFcfsBranch(
     const unix = parseWhen(target.at);
     targetStart = new Date(unix * 1000);
     timingLabel = `--at ${target.at}`;
-    console.log(chalk.gray(`  Scheduled for ${toIST(targetStart)} (${timingLabel})`));
+    console.log(chalk.gray(`  Scheduled for ${formatLocalTime(targetStart)} (${timingLabel})`));
   } else if (target.whenOpen) {
     // An unknown opening time means "fire now" — the stage may already be open.
     targetStart = startsAt ?? new Date();
     timingLabel = "when-open";
     console.log(
       chalk.gray(
-        `  Will fire at the stage opening (${startsAt ? toIST(startsAt) : "unknown — firing immediately"}).`
+        `  Will fire at the stage opening (${startsAt ? formatLocalTime(startsAt) : "unknown — firing immediately"}).`
       )
     );
   } else {

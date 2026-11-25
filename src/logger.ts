@@ -9,6 +9,7 @@
 // point, mirror that pattern — a missing log.end() leaves a partially-written
 // log file and loses the run's diagnostic data.
 
+import { formatLocalTime } from "./time-format";
 import * as fs from "fs";
 import * as path from "path";
 import chalk from "chalk";
@@ -81,7 +82,7 @@ export function createRunLogger(opts: { mode: string; label?: string }): RunLogg
   const logFile = path.join(logDir(), `run-${runId}-${safeLogLabel(label)}.log`);
 
   const push = (level: string, msg: string) => {
-    const t = new Date().toISOString();
+    const t = formatLocalTime(new Date());
     lines.push(`[${t}] [${level}] ${msg}`);
     if (level === "ERROR") {
       const err = new Error(msg);

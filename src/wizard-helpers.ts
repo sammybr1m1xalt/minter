@@ -6,7 +6,7 @@ import chalk from "chalk";
 import { formatEther, JsonRpcProvider, Wallet } from "ethers";
 import { ChainProfile } from "./chains";
 import { askChoice, askNumber, askYesNo } from "./prompt";
-import { toIST } from "./time-format";
+import { formatLocalTime } from "./time-format";
 import { SIGNED_GAS_FLOOR } from "./auto-gas";
 import {
   executeSellAfterMint,
@@ -239,7 +239,7 @@ export async function promptTiming(dropStartTime: Date | null): Promise<{ target
   }
   const waitStr = `in ${Math.round(delay / 1000)}s`;
   console.log(chalk.bold.white(`\nTiming`));
-  console.log(chalk.gray(`  Stage opens ${toIST(dropStartTime)} (${waitStr} from now)`));
+  console.log(chalk.gray(`  Stage opens ${formatLocalTime(dropStartTime)} (${waitStr} from now)`));
 
   // A future signed phase has no payload yet — OpenSea signs a mint only for a
   // live stage. Ask whether to wait for it rather than assuming, so the user
@@ -251,7 +251,7 @@ export async function promptTiming(dropStartTime: Date | null): Promise<{ target
   if (!fireWhenOpen) {
     return { targetStart: null, timingLabel: "Declined — not scheduled" };
   }
-  return { targetStart: dropStartTime, timingLabel: `Fires at ${toIST(dropStartTime)}` };
+  return { targetStart: dropStartTime, timingLabel: `Fires at ${formatLocalTime(dropStartTime)}` };
 }
 
 function labelOf(url: string): string {

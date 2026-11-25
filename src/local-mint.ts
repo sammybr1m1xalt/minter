@@ -6,6 +6,7 @@
 // encoding. That is strictly faster than the OpenSea path, which cannot sign
 // until the API hands over calldata roughly a second after the stage starts.
 
+import { formatLocalTime } from "./time-format";
 import chalk from "chalk";
 import { performance } from "perf_hooks";
 import { JsonRpcProvider, Wallet, formatEther } from "ethers";
@@ -279,7 +280,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<LocalSnipe
     if (stageNotYetOpen) {
       console.log(
         chalk.yellow(
-          `\n  ⚠ Stage opens at ${targetStart!.toISOString()} — skipping pre-flight simulation ` +
+          `\n  ⚠ Stage opens at ${formatLocalTime(targetStart!)} — skipping pre-flight simulation ` +
           `(mintPublic reverts before the stage opens). The tx will be broadcast at T-0.`
         )
       );
