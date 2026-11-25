@@ -19,6 +19,7 @@ import { resolveRpcsForChain } from "./rpc-resolver";
 import { askChoice, askYesNo } from "./prompt";
 import { screenMintContract, detectPrice, buildGenericMintTx, isPlanBroadcastable } from "./mint-generic";
 import { fetchPublicDrop } from "./seadrop-public";
+import { fetchAbi, deriveMintCandidates } from "./abi-mint";
 import { loadEnvKeys, promptWalletPassphrase, walletFilePath } from "./wizard";
 
 const ZERO_TOPIC = "0x" + "0".repeat(64);
@@ -654,6 +655,44 @@ function printTable(chainKey: string, window: string, rows: Enriched[]): void {
 
 // ── Targeting ───────────────────────────────────────────────────────────────
 
+/**
+ * "No buildable mint" is too thin a diagnosis for a struct/invite mint. Read
+ * the verified ABI and name the blocker: a wallet-specific merkle proof or a
+ * struct argument cannot be derived from a scalar quantity, and fabricating
+ * one is exactly the failure this tool refuses.
+ */
+export function describeUnbuildable(abi: any[]): string {
+  const candidates = deriveMintCandidates(abi);
+  // Prefer the simplest signature when several struct mints exist — an
+  // owner-only batchMintTo must not shadow the public mint() for diagnostics.
+  const structured = candidates
+    .filter((c) =>
+      c.inputs.some(
+        (i) => i.type.startsWith("tuple") || i.type === "bytes32[]" || i.type === "bytes"
+      )
+    )
+    .sort((a, b) => a.signature.length - b.signature.length);
+  if (!structured.length) {
+    return `No scalar mint signature matched ${candidates.length} verified ABI candidate(s).`;
+  }
+  const c = structured[0];
+  const args = c.inputs.map((i) => `${i.name || "?"}: ${i.type}`).join(", ");
+  return (
+    `Verified ABI exposes ${c.signature} (${args}). ` +
+    "It takes an invite key / wallet-specific proof or a struct the chain cannot supply, " +
+    "so no calldata can be built without fabricating a proof."
+  );
+}
+
+async function explainUnbuildable(chain: ChainProfile, address: string): Promise<string> {
+  const got = await fetchAbi(chain.chainId, address, {
+    etherscanKey: process.env.ETHERSCAN_API_KEY,
+    timeoutMs: 8000,
+  });
+  if (!got.abi) return "No verified ABI was reachable, so the blocker could not be named.";
+  return describeUnbuildable(got.abi);
+}
+
 export async function loadFirstWalletKey(): Promise<{ key: string; address: string } | null> {
   // Use the wizard's loader, not a parallel copy of it. promptWalletPassphrase
   // stores the typed passphrase in the wizard's session state; passing only
@@ -693,7 +732,10 @@ async function targetOne(
   const plan = await buildGenericMintTx(row.address, provider, wallet.address, 1n);
   provider.destroy();
   if (!plan) {
-    console.error(chalk.red(`\n❌ No buildable mint found on ${row.address}. Nothing was sent.\n`));
+    console.error(chalk.red(`\n❌ No buildable mint found on ${row.address}. Nothing was sent.`));
+    const reason = await explainUnbuildable(chain, row.address);
+    console.error(chalk.yellow(`   ${reason}`));
+    console.error("");
     return 2;
   }
   if (!isPlanBroadcastable(plan)) {
