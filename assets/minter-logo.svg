@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="400" viewBox="0 0 720 200" role="img" aria-labelledby="title desc" shape-rendering="geometricPrecision" text-rendering="geometricPrecision">
   <title id="title">Minter logo</title>
-  <desc id="desc">Minter wordmark with an aqua cube, widened M and chain bisecting its V below the top face.</desc>
+  <desc id="desc">Minter wordmark with an aqua 2.5D cube and widened M.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0B1020"/>
@@ -44,20 +44,6 @@
       <path d="M114 164 256 248 256 432 114 348Z" fill="url(#faceL)"/>
       <path d="M256 248 398 164 398 348 256 432Z" fill="url(#faceR)"/>
       <path d="M256 80 398 164 256 248 114 164Z" fill="url(#faceTop)"/>
-    </g>
-    <!-- Chain motif in the cube top face -->
-    <!-- Longer rounded chain below the top face, within the M uprights -->
-    <g fill="none" stroke="url(#mint)" stroke-width="3.5" stroke-linejoin="round" stroke-linecap="round">
-      <rect x="248" y="250" width="12" height="18" rx="6"/>
-      <rect x="256" y="250" width="12" height="18" rx="6"/>
-      <rect x="248" y="268" width="12" height="18" rx="6"/>
-      <rect x="256" y="268" width="12" height="18" rx="6"/>
-      <rect x="248" y="286" width="12" height="18" rx="6"/>
-      <rect x="256" y="286" width="12" height="18" rx="6"/>
-      <rect x="248" y="304" width="12" height="18" rx="6"/>
-      <rect x="256" y="304" width="12" height="18" rx="6"/>
-      <rect x="248" y="322" width="12" height="18" rx="6"/>
-      <rect x="256" y="322" width="12" height="18" rx="6"/>
     </g>
 
     <g filter="url(#glow)" opacity="0.45">
