@@ -85,6 +85,62 @@ async function readPublicDrop(
   return drop;
 }
 
+/**
+ * Build the same local public-mint plan on an EXISTING provider.
+ *
+ * Hot's target path already owns a provider (and a chain-id check), so it must
+ * not open a second connection just to build a plan. The plan targets the
+ * SeaDrop singleton: calling `mintSeaDrop` on the collection from an EOA
+ * reverts `OnlyAllowedSeaDrop` — that entry point is for the singleton to call.
+ */
+export async function buildLocalMintPlanOnProvider(
+  provider: JsonRpcProvider,
+  nftContract: string,
+  quantity: number,
+  timeoutMs: number = DEFAULT_READ_TIMEOUT_MS
+): Promise<{ plan: LocalMintPlan | null; reason: string }> {
+  let drop: PublicDrop | null;
+  let fee: FeeRecipientResult | null;
+  try {
+    try {
+      drop = await withRpcTimeout(readPublicDrop(provider, nftContract), timeoutMs, "read the public drop");
+    } catch (e: any) {
+      return { plan: null, reason: `reading the public drop failed: ${e?.shortMessage || e?.message || e}` };
+    }
+    if (!drop) return { plan: null, reason: "no public drop is set on the SeaDrop singleton" };
+    try {
+      fee = await withRpcTimeout(
+        readFeeRecipient(provider, nftContract, drop.restrictFeeRecipients),
+        timeoutMs,
+        "read the fee recipient"
+      );
+    } catch (e: any) {
+      return { plan: null, reason: `reading the fee recipient failed: ${e?.shortMessage || e?.message || e}` };
+    }
+    if (fee.address == null) {
+      return {
+        plan: null,
+        reason:
+          fee.source === "read-failed"
+            ? `reading allowed fee recipients failed: ${fee.error}`
+            : "the drop restricts fee recipients and none is allowed",
+      };
+    }
+  } catch (e: any) {
+    return { plan: null, reason: e?.shortMessage || e?.message || String(e) };
+  }
+  return {
+    plan: {
+      to: SEADROP_ADDRESS,
+      data: encodeMintPublic(nftContract, fee.address, quantity),
+      value: drop.mintPrice * BigInt(quantity),
+      drop,
+      feeRecipient: fee.address,
+    },
+    reason: "",
+  };
+}
+
 // Returns null when this contract has no public drop on the SeaDrop singleton —
 // either it isn't a SeaDrop collection at all, or it uses a newer variant that
 // keeps drop config on the token contract itself.

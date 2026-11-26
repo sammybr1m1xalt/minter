@@ -864,6 +864,11 @@ unless `--yes`. The scanner's output is not a safety signal: a hot contract is
 where rugs live. Nothing is broadcast when the screen refuses or simulation
 reverts.
 
+SeaDrop collections are planned through the SeaDrop singleton's `mintPublic`:
+calling the collection's `mintSeaDrop(minter, quantity)` from an EOA reverts
+`OnlyAllowedSeaDrop`, which made a genuinely free public stage look unmintable.
+The planner checks the singleton path first and simulates it from the buyer.
+
 Etherscan V2 free serves Ethereum only; Base, Arc and Robinhood are refused
 with `Free API access is not supported for this chain`, and Ink is absent from
 its chainlist. Those chains are scanned through their own RPCs. Enabling the

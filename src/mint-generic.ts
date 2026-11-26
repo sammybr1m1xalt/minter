@@ -27,7 +27,7 @@
 
 import { id as keccakId, Interface, JsonRpcProvider } from "ethers";
 import { autoGasBounded } from "./auto-gas";
-import { SEADROP_ADDRESS } from "./seadrop-public";
+import { SEADROP_ADDRESS, buildLocalMintPlanOnProvider } from "./seadrop-public";
 import { withRpcTimeout, DEFAULT_READ_TIMEOUT_MS } from "./rpc-timeout";
 import { isIndeterminateRpcError } from "./simulate";
 
@@ -904,6 +904,57 @@ export interface GenericMintPlan {
  * A refused screen returns a minimal plan rather than null, so the caller can
  * see WHY the contract was refused instead of only that it produced nothing.
  */
+/**
+ * A SeaDrop collection's public stage is minted THROUGH the SeaDrop singleton.
+ * `mintSeaDrop(address,uint256)` on the collection is only callable by an
+ * allowed SeaDrop implementation; simulating it from an EOA reverts
+ * `OnlyAllowedSeaDrop`, which is why a genuinely free SeaDrop drop looked
+ * unmintable. Build the singleton plan first and simulate THAT from the buyer.
+ */
+export async function buildSeaDropGenericTx(
+  contract: string,
+  provider: JsonRpcProvider,
+  from: string,
+  amount: bigint
+): Promise<GenericMintPlan | null> {
+  if (!(amount > 0n) || amount > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  const built = await buildLocalMintPlanOnProvider(provider, contract, Number(amount), 6000);
+  if (!built.plan) return null;
+  const plan = built.plan;
+  const screen = await screenMintContract(contract, provider, { timeoutMs: 8000 });
+  const blocked = screen.verdict !== "pass" && screen.verdict !== "warn";
+  const tx = { to: plan.to, from, data: plan.data, value: plan.value };
+  let simulationReverted = false;
+  let simulationError: string | undefined;
+  if (!blocked) {
+    try {
+      await provider.call(tx);
+    } catch (e: any) {
+      if (isIndeterminateRpcError(e)) {
+        simulationError = `simulation inconclusive: ${e?.shortMessage ?? e?.message ?? "unknown"}`;
+      } else {
+        simulationReverted = true;
+        simulationError = e?.shortMessage ?? e?.reason ?? e?.info?.error?.message ?? e?.message ?? "unknown revert";
+      }
+    }
+  }
+  const gas = blocked || simulationReverted
+    ? { gasLimit: 150_000n }
+    : (await autoGasBounded(provider, tx)) ?? { gasLimit: 150_000n };
+  return {
+    to: plan.to,
+    data: plan.data,
+    value: plan.value,
+    selector: "mintPublic(address,address,address,uint256)",
+    price: plan.value,
+    gas,
+    simulationReverted,
+    simulationError,
+    screenRefused: blocked,
+    screen,
+  };
+}
+
 export async function buildGenericMintTx(
   contract: string,
   provider: JsonRpcProvider,
@@ -911,6 +962,13 @@ export async function buildGenericMintTx(
   amount: bigint,
   opts: { proof?: string[]; signature?: string } = {}
 ): Promise<GenericMintPlan | null> {
+  // A public SeaDrop stage must be minted at the singleton, not by calling the
+  // collection's EOA-restricted `mintSeaDrop`. Check that path BEFORE the
+  // generic selector registry, which finds `mintSeaDrop` and simulates it
+  // from the wrong caller.
+  const seaDrop = await buildSeaDropGenericTx(contract, provider, from, amount);
+  if (seaDrop) return seaDrop;
+
   const screen = await screenMintContract(contract, provider);
   // "refuse" is a definite disqualification; "unknown" means the contract could
   // not be read. Both block — an unanswered probe is not evidence of safety.
