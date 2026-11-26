@@ -27,6 +27,7 @@ const BUYER = new Wallet(KEY).address;
   const realFetch = globalThis.fetch;
   const realEstimate = JsonRpcProvider.prototype.estimateGas;
   const realFee = JsonRpcProvider.prototype.getFeeData;
+  const realBalance = JsonRpcProvider.prototype.getBalance;
   let captured = null;
   globalThis.fetch = async () => ({
     status: 200,
@@ -37,6 +38,7 @@ const BUYER = new Wallet(KEY).address;
     return 21_000n;
   };
   JsonRpcProvider.prototype.getFeeData = async () => ({ gasPrice: 1n, maxFeePerGas: 1n });
+  JsonRpcProvider.prototype.getBalance = async () => 10n ** 18n;
   try {
     const out = await B.executeListingBuy({
       listing: {
@@ -53,7 +55,37 @@ const BUYER = new Wallet(KEY).address;
     globalThis.fetch = realFetch;
     JsonRpcProvider.prototype.estimateGas = realEstimate;
     JsonRpcProvider.prototype.getFeeData = realFee;
+    JsonRpcProvider.prototype.getBalance = realBalance;
   }
+
+  // Underfunded wallets must be refused with the shortfall, not a cryptic RPC error.
+  globalThis.fetch = async () => ({
+    status: 200,
+    text: async () => JSON.stringify({ fulfillment_data: { transaction: tx } }),
+  });
+  JsonRpcProvider.prototype.estimateGas = async (request) => { captured = request; return 21_000n; };
+  JsonRpcProvider.prototype.getFeeData = async () => ({ gasPrice: 1n, maxFeePerGas: 1n });
+  JsonRpcProvider.prototype.getBalance = async () => 1n;
+  let broke;
+  try {
+    broke = await B.executeListingBuy({
+      listing: {
+        tokenId: "58", orderHash: "0xabc", chain: "ethereum", protocolAddress: tx.to,
+        maker: null, currency: "ETH", value: tx.value, decimals: 18, price: 0.0033, error: null,
+      },
+      buyerKey: KEY, apiKey: "x", rpcUrl: "http://127.0.0.1:1", chainId: 1, yes: true,
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+    JsonRpcProvider.prototype.estimateGas = realEstimate;
+    JsonRpcProvider.prototype.getFeeData = realFee;
+    JsonRpcProvider.prototype.getBalance = realBalance;
+  }
+  check(
+    "underfunded wallet reports shortfall before send",
+    broke.sent === false && /insufficient ETH balance/.test(broke.reason || "") && /nothing was sent/.test(broke.reason || ""),
+    JSON.stringify(broke)
+  );
 
   console.log(`\n--- ${pass} passed, ${fail} failed`);
   process.exitCode = fail ? 1 : 0;

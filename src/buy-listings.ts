@@ -263,7 +263,7 @@ export function printListingLine(l: ListingSummary): string {
 }
 
 // ── Executing the buy ────────────────────────────────────────────────────────
-import { Interface, JsonRpcProvider, Wallet } from "ethers";
+import { Interface, JsonRpcProvider, Wallet, formatEther } from "ethers";
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
@@ -404,6 +404,14 @@ export async function executeListingBuy(o: {
     const fee = await provider.getFeeData();
     const gasCost = gas * (fee.maxFeePerGas ?? fee.gasPrice ?? 0n);
     console.log(chalk.gray(`    gas estimate: ${gas} (≈ ${gasCost} wei at current fees)`));
+    const balance = await provider.getBalance(buyer.address);
+    const needed = value + gasCost;
+    if (balance < needed) {
+      provider.destroy();
+      return fail(
+        `insufficient ETH balance: have ${formatEther(balance)}, need ≈ ${formatEther(needed)} (price + gas) — nothing was sent`
+      );
+    }
   } catch (e: any) {
     provider.destroy();
     return fail(`gas estimate failed: ${e?.message ?? e}`);

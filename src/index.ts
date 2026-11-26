@@ -46,6 +46,7 @@ import { runWalletCli } from "./wallet-cli";
 import { recordInvocationEnd, recordInvocationStart } from "./invocation-log";
 import { runDoctor } from "./doctor";
 import { runRevealScanCli } from "./reveal-scan-cli";
+import { runSnipeCli } from "./snipe-cli";
 import { runScanCli } from "./scan-cli";
 import { runHotCli } from "./hot-cli";
 import { runDropUriCli } from "./dropuri-cli";
@@ -294,29 +295,11 @@ async function main(): Promise<void> {
     }
   }
 
-  // Bare --snipe is the wizard-shaped entry: ask for the target, then run the
-  // rarity + listings report with the snipe prompt. It used to die as an
-  // unknown option because --snipe was only a modifier on --reveal-scan.
-  if (args.includes("--snipe") && !args.includes("--reveal-scan")) {
+  // --snipe is the ONLY spend path in this branch. It owns wallet loading,
+  // gas estimation, balance checks, id targeting and confirmation.
+  if ((args.includes("--snipe") || args.includes("--buy")) && !args.includes("--reveal-scan")) {
     try {
-      const rest = args.filter((a) => a !== "--snipe");
-      let target = rest.find((a) => !a.startsWith("--") && !a.includes("="));
-      if (!target) {
-        target = (await askText("Contract address to scan for rares and listings", "")).trim();
-      }
-      if (!target) {
-        console.log(chalk.yellow("\n  No target — nothing was scanned or sent.\n"));
-        closePrompts();
-        process.exit(2);
-      }
-      const cliArgs = [
-        ...rest.filter((a) => a !== target),
-        "--rarity",
-        "--listings",
-        "--snipe",
-        target,
-      ];
-      const code = await runRevealScanCli(cliArgs);
+      const code = await runSnipeCli(args.filter((a) => a !== "--snipe"));
       closePrompts();
       process.exit(code);
     } catch (e: any) {

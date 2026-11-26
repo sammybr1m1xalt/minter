@@ -1018,13 +1018,18 @@ to its price instead of a bare "listed" line with no context. A `rare + listed`
 table collects those rows. No OpenSea key means prices stay unknown — never
 "not listed".
 
-`--snipe` adds the interactive step: after the priced rarity table it asks
-which of those reported token ids to buy, loads the wallet the same wizard
-way, then re-reads that token's listing and asks for confirmation before any
-send. `--listings` in a TTY offers the same prompt; `--no-snipe` suppresses it.
-Bare `minter --snipe [target]` works too — it asks for the target when none is
-given. Headless runs must use `--buy <tokenId>`; only ids present in the
-reported rarity table can be chosen.
+`--snipe` is now a standalone command, not a modifier on `--reveal-scan`:
+
+    minter --snipe [contract|ipfs-link] [--token-id N] [--slug S] [--yes]
+
+It runs the rarity report read-only, asks which REPORTED and LISTED id to buy
+(or takes `--token-id N` headlessly), loads the wallet exactly as the wizard
+does, re-reads that token's listing, walks RPC endpoints until one answers
+with the right chain id, estimates gas with the buyer as `from`, checks that
+the wallet can cover price + gas, and only then asks for confirmation.
+`--reveal-scan --rarity --listings` never loads a wallet, estimates gas or
+sends anything — it only reports prices. Only ids present in the reported
+rarity table and actually listed on OpenSea can be chosen.
 
 The independent reads in the reveal scan (baseURI, uri, contractURI,
 totalSupply and the tokenURI sample), the CID inspections, the ABI getter
@@ -1054,6 +1059,9 @@ estimation.
 
 Successful scan, IPFS-view and rarity+listings reports print their elapsed time
 at the end, e.g. `rarity + listings report completed in 10.2s`.
+
+An underfunded wallet is refused before send with
+`insufficient ETH balance: have X, need ≈ Y (price + gas) — nothing was sent`.
 
 `gas estimate failed: execution reverted` on a valid order was caused by calling
 `eth_estimateGas` without `from`. Seaport checks `msg.sender` against the

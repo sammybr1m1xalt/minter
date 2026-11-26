@@ -11,9 +11,6 @@ import { computeRarity, crawlTraits, crawlOnchainTraits, saveRarityCache, type C
 import { DEFAULT_GATEWAYS } from "./reveal-scan";
 import { fetchBestListing, fetchCollectionListings, printListingLine, formatRarityListing, type ListingSummary } from "./buy-listings";
 import { resolveContractToSlug } from "./slug-resolver";
-import { executeListingBuy } from "./buy-listings";
-import { loadEnvKeys, promptWalletPassphrase } from "./wizard";
-import { askText, askYesNo } from "./prompt";
 import { resolveChain } from "./chains";
 import { resolveRpcsForChain } from "./rpc-resolver";
 
@@ -33,9 +30,6 @@ function parseArgs(args: string[]): {
   top: number;
   pick: number;
   listings: boolean;
-  snipe: boolean;
-  noSnipe: boolean;
-  buy: string | null;
   yes: boolean;
   slug: string | null;
 } {
@@ -54,9 +48,6 @@ function parseArgs(args: string[]): {
   let top = 20;
   let pick = 0;
   let listings = false;
-  let snipe = false;
-  let noSnipe = false;
-  let buy: string | null = null;
   let yes = false;
   let slug: string | null = null;
   for (let i = 0; i < args.length; i++) {
@@ -77,9 +68,6 @@ function parseArgs(args: string[]): {
     else if (a === "--top") top = Number(args[++i] ?? 20) || 20;
     else if (a === "--pick") pick = Number(args[++i] ?? 0) || 0;
     else if (a === "--listings") listings = true;
-    else if (a === "--snipe") snipe = true;
-    else if (a === "--no-snipe") noSnipe = true;
-    else if (a === "--buy") buy = args[++i] ?? null;
     else if (a === "--yes" || a === "-y") yes = true;
     else if (a === "--slug") slug = args[++i] ?? null;
     else if (a === "--help" || a === "-h") {
@@ -101,12 +89,6 @@ function parseArgs(args: string[]): {
                      rarest token (scanner -> rarity -> position -> fire)
   --listings         with --rarity, also check whether the rarest ids are listed,
                      where, and for how much
-  --no-snipe         with --listings, do not offer the snipe prompt
-  --snipe            with --rarity, ask which reported token to buy, using the
-                     same wallet file and prompt as the wizard
-  --buy <tokenId>    with --rarity, buy one listed token without asking which
-                     (the same encrypted wallets.json the wizard uses)
-  --yes, -y          with --buy, send without asking
   --slug <slug>      override the collection slug (an address can resolve to
                      several OpenSea collections; the resolver refuses to guess)
                      (--limit defaults to 100; --limit 0 scores everything)
@@ -118,7 +100,7 @@ whatever IPFS or Arweave CIDs those already point at.`);
       if (!contract) contract = a;
     }
   }
-  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, deep: !noDeep, ids, gateway, opensea, ipfsLink, rarity, limit, concurrency, top, pick, listings, snipe, noSnipe, buy, yes, slug };
+  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, deep: !noDeep, ids, gateway, opensea, ipfsLink, rarity, limit, concurrency, top, pick, listings, yes, slug };
 }
 
 // ── OpenSea comparison (opt-in) ─────────────────────────────────────────────
@@ -208,7 +190,7 @@ async function readTokenUriJson(uri: string | null, timeoutMs = 15_000): Promise
 
 // A CIDv0 (Qm…, 46 chars) or a CIDv1 (base32, starts b). Accepts ipfs://,
 // ar://, a bare CID, or a full gateway URL.
-function normalizeIpfsLink(link: string): string | null {
+export function normalizeIpfsLink(link: string): string | null {
   const raw = link.trim();
   if (!raw) return null;
   if (/^https?:\/\//i.test(raw)) {
@@ -286,67 +268,20 @@ export async function fetchListingPrices(
 }
 
 /** Buy one listed token with the wizard's wallet loader, not a copy of it. */
-export async function buyListedToken(o: {
-  tokenId: string;
-  slug: string;
-  apiKey: string;
-  chainKey: string;
-  rpcs: string[];
-  yes: boolean;
-}): Promise<void> {
-  await promptWalletPassphrase();
-  const wallets = loadEnvKeys();
-  if (!wallets.length) {
-    console.log(chalk.yellow("  No usable wallet: set PRIVATE_KEY/PRIVATE_KEYS, or WALLETS_FILE with WALLETS_PASSPHRASE."));
-    console.log(chalk.gray("  Nothing was sent."));
-    return;
-  }
-  const listing = await fetchBestListing(o.slug, o.tokenId, o.apiKey).catch((e: any) => ({
-    tokenId: o.tokenId, orderHash: null, protocolAddress: null, chain: null, maker: null,
-    currency: null, value: null, decimals: null, price: null,
-    error: e?.message ?? "fetch failed",
-  }));
-  if (listing.error || listing.price == null) {
-    console.log(chalk.yellow(`  token ${o.tokenId}: cannot buy — ${listing.error ?? "price unknown"}`));
-    return;
-  }
-  // Do not pin [0]: a dead first endpoint would disable the whole buy.
-  let rpcUrl = "";
-  for (const url of o.rpcs) {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
-        signal: AbortSignal.timeout(4000),
-      });
-      const body: any = await res.json();
-      if (body?.result) {
-        rpcUrl = url;
-        break;
-      }
-    } catch {
-      // Next endpoint.
-    }
-  }
-  if (!rpcUrl) {
-    console.log(chalk.yellow("  No RPC answered eth_chainId — nothing was sent."));
-    return;
-  }
-  const out = await executeListingBuy({
-    listing,
-    buyerKey: wallets[0].privateKey,
-    apiKey: o.apiKey,
-    rpcUrl,
-    chainId: resolveChain(o.chainKey)?.chainId ?? 1,
-    yes: o.yes,
-    ask: askYesNo,
-  });
-  if (out.sent) console.log(chalk.green(`  sent: ${out.txHash}`));
-  else console.log(chalk.yellow(`  not sent: ${out.reason}`));
+/** Read-only result handed to the standalone --snipe command. */
+export interface RarityCapture {
+  rows: { tokenId: number; score: number }[];
+  listedIds: string[];
+  listings: {
+    apiKey: string;
+    slug: string;
+    source: string;
+    chainKey: string;
+    rpcs: string[];
+  } | null;
 }
 
-async function runRarity(o: {
+export async function runRarity(o: {
   cid: string | null;
   gateway: string | null;
   limit: number | null;
@@ -354,9 +289,6 @@ async function runRarity(o: {
   top: number;
   pick: number;
   listings: boolean;
-  snipe: boolean;
-  noSnipe: boolean;
-  buy: string | null;
   yes: boolean;
   slug: string | null;
   contract: string | null;
@@ -365,7 +297,7 @@ async function runRarity(o: {
   blocks: number;
   deep: boolean;
   ids: number[];
-}): Promise<number> {
+}, capture?: (r: RarityCapture) => void): Promise<number> {
   const started = Date.now();
   let cid = o.cid ? normalizeIpfsLink(o.cid) : null;
   let dir: { cid: string; gateway: string | null } | null = null;
@@ -433,7 +365,7 @@ async function runRarity(o: {
   }
 
   // Listing prices belong IN the rarity table, not in a detached second list.
-  if ((o.listings || o.snipe || o.buy) && o.contract) {
+  if (o.listings && o.contract) {
     const key = (await getValidApiKey({ timeoutMs: 8000 }).catch(() => null))?.api_key ?? "";
     if (!key) {
       console.log(chalk.yellow("\n  Listings: no usable OpenSea key — prices stay unknown."));
@@ -445,7 +377,7 @@ async function runRarity(o: {
       } else {
         // The collection page carries every listed id; join it against the
         // rarity rows after those rows exist. No per-token GETs needed here.
-        const ids: string[] = o.buy ? [o.buy] : [];
+        const ids: string[] = [];
         const prices = await fetchListingPrices(slug, key, ids);
         listingByToken = prices.byToken;
         listingsCtx = { apiKey: key, slug, source: prices.source };
@@ -517,6 +449,16 @@ async function runRarity(o: {
       if (!listingByToken.has(id)) listingByToken.set(id, emptyListing(id, "not listed"));
     }
   }
+
+  capture?.({
+    rows: report.rows.map((r) => ({ tokenId: r.tokenId, score: r.score })),
+    listedIds: [...listingByToken]
+      .filter(([, l]) => !l.error)
+      .map(([id]) => id),
+    listings: listingsCtx
+      ? { ...listingsCtx, chainKey: o.chainKey, rpcs: [...rpcs] }
+      : null,
+  });
 
   const listed = crawl.listed;
   const pct = listed > 0 ? (report.scored / listed) * 100 : 0;
@@ -613,7 +555,7 @@ async function runRarity(o: {
     console.log(chalk.white(`    minter --fcfs <target> --token-id ${row.tokenId} --quantity ${qty}`));
     console.log(chalk.gray(`  (the mint starts at tokenId - quantity + 1, so quantity shifts the range)`));
   }
-  // ── Listings / snipe ─────────────────────────────────────────────────
+  // ── Listings (read-only; snipe lives in snipe-cli.ts) ────────────────
   if (listingsCtx) {
     console.log();
     console.log(chalk.bold.white("  Listings"));
@@ -622,30 +564,6 @@ async function runRarity(o: {
     console.log();
     console.log(chalk.gray("  Only OpenSea is checked. Reservoir — the aggregator that would have"));
     console.log(chalk.gray("  covered Blur/LooksRare/X2Y2 — was sunset on 2025-10-15."));
-  }
-
-  const wantsSnipe = o.snipe || (o.listings && process.stdin.isTTY && !o.noSnipe);
-  if (wantsSnipe && !process.stdin.isTTY && !o.buy) {
-    console.log(chalk.yellow("\n  --snipe needs a TTY to ask which token; headless runs use --buy <tokenId>."));
-  } else if (listingsCtx && (o.buy || wantsSnipe)) {
-    const answer = o.buy
-      ? o.buy
-      : (await askText("Snipe a listed token? (token id, blank to skip)", "")).trim();
-    if (answer) {
-      if (!report.rows.some((r) => String(r.tokenId) === answer)) {
-        console.log(chalk.yellow(`  token ${answer} is not among the rarity rows — nothing was sent.`));
-      } else {
-        console.log();
-        await buyListedToken({
-          tokenId: answer,
-          slug: listingsCtx.slug,
-          apiKey: listingsCtx.apiKey,
-          chainKey: o.chainKey,
-          rpcs: rpcs,
-          yes: o.yes,
-        });
-      }
-    }
   }
 
   console.log();
@@ -705,9 +623,6 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
       top: parsed.top,
       pick: parsed.pick,
       listings: parsed.listings,
-      snipe: parsed.snipe,
-      noSnipe: parsed.noSnipe,
-      buy: parsed.buy,
       yes: parsed.yes,
       slug: parsed.slug,
       contract: parsed.contract,

@@ -2,6 +2,7 @@
 const B = require("/home/anon/minter/dist/buy-listings.js");
 const W = require("/home/anon/minter/dist/wizard.js");
 const C = require("/home/anon/minter/dist/reveal-scan-cli.js");
+const S = require("/home/anon/minter/dist/snipe-cli.js");
 
 let pass = 0,
   fail = 0;
@@ -42,7 +43,7 @@ ok("unknown decimals stay labelled", B.formatRarityListing(base({ decimals: null
     W.loadEnvKeys = () => [{ address: "0x1111111111111111111111111111111111111111", privateKey: pk }];
     B.fetchBestListing = async () => base();
     B.executeListingBuy = async (o) => { captured = o; return { sent: false, txHash: null, reason: "stub", price: 0.5, currency: "ETH" }; };
-    await C.buyListedToken({
+    await S.buyListedToken({
       tokenId: "7", slug: "test-collection", apiKey: "stub",
       chainKey: "ethereum", rpcs: ["http://rpc.invalid"], yes: false,
     });
