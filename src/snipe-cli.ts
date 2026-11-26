@@ -26,11 +26,12 @@ interface SnipeArgs {
   deep: boolean;
 }
 
-function parseArgs(args: string[]): SnipeArgs {
+export function parseArgs(args: string[]): SnipeArgs {
   const out: SnipeArgs = {
     target: null, tokenId: null, slug: null, chainKey: "ethereum", rpcs: [],
     gateway: null, ipfsLink: null, rarity: false, limit: 20, top: 20, yes: false, blocks: 2000, deep: true,
   };
+  const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--token-id" || a === "--buy") out.tokenId = args[++i] ?? null;
@@ -60,8 +61,14 @@ function parseArgs(args: string[]): SnipeArgs {
   --yes, -y          send without a confirmation prompt
   --no-deep          skip deep reveal discovery
 `);
-    } else if (!a.startsWith("--")) out.target = a;
+    } else if (!a.startsWith("--")) positional.push(a);
   }
+  // `--snipe 3255` is a token id, not a contract address. The contract is the
+  // non-numeric positional (it was already given before --rarity/--snipe).
+  // An explicit --token-id always wins over a positional number.
+  const numbers = positional.filter((p) => /^\d+$/.test(p));
+  if (!out.tokenId && numbers.length > 0) out.tokenId = numbers[0];
+  if (!out.target) out.target = positional.find((p) => !/^\d+$/.test(p)) ?? numbers[1] ?? null;
   return out;
 }
 
