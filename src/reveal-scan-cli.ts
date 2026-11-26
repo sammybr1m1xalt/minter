@@ -217,6 +217,21 @@ export function normalizeIpfsLink(link: string): string | null {
  * first and the CID is whatever directory it resolved — so this never reads
  * anything the contract does not already publish.
  */
+/** Keep giant data URIs out of stdout while still saying what they are. */
+export function displayUri(uri: string | null | undefined, max = 120): string {
+  if (!uri) return "(none)";
+  if (uri.startsWith("data:")) {
+    const comma = uri.indexOf(",");
+    if (comma >= 0) {
+      const head = uri.slice(0, comma + 1);
+      const payload = uri.slice(comma + 1);
+      const suffix = `[${payload.length} chars] ${payload.slice(0, 48)}…`;
+      return head + suffix.slice(0, Math.max(16, max - head.length));
+    }
+  }
+  return uri.length > max ? `${uri.slice(0, max)}… (${uri.length} chars)` : uri;
+}
+
 /** Print the elapsed time only for runs that actually produced a report. */
 function elapsedLine(started: number, label: string): void {
   const seconds = (Date.now() - started) / 1000;
@@ -672,15 +687,15 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
     r.verdict === "PUBLIC" ? chalk.red : r.verdict === "PARTIAL" ? chalk.yellow : r.verdict === "HIDDEN" ? chalk.green : chalk.gray;
   console.log(`  verdict:   ${colour(r.verdict)}`);
   console.log(`  standard:  ${r.standard}`);
-  console.log(`  baseURI:   ${r.baseURI ?? "(none)"}`);
+  console.log(`  baseURI:   ${displayUri(r.baseURI)}`);
   console.log(`  revealed:  ${r.revealedBySlash == null ? "unknown" : r.revealedBySlash ? "yes (trailing slash)" : "no"}`);
-  if (r.contractURI) console.log(`  contractURI: ${r.contractURI}`);
+  if (r.contractURI) console.log(`  contractURI: ${displayUri(r.contractURI)}`);
   if (r.totalSupply != null) console.log(`  supply:    ${r.totalSupply}`);
 
   if (r.sampledTokenUris.length > 0) {
     console.log(`  tokenURIs: ${r.distinctTokenUris} distinct across ${r.sampledTokenUris.length} sampled`);
     for (const s of r.sampledTokenUris) {
-      const shown = s.uri ? s.uri : s.error ? `(reverted: ${String(s.error).slice(0, 60)})` : "(null)";
+      const shown = s.uri ? displayUri(s.uri) : s.error ? `(reverted: ${String(s.error).slice(0, 60)})` : "(null)";
       console.log(`    ${String(s.tokenId).padStart(6)}  ${shown}`);
     }
   }
@@ -690,11 +705,6 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
     console.log(`    ${i.kind}  files=${i.fileCount}  ${i.note ?? ""}`);
     if (i.url) console.log(chalk.gray(`    view: ${i.url}`));
     if (i.sample.length > 0) console.log(`    sample: ${i.sample.join(", ")}`);
-  }
-
-  if (r.deepPointers?.sources.length) {
-    console.log(`  pointers:  ${r.deepPointers.sources.length} from the ABI / events`);
-    for (const p of r.deepPointers.sources.slice(0, 5)) console.log(chalk.gray(`    ${p}`));
   }
 
   if (r.deepPointers?.sources.length) {
