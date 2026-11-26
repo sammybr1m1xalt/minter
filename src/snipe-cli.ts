@@ -8,6 +8,7 @@ import { askText, askYesNo, closePrompts } from "./prompt";
 import { resolveChain } from "./chains";
 import { resolveRpcsForChain } from "./rpc-resolver";
 import { normalizeIpfsLink } from "./reveal-scan-cli";
+import { scrapeOne, printTargetedScrape, resolveListingContext } from "./snipe-target";
 
 interface SnipeArgs {
   target: string | null;
@@ -16,6 +17,8 @@ interface SnipeArgs {
   chainKey: string;
   rpcs: string[];
   gateway: string | null;
+  ipfsLink: string | null;
+  rarity: boolean;
   limit: number | null;
   top: number;
   yes: boolean;
@@ -26,7 +29,7 @@ interface SnipeArgs {
 function parseArgs(args: string[]): SnipeArgs {
   const out: SnipeArgs = {
     target: null, tokenId: null, slug: null, chainKey: "ethereum", rpcs: [],
-    gateway: null, limit: 20, top: 20, yes: false, blocks: 2000, deep: true,
+    gateway: null, ipfsLink: null, rarity: false, limit: 20, top: 20, yes: false, blocks: 2000, deep: true,
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -36,6 +39,8 @@ function parseArgs(args: string[]): SnipeArgs {
     else if (a === "--chain") out.chainKey = args[++i] ?? "ethereum";
     else if (a === "--rpc") out.rpcs.push(args[++i] ?? "");
     else if (a === "--gateway") out.gateway = args[++i] ?? null;
+    else if (a === "--ipfs") out.ipfsLink = args[++i] ?? null;
+    else if (a === "--rarity") out.rarity = true;
     else if (a === "--limit") out.limit = Number(args[++i] ?? 20) || 20;
     else if (a === "--top") out.top = Number(args[++i] ?? 20) || 20;
     else if (a === "--blocks") out.blocks = Number(args[++i] ?? 2000) || 2000;
@@ -44,7 +49,8 @@ function parseArgs(args: string[]): SnipeArgs {
     else if (a === "--help" || a === "-h") {
       console.log(`Usage: minter --snipe [target] [options]
 
-  --token-id <id>    buy one reported id without asking (headless-safe)
+  --token-id <id>    scrape only this id, then buy it (headless-safe)
+  --rarity           accepted for --reveal-scan --rarity --snipe form
   --slug <slug>      override the OpenSea collection slug
   --chain <key>      chain key (default ethereum)
   --rpc <url>        RPC endpoint (repeatable)
@@ -132,9 +138,44 @@ export async function runSnipeCli(args: string[]): Promise<number> {
   const o = parseArgs(args);
   let target = o.target;
   if (!target) target = (await askText("Contract address or IPFS link to score", "")).trim();
+  if (!target && o.ipfsLink) target = o.ipfsLink;
   if (!target) {
     console.log(chalk.yellow("\n  No target — nothing was scanned or sent.\n"));
     return 2;
+  }
+
+  // Targeted form: `--reveal-scan <contract> --rarity --snipe --token-id N`
+  // routes here too. One JSON + one listing GET, no full rarity crawl.
+  if (o.tokenId) {
+    const ctx = await resolveListingContext({ contract: normalizeIpfsLink(target) ? null : target, slug: o.slug });
+    if (!ctx) {
+      console.log(chalk.yellow("\n  No usable OpenSea key/slug — listing unknown, nothing was sent.\n"));
+      return 2;
+    }
+    const scraped = await scrapeOne({
+      contract: normalizeIpfsLink(target) ? null : target,
+      cid: normalizeIpfsLink(target),
+      tokenId: o.tokenId,
+      chainKey: o.chainKey,
+      rpcs: o.rpcs.length > 0 ? o.rpcs : resolveRpcsForChain(o.chainKey, []).urls,
+      gateway: o.gateway,
+      slug: ctx.slug,
+      apiKey: ctx.apiKey,
+    });
+    printTargetedScrape(scraped);
+    if (scraped.listing.error || scraped.listing.price == null) {
+      console.log(chalk.yellow("\n  Token is not listed with a known price — nothing was sent.\n"));
+      return 2;
+    }
+    await buyListedToken({
+      tokenId: o.tokenId,
+      slug: ctx.slug,
+      apiKey: ctx.apiKey,
+      chainKey: o.chainKey,
+      rpcs: o.rpcs.length > 0 ? o.rpcs : resolveRpcsForChain(o.chainKey, []).urls,
+      yes: o.yes,
+    });
+    return 0;
   }
 
   const cid = normalizeIpfsLink(target);

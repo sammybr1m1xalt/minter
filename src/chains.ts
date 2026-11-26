@@ -103,6 +103,22 @@ export const CHAINS: ChainProfile[] = [
     },
   },
   {
+    // Longyu mainnet — user-supplied, verified live 2026-11-25:
+    // eth_chainId 0xa3480 = 668800, explorer answered HTTP 200. BNB is the
+    // gas token (supplied by the user; not verifiable from JSON-RPC).
+    // OpenSea's live /api/v2/chains does NOT list "longyu", so only the
+    // chain-agnostic paths (RPC, explorer links, generic mint probing) apply;
+    // do not claim OpenSea stage/payload support on this chain.
+    key: "longyu",
+    chainId: 668800,
+    name: "Longyu",
+    explorer: "https://explorer.longyu.network",
+    nativeSymbol: "BNB",
+    rpc: {
+      public: ["https://rpc.longyu.network"],
+    },
+  },
+  {
     // Soneium mainnet — verified live 2026-11-08: chain id 1868 (0x74c), ETH
     // gas, SeaDrop singleton deployed at the same address as every other chain
     // (eth_getCode returned bytecode). OpenSea lists it as "soneium" in

@@ -371,6 +371,7 @@ export const NATIVE_TOKEN_SENTINELS: Readonly<Record<string, readonly string[]>>
   robinhood: [NATIVE_IDENTIFIER],
   arc: [NATIVE_IDENTIFIER, AR_USDC],
   soneium: [NATIVE_IDENTIFIER],
+  longyu: [NATIVE_IDENTIFIER],
   // Chains the tool can target but not serve (src/chains.ts OS_CHAIN).
   polygon: [NATIVE_IDENTIFIER],
   arbitrum: [NATIVE_IDENTIFIER],
