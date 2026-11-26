@@ -196,6 +196,7 @@ export async function runSnipeCli(args: string[]): Promise<number> {
       top: o.top,
       pick: 0,
       listings: true,
+      opensea: false,
       yes: false,
       slug: o.slug,
       contract: cid ? null : target,

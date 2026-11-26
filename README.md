@@ -1108,6 +1108,14 @@ serves `name: ""` for most ids of a collection whose name lives on the image,
 so a non-empty name is not a reliable "has metadata" signal — the mode prints
 traits/image presence too.
 
+With `--rarity`, `--opensea` does NOT run that per-token metadata comparison —
+it would add ~25s for three ids. Instead it reuses ONE collection listing page
+and prints prices beside the rarest rows under `OpenSea — listings for the
+rarest tokens`, labelled with the listing source. It adds no metadata fetches:
+only `--listings` extends the crawl with extra listed ids. Measured on
+`official-rebelkin`: 52.5s for `--rarity` vs 48.3s with `--opensea` (noise,
+not degradation).
+
 For a genuine OpenSea Studio drop the answer is `HIDDEN`: OpenSea holds the
 files privately until the reveal, so there is nothing to read before it. The
 `PUBLIC` cases are a creator who uploaded to IPFS first and only "revealed" by
