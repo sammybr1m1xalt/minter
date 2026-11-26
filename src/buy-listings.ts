@@ -55,6 +55,10 @@ export interface ListingSummary {
   /** value / 10^decimals, or null when either half is unknown. */
   price: number | null;
   error: string | null;
+  /** NFT contract address, from asset.contract or the Seaport offer line. */
+  collection: string | null;
+  /** ERC20 payment address when the price is not native. */
+  paymentToken: string | null;
 }
 
 /** Pull a field from the first place it appears. OpenSea nests differently per surface. */
@@ -86,6 +90,8 @@ function summarizeListing(tokenId: string, raw: any): ListingSummary {
     decimals: null,
     price: null,
     error: null,
+    collection: null,
+    paymentToken: null,
   };
   if (!raw || typeof raw !== "object") {
     return { ...base, error: "empty body" };
@@ -120,6 +126,27 @@ function summarizeListing(tokenId: string, raw: any): ListingSummary {
     const n = Number(base.value);
     if (Number.isFinite(n)) base.price = n / 10 ** base.decimals;
   }
+  // Collection comes from the asset, or from the NFT line of the Seaport order.
+  // Never infer it from the slug: a slug can resolve to several collections.
+  const offer = pick(order, ["protocol_data", "parameters", "offer"]);
+  const nftLine = Array.isArray(offer)
+    ? offer.find((i: any) => [2, 3, 4, 5].includes(Number(i?.itemType)))
+    : null;
+  base.collection =
+    pick(order, ["asset", "contract"], ["collection", "address"], ["contract"]) ??
+    pick(nftLine, ["token"], ["tokenAddress"]) ??
+    null;
+  // Currency address is OPTIONAL and only trusted when the API actually states
+  // it. An ETH price with no address stays native — never assume WETH.
+  const consideration = pick(order, ["protocol_data", "parameters", "consideration"]);
+  const erc20Line = Array.isArray(consideration)
+    ? consideration.find((i: any) => Number(i?.itemType) === 1)
+    : null;
+  base.paymentToken =
+    pick(cur, ["address"], ["token_address"], ["tokenAddress"], ["currency_address"]) ??
+    pick(order, ["payment_token", "address"], ["currency", "address"]) ??
+    pick(erc20Line, ["token"]) ??
+    null;
   return base;
 }
 
@@ -265,6 +292,7 @@ export function printListingLine(l: ListingSummary): string {
 // ── Executing the buy ────────────────────────────────────────────────────────
 import { Interface, JsonRpcProvider, Wallet, formatEther } from "ethers";
 import { chainKeyFromId } from "./chains";
+import { waitForFulfillment, type FulfillmentVerification } from "./fulfillment-verify";
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
@@ -343,6 +371,115 @@ export interface BuyOutcome {
   reason: string | null;
   price: number | null;
   currency: string | null;
+  /** Filled only after a receipt check: status 1 alone is not success. */
+  verification?: FulfillmentVerification | null;
+}
+
+// ERC20 payment: the currency symbol carries no address. The payment token is
+// the ERC20 (itemType 1) consideration line, and the spender is derived from
+// the vended fulfillerConduitKey — a non-zero key resolves through the
+// ConduitController, exactly as the offer/sell path already does. No approval
+// is guessed from the currency symbol.
+const CONDUIT_CONTROLLER_ADDRESS = "0x00000000f9490004c11cef243f5400493c00ad63";
+const ZERO_BYTES32 = "0x" + "00".repeat(32);
+const ERC20_IFACE = new Interface([
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+]);
+const CONDUIT_IFACE = new Interface([
+  "function getConduit(bytes32 conduitKey) view returns (address conduit, bool exists)",
+]);
+
+async function boundedCall(provider: any, to: string, data: string, label: string, ms = 8000): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      provider.call({ to, data }),
+      new Promise<string>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function erc20Spender(provider: any, tx: BuyTransaction): Promise<string> {
+  const d = tx.inputData as any;
+  const key =
+    d?.advancedOrder?.fulfillerConduitKey ??
+    d?.parameters?.fulfillerConduitKey ??
+    ZERO_BYTES32;
+  if (!key || String(key).toLowerCase() === ZERO_BYTES32) return tx.to;
+  const raw = await boundedCall(
+    provider,
+    CONDUIT_CONTROLLER_ADDRESS,
+    CONDUIT_IFACE.encodeFunctionData("getConduit", [key]),
+    "conduit lookup"
+  );
+  const [operator, exists] = CONDUIT_IFACE.decodeFunctionResult("getConduit", raw);
+  if (!exists) throw new Error("the order's conduit key is not registered");
+  return operator;
+}
+
+async function ensureErc20Approval(o: {
+  provider: any;
+  buyer: Wallet;
+  token: string;
+  amount: bigint;
+  spender: string;
+  ask?: (q: string, defaultYes: boolean) => Promise<boolean>;
+  confirmed: boolean;
+}): Promise<{ confirmed: boolean; error?: string; hash?: string }> {
+  if (o.amount <= 0n) return { confirmed: o.confirmed, error: "ERC20 price could not be read — nothing was sent" };
+  let allowance: bigint;
+  try {
+    const raw = await boundedCall(
+      o.provider,
+      o.token,
+      ERC20_IFACE.encodeFunctionData("allowance", [o.buyer.address, o.spender]),
+      "ERC20 allowance read"
+    );
+    allowance = BigInt(ERC20_IFACE.decodeFunctionResult("allowance", raw)[0]);
+  } catch (e: any) {
+    return { confirmed: o.confirmed, error: `ERC20 allowance read failed: ${e?.message ?? e}` };
+  }
+  if (allowance >= o.amount) return { confirmed: o.confirmed };
+  if (!o.confirmed) {
+    if (!o.ask) return { confirmed: false, error: "not confirmed (pass --yes to approve and buy)" };
+    if (!(await o.ask(`Approve ${o.amount} payment tokens for ${o.spender} and buy this token?`, false))) {
+      return { confirmed: false, error: "declined" };
+    }
+  }
+  let hash: string;
+  try {
+    const gas = await o.provider.estimateGas({
+      from: o.buyer.address,
+      to: o.token,
+      data: ERC20_IFACE.encodeFunctionData("approve", [o.spender, o.amount]),
+      value: 0n,
+    });
+    const fee = await o.provider.getFeeData();
+    const native = await o.provider.getBalance(o.buyer.address);
+    const gasCost = gas * (fee.maxFeePerGas ?? fee.gasPrice ?? 0n);
+    if (native < gasCost) {
+      return { confirmed: true, error: `insufficient native balance for approval gas: have ${formatEther(native)}, need ≈ ${formatEther(gasCost)} — nothing was sent` };
+    }
+    const sent = await o.buyer.connect(o.provider).sendTransaction({
+      to: o.token,
+      data: ERC20_IFACE.encodeFunctionData("approve", [o.spender, o.amount]),
+      value: 0n,
+    });
+    hash = sent.hash;
+    const receipt = await o.provider.waitForTransaction(hash, 1, 60_000);
+    if (!receipt || String(receipt.status) === "0" || String(receipt.status) === "0x0") {
+      return { confirmed: true, error: `ERC20 approval ${hash} reverted — nothing was sent` };
+    }
+  } catch (e: any) {
+    return { confirmed: true, error: `ERC20 approval failed: ${e?.message ?? e}` };
+  }
+  console.log(chalk.gray(`    ERC20 approval confirmed: ${hash}`));
+  return { confirmed: true, hash };
 }
 
 /**
@@ -365,11 +502,13 @@ export async function executeListingBuy(o: {
   chainId: number;
   yes: boolean;
   ask?: (q: string, defaultYes: boolean) => Promise<boolean>;
+  verifyTimeoutMs?: number;
 }): Promise<BuyOutcome> {
   const fail = (reason: string): BuyOutcome => ({
     sent: false,
     txHash: null,
     reason,
+    verification: null,
     price: o.listing.price,
     currency: o.listing.currency,
   });
@@ -383,15 +522,46 @@ export async function executeListingBuy(o: {
   const problem = buyTxProblem(tx);
   if (problem) return fail(problem);
 
-  // An ERC20-priced listing sends no native value and needs an approval first.
+  // ERC20-priced listings send ZERO native value and pull payment with
+  // transferFrom. Detect on the currency AND the vended order line, never on
+  // `value === 0` alone: a genuinely free native listing also has value 0.
   const value = BigInt(tx.value ?? "0");
-  if (value === 0n && (o.listing.currency ?? "ETH") !== "ETH") {
-    return fail(
-      `${o.listing.currency}-priced listing: needs a spender approval before buying. Not sent.`
-    );
-  }
-
+  const input = tx.inputData as any;
+  const isErc20 =
+    Boolean(o.listing.paymentToken) ||
+    (value === 0n &&
+      (o.listing.currency ?? "ETH") !== "ETH" &&
+      BigInt(input?.parameters?.considerationAmount ?? "0") > 0n);
   const provider = new JsonRpcProvider(o.rpcUrl, o.chainId, { staticNetwork: true });
+  let confirmed = o.yes;
+  if (isErc20) {
+    const token = o.listing.paymentToken;
+    if (!token || !/^0x[0-9a-fA-F]{40}$/.test(token)) {
+      provider.destroy();
+      return fail(`${o.listing.currency ?? "ERC20"}-priced listing did not state its payment token address — nothing was sent`);
+    }
+    let spender: string;
+    try {
+      spender = await erc20Spender(provider, tx);
+    } catch (e: any) {
+      provider.destroy();
+      return fail(`could not resolve the ERC20 spender: ${e?.message ?? e} — nothing was sent`);
+    }
+    const approved = await ensureErc20Approval({
+      provider,
+      buyer,
+      token,
+      amount: BigInt(o.listing.value ?? "0"),
+      spender,
+      ask: o.ask,
+      confirmed,
+    });
+    confirmed = approved.confirmed;
+    if (approved.error) {
+      provider.destroy();
+      return fail(approved.error);
+    }
+  }
   try {
     // Seaport validates msg.sender against the fulfiller encoded in the order.
     // Without `from`, eth_estimateGas runs as the zero address and reverts even
@@ -418,7 +588,7 @@ export async function executeListingBuy(o: {
     return fail(`gas estimate failed: ${e?.message ?? e}`);
   }
 
-  if (!o.yes) {
+  if (!confirmed) {
     const askFn = o.ask;
     if (!askFn) {
       provider.destroy();
@@ -434,19 +604,38 @@ export async function executeListingBuy(o: {
     }
   }
 
+  let hash: string;
   try {
     const txRes = await buyer.connect(provider).sendTransaction({
       to: tx.to,
       data: encodeBuyInput(tx),
       value,
     });
-    const hash = txRes.hash;
-    provider.destroy();
-    return { sent: true, txHash: hash, reason: null, price: o.listing.price, currency: o.listing.currency };
+    hash = txRes.hash;
   } catch (e: any) {
     provider.destroy();
     return fail(`send failed: ${e?.message ?? e}`);
   }
+  const verification = await waitForFulfillment(
+    provider,
+    hash,
+    { buyer: buyer.address, tokenIds: [o.listing.tokenId], collection: o.listing.collection },
+    o.verifyTimeoutMs ?? 60_000
+  );
+  provider.destroy();
+  console.log(
+    verification.status === "confirmed"
+      ? chalk.green(`    verified: token ${o.listing.tokenId} reached ${buyer.address}`)
+      : chalk.yellow(`    fulfillment ${verification.status}: ${verification.reason ?? "unknown"}`)
+  );
+  return {
+    sent: true,
+    txHash: hash,
+    reason: verification.status === "confirmed" ? null : verification.reason,
+    price: o.listing.price,
+    currency: o.listing.currency,
+    verification,
+  };
 }
 
 /**
@@ -562,9 +751,10 @@ export async function executeBatchListingBuy(o: {
   chainId: number;
   yes: boolean;
   ask?: (q: string, defaultYes: boolean) => Promise<boolean>;
+  verifyTimeoutMs?: number;
 }): Promise<BuyOutcome> {
   const fail = (reason: string): BuyOutcome => ({
-    sent: false, txHash: null, reason,
+    sent: false, txHash: null, reason, verification: null,
     price: o.listings.reduce((a, l) => a + (l.price ?? 0), 0),
     currency: o.listings[0]?.currency ?? null,
   });
@@ -576,6 +766,13 @@ export async function executeBatchListingBuy(o: {
     if (!l.orderHash || !l.chain || !l.protocolAddress) {
       return fail(`listing for token ${l.tokenId} is incomplete — nothing was sent`);
     }
+  }
+  // The verified batch endpoint path is same-chain NATIVE payment. An ERC20
+  // batch would need a payment-token field and an exact approval amount; that
+  // surface has not been probed live, so refuse rather than send value 0 with
+  // the zero-address payment token.
+  if (o.listings.some((l) => l.paymentToken || (l.currency && l.currency !== "ETH"))) {
+    return fail("ERC20-priced batch snipe is not verified — buy the token individually instead; nothing was sent");
   }
   const buyer = new Wallet(o.buyerKey);
   let txs: any[] = [];
@@ -642,14 +839,39 @@ export async function executeBatchListingBuy(o: {
       return fail("declined");
     }
   }
+  let hash: string;
   try {
     const sent = await buyer.connect(provider).sendTransaction({ to: tx.to, data: tx.data, value });
-    provider.destroy();
-    return { sent: true, txHash: sent.hash, reason: null, price: o.listings.reduce((a, l) => a + (l.price ?? 0), 0), currency: o.listings[0]?.currency ?? null };
+    hash = sent.hash;
   } catch (e: any) {
     provider.destroy();
     return fail(`send failed: ${e?.message ?? e}`);
   }
+  const collections = [...new Set(o.listings.map((l) => l.collection).filter(Boolean))] as string[];
+  const verification = await waitForFulfillment(
+    provider,
+    hash,
+    {
+      buyer: buyer.address,
+      tokenIds: o.listings.map((l) => l.tokenId),
+      collection: collections.length === 1 ? collections[0] : null,
+    },
+    o.verifyTimeoutMs ?? 60_000
+  );
+  provider.destroy();
+  console.log(
+    verification.status === "confirmed"
+      ? chalk.green(`    verified: ${verification.receivedTokenIds.length} token(s) reached ${buyer.address}`)
+      : chalk.yellow(`    fulfillment ${verification.status}: ${verification.reason ?? "unknown"}`)
+  );
+  return {
+    sent: true,
+    txHash: hash,
+    reason: verification.status === "confirmed" ? null : verification.reason,
+    price: o.listings.reduce((a, l) => a + (l.price ?? 0), 0),
+    currency: o.listings[0]?.currency ?? null,
+    verification,
+  };
 }
 
 /** Rebuild the calldata from whichever fulfillment shape OpenSea vended. */

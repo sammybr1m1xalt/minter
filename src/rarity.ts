@@ -15,6 +15,7 @@ import fs from "fs";
 import path from "path";
 import { Interface, JsonRpcProvider } from "ethers";
 import { DEFAULT_GATEWAYS } from "./reveal-scan";
+import { verifyIpfsBytes, type CidVerdict } from "./cid-verify";
 
 // Scored tokens are cached per directory CID. The gateways throttle a single IP
 // hard, so a full table is usually several runs' worth; without a cache every
@@ -147,6 +148,8 @@ export interface Trait {
 export interface TokenTraits {
   tokenId: number;
   traits: Trait[];
+  /** Only set with --verify-ipfs; UNKNOWN means no cryptographic check was possible. */
+  cidVerification?: CidVerdict;
 }
 
 /** What a metadata document's `attributes` array yielded. */
@@ -329,6 +332,8 @@ export interface CrawlOptions {
   useCache?: boolean;
   /** Per-request timeout. */
   requestTimeoutMs?: number;
+  /** Verify direct-CID metadata bytes against the CID before scoring. Off by default. */
+  verifyIpfs?: boolean;
   onProgress?: (done: number, ok: number) => void;
 }
 
@@ -352,6 +357,10 @@ export interface CrawlResult {
   source: "directory" | "aggregate" | "onchain";
   /** The aggregate file used, when source is "aggregate". */
   aggregateFile: string | null;
+  /** Only meaningful with verifyIpfs: bytes matched / contradicted / could not be checked. */
+  cidVerified: number;
+  cidMismatched: number;
+  cidUnknown: number;
 }
 
 /**
@@ -616,6 +625,9 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
         indexFromCache: cachedIndex.length > 0,
         source: "aggregate",
         aggregateFile: agg.file,
+        cidVerified: 0,
+        cidMismatched: 0,
+        cidUnknown: 0,
       };
     }
   }
@@ -628,6 +640,9 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
   const tokens: TokenTraits[] = [...cached];
   let failed = 0;
   let ignoredTraits = 0;
+  let cidVerified = 0;
+  let cidMismatched = 0;
+  let cidUnknown = 0;
   let gi = 0;
   let next = 0;
 
@@ -667,10 +682,25 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
               await r.body?.cancel().catch(() => {});
               break;
             }
-            const doc = JSON.parse(await r.text());
+            const body = await r.text();
+            // Only a DIRECT cid can be checked from the bytes already fetched.
+            // A path URL (/ipfs/<dir>/<id>) names the directory CID, not the
+            // child block, so hashing the JSON against it would be a false
+            // mismatch. Report UNKNOWN for those instead.
+            let verdict: CidVerdict | undefined;
+            if (opts.verifyIpfs && /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]+)$/.test(bare)) {
+              verdict = verifyIpfsBytes(bare, Buffer.from(body, "utf8"));
+              if (verdict === "mismatch") {
+                cidMismatched++;
+                break;
+              }
+              if (verdict === "verified") cidVerified++;
+              else cidUnknown++;
+            }
+            const doc = JSON.parse(body);
             const parsed = parseTraits(doc);
             ignoredTraits += parsed.missingValue + parsed.unknownDisplayType;
-            got = { tokenId: id, traits: parsed.traits };
+            got = { tokenId: id, traits: parsed.traits, ...(verdict ? { cidVerification: verdict } : {}) };
             break;
           } catch {
             // Timeout or network: try once more, then give up on this token.
@@ -698,6 +728,9 @@ export async function crawlTraits(opts: CrawlOptions): Promise<CrawlResult> {
     indexFromCache: cachedIndex.length > 0,
     source: "directory",
     aggregateFile: null,
+    cidVerified,
+    cidMismatched,
+    cidUnknown,
   };
 }
 
@@ -764,6 +797,9 @@ export async function crawlOnchainTraits(opts: OnchainCrawlOptions): Promise<Cra
     indexFromCache: false,
     source: "onchain",
     aggregateFile: null,
+    cidVerified: 0,
+    cidMismatched: 0,
+    cidUnknown: 0,
   };
   if (opts.totalSupply <= 0) {
     out.failed = 0;

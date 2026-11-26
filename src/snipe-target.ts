@@ -18,6 +18,7 @@ function emptyListing(tokenId: string, error: string): ListingSummary {
   return {
     tokenId, orderHash: null, protocolAddress: null, chain: null, maker: null,
     currency: null, value: null, decimals: null, price: null, error,
+    collection: null, paymentToken: null,
   };
 }
 
