@@ -264,6 +264,7 @@ export function printListingLine(l: ListingSummary): string {
 
 // ── Executing the buy ────────────────────────────────────────────────────────
 import { Interface, JsonRpcProvider, Wallet, formatEther } from "ethers";
+import { chainKeyFromId } from "./chains";
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
@@ -540,6 +541,115 @@ function encodeAdvancedInput(tx: BuyTransaction): string {
     d.fulfillerConduitKey,
     d.recipient,
   ]);
+}
+
+/**
+ * Buy several EXACT listings in one transaction.
+ *
+ * The single-listing `/fulfillment_data` endpoint cannot do this, and
+ * `/listings/sweep` buys the cheapest N with substitution. The verified bulk
+ * surface is `/listings/cross_chain_fulfillment_data` with an explicit
+ * `listings[]` and same-chain native payment: a same-chain probe with two
+ * orders returned ONE tx to Seaport using `fulfillAvailableAdvancedOrders`
+ * (selector 0x87201b41). More than one returned tx is refused rather than
+ * broadcasting half a plan; ERC20 payment can add approval steps.
+ */
+export async function executeBatchListingBuy(o: {
+  listings: ListingSummary[];
+  buyerKey: string;
+  apiKey: string;
+  rpcUrl: string;
+  chainId: number;
+  yes: boolean;
+  ask?: (q: string, defaultYes: boolean) => Promise<boolean>;
+}): Promise<BuyOutcome> {
+  const fail = (reason: string): BuyOutcome => ({
+    sent: false, txHash: null, reason,
+    price: o.listings.reduce((a, l) => a + (l.price ?? 0), 0),
+    currency: o.listings[0]?.currency ?? null,
+  });
+  if (!o.listings.length) return fail("no listings selected — nothing was sent");
+  if (!o.rpcUrl) return fail("no RPC endpoint");
+  const chain = chainKeyFromId(o.chainId);
+  if (!chain) return fail(`unknown chain id ${o.chainId} — nothing was sent`);
+  for (const l of o.listings) {
+    if (!l.orderHash || !l.chain || !l.protocolAddress) {
+      return fail(`listing for token ${l.tokenId} is incomplete — nothing was sent`);
+    }
+  }
+  const buyer = new Wallet(o.buyerKey);
+  let txs: any[] = [];
+  try {
+    const r = await fetch("https://api.opensea.io/api/v2/listings/cross_chain_fulfillment_data", {
+      method: "POST",
+      headers: { accept: "application/json", "content-type": "application/json", "x-api-key": o.apiKey.trim() },
+      body: JSON.stringify({
+        fulfiller: { address: buyer.address },
+        listings: o.listings.map((l) => ({
+          chain: l.chain, hash: l.orderHash, protocol_address: l.protocolAddress,
+        })),
+        payment: { chain, token_address: ZERO_ADDRESS },
+        recipient: buyer.address,
+      }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const text = await r.text();
+    const json: any = text ? JSON.parse(text) : null;
+    if (!r.ok) return fail(`bulk fulfillment HTTP ${r.status}: ${String(json?.error?.message ?? "").slice(0, 160)}`);
+    txs = Array.isArray(json?.transactions) ? json.transactions : [];
+  } catch (e: any) {
+    return fail(`bulk fulfillment request failed: ${e?.message ?? e}`);
+  }
+  if (!txs.length) return fail("OpenSea returned no transactions for the selected listings");
+  if (txs.length !== 1) {
+    return fail(
+      `OpenSea returned ${txs.length} transactions for ${o.listings.length} listings; this command sends one — nothing was sent`
+    );
+  }
+  const tx = txs[0];
+  if (!tx?.to || typeof tx.data !== "string") return fail("bulk transaction has no to/data — nothing was sent");
+  const value = BigInt(tx.value ?? "0");
+  const provider = new JsonRpcProvider(o.rpcUrl, o.chainId, { staticNetwork: true });
+  try {
+    const gas = await provider.estimateGas({ from: buyer.address, to: tx.to, data: tx.data, value });
+    const fee = await provider.getFeeData();
+    const gasCost = gas * (fee.maxFeePerGas ?? fee.gasPrice ?? 0n);
+    console.log(chalk.gray(`    gas estimate: ${gas} (≈ ${gasCost} wei at current fees)`));
+    const balance = await provider.getBalance(buyer.address);
+    const needed = value + gasCost;
+    if (balance < needed) {
+      provider.destroy();
+      return fail(
+        `insufficient ETH balance: have ${formatEther(balance)}, need ≈ ${formatEther(needed)} (price + gas) — nothing was sent`
+      );
+    }
+  } catch (e: any) {
+    provider.destroy();
+    return fail(`gas estimate failed: ${e?.message ?? e}`);
+  }
+  if (!o.yes) {
+    const askFn = o.ask;
+    if (!askFn) {
+      provider.destroy();
+      return fail("not confirmed (pass --yes to send)");
+    }
+    const ok = await askFn(
+      `Buy ${o.listings.length} listed tokens for ≈ ${formatEther(value)} ETH?`,
+      false
+    );
+    if (!ok) {
+      provider.destroy();
+      return fail("declined");
+    }
+  }
+  try {
+    const sent = await buyer.connect(provider).sendTransaction({ to: tx.to, data: tx.data, value });
+    provider.destroy();
+    return { sent: true, txHash: sent.hash, reason: null, price: o.listings.reduce((a, l) => a + (l.price ?? 0), 0), currency: o.listings[0]?.currency ?? null };
+  } catch (e: any) {
+    provider.destroy();
+    return fail(`send failed: ${e?.message ?? e}`);
+  }
 }
 
 /** Rebuild the calldata from whichever fulfillment shape OpenSea vended. */

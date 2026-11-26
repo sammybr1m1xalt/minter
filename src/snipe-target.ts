@@ -8,11 +8,18 @@ import chalk from "chalk";
 import { scanReveal, type RevealScanResult } from "./reveal-scan";
 import { DEFAULT_GATEWAYS } from "./reveal-scan";
 import { decodeOnchainMetadata, parseTraits } from "./rarity";
-import { fetchBestListing, type ListingSummary } from "./buy-listings";
+import { fetchBestListing, fetchCollectionListings, type ListingSummary } from "./buy-listings";
 import { resolveChain } from "./chains";
 import { getValidApiKey } from "./opensea-key";
 import { resolveContractToSlug } from "./slug-resolver";
 import { resolveRpcsForChain } from "./rpc-resolver";
+
+function emptyListing(tokenId: string, error: string): ListingSummary {
+  return {
+    tokenId, orderHash: null, protocolAddress: null, chain: null, maker: null,
+    currency: null, value: null, decimals: null, price: null, error,
+  };
+}
 
 export interface TargetedScrape {
   tokenId: string;
@@ -122,6 +129,89 @@ export async function scrapeOne(o: {
     metadataOk: doc != null,
     listing,
   };
+}
+
+/**
+ * Batch form: one reveal scan for ALL requested ids, one collection listing
+ * page, and bounded parallel metadata reads. Calling scrapeOnce per id would
+ * repeat the whole contract scan N times — the exact latency this path avoids.
+ */
+export async function scrapeMany(o: {
+  contract: string | null;
+  cid: string | null;
+  tokenIds: string[];
+  chainKey: string;
+  rpcs: string[];
+  gateway: string | null;
+  slug: string;
+  apiKey: string;
+}): Promise<TargetedScrape[]> {
+  const ids = [...new Set(o.tokenIds)];
+  let cid = o.cid;
+  let gateways = o.gateway ? [o.gateway] : DEFAULT_GATEWAYS;
+  const docs = new Map<string, { doc: any; source: string }>();
+
+  if (o.contract && !cid) {
+    const profile = resolveChain(o.chainKey);
+    if (!profile) throw new Error(`unknown chain "${o.chainKey}"`);
+    const rpcUrls = o.rpcs.length > 0 ? o.rpcs : resolveRpcsForChain(o.chainKey, []).urls;
+    const scan = await scanReveal({
+      rpcUrls,
+      chainId: profile.chainId,
+      contract: o.contract,
+      sampleTokenIds: ids.map((id) => Number(id)).filter(Number.isFinite),
+      logScanBlocks: 0,
+      deep: true,
+    });
+    for (const s of scan.sampledTokenUris) {
+      const doc = decodeOnchainMetadata(s.uri);
+      if (doc) docs.set(String(s.tokenId), { doc, source: "on-chain tokenURI data URI" });
+    }
+    const dir = scan.inspections.find((i) => i.kind === "directory" || i.kind === "file");
+    cid = dir?.cid ?? null;
+    if (dir?.gateway) gateways = [dir.gateway, ...gateways.filter((g) => g !== dir.gateway)];
+  } else if (cid) {
+    // A bare CID was supplied directly; no contract scan is needed.
+  }
+
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(4, ids.length) }, async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= ids.length) return;
+        const id = ids[i];
+        if (docs.has(id)) continue;
+        if (!cid) continue;
+        const bare = cid.replace(/^ipfs:\/\//, "").replace(/\/+$/, "");
+        for (const gateway of gateways.slice(0, 3)) {
+          for (const path of [`${id}`, `${id}.json`]) {
+            const doc = await readJson(`${gateway.replace(/\/+$/, "")}/${bare}/${path}`);
+            if (doc) {
+              docs.set(id, { doc, source: `${gateway} /${path}` });
+              break;
+            }
+          }
+          if (docs.has(id)) break;
+        }
+      }
+    })
+  );
+
+  const orders = await fetchCollectionListings(o.slug, o.apiKey, { limit: 200, timeoutMs: 15_000 }).catch(() => []);
+  const byToken = new Map<string, ListingSummary>();
+  for (const l of orders) if (!byToken.has(l.tokenId)) byToken.set(l.tokenId, l);
+
+  return ids.map((id) => {
+    const found = docs.get(id);
+    return {
+      tokenId: id,
+      source: found?.source ?? "unreadable",
+      traits: found ? parseTraits(found.doc).traits.map((t) => ({ type: t.type, value: t.value })) : [],
+      metadataOk: found != null,
+      listing: byToken.get(id) ?? emptyListing(id, "not listed"),
+    };
+  });
 }
 
 export async function resolveListingContext(o: {
