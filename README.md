@@ -999,6 +999,8 @@ Rarity is a property of the metadata, not a market value.
     minter --reveal-scan <contract> --rarity --slug <slug> --snipe --token-id N [--yes]
     minter --snipe [contract|ipfs-link] [--token-id N] [--slug S] [--yes]
 
+A trailing numeric positional after `--snipe` is also read as the token id, so
+`--reveal-scan <contract> --snipe 3255` is the same as adding `--token-id 3255`.
 `--buy <tokenId>` is an alias for `--snipe --token-id <tokenId>`. Both forms
 route to `src/snipe-cli.ts`, which owns every money-moving step. With a token
 id it scrapes metadata and the listing for that id ALONE and does not build a
