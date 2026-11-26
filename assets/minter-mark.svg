@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512" role="img" aria-labelledby="title desc" shape-rendering="geometricPrecision">
   <title id="title">Minter mark</title>
-  <desc id="desc">A wider mint-green M inside the cube front view with a two-column chain below the top face bisecting the M V, contained between the M uprights, and aqua 2.5D shading.</desc>
+  <desc id="desc">A wider mint-green M inside the cube front view with aqua 2.5D shading.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0B1020"/>
@@ -45,20 +45,6 @@
     <path d="M256 80 398 164 256 248 114 164Z" fill="url(#faceTop)"/>
   </g>
 
-  <!-- Chain motif in the cube top face -->
-  <!-- Longer rounded chain below the top face, within the M uprights -->
-  <g fill="none" stroke="url(#mint)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round">
-    <rect x="248" y="250" width="12" height="18" rx="6"/>
-    <rect x="256" y="250" width="12" height="18" rx="6"/>
-    <rect x="248" y="268" width="12" height="18" rx="6"/>
-    <rect x="256" y="268" width="12" height="18" rx="6"/>
-    <rect x="248" y="286" width="12" height="18" rx="6"/>
-    <rect x="256" y="286" width="12" height="18" rx="6"/>
-    <rect x="248" y="304" width="12" height="18" rx="6"/>
-    <rect x="256" y="304" width="12" height="18" rx="6"/>
-    <rect x="248" y="322" width="12" height="18" rx="6"/>
-    <rect x="256" y="322" width="12" height="18" rx="6"/>
-  </g>
 
   <g filter="url(#glow)" opacity="0.45">
     <path d="M166 344V230L256 316 346 230V344" fill="none" stroke="url(#mint)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
