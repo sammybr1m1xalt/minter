@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512" role="img" aria-labelledby="title desc" shape-rendering="geometricPrecision">
   <title id="title">Minter mark</title>
-  <desc id="desc">A wider mint-green M inside the cube front view with a longer two-column chain running down to the M inner V, and aqua 2.5D shading.</desc>
+  <desc id="desc">A wider mint-green M inside the cube front view with a two-column chain centred on the cube seam that bisects the M V, contained between the M uprights, and aqua 2.5D shading.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0B1020"/>
@@ -46,19 +46,14 @@
   </g>
 
   <!-- Chain motif in the cube top face -->
-  <g transform="translate(256 153)" fill="none" stroke="url(#mint)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round">
-    <rect x="-10" y="-17" width="12" height="34" rx="6"/>
-    <rect x="-2" y="-17" width="12" height="34" rx="6"/>
-    <rect x="-10" y="11" width="12" height="34" rx="6"/>
-    <rect x="-2" y="11" width="12" height="34" rx="6"/>
-    <rect x="-10" y="39" width="12" height="34" rx="6"/>
-    <rect x="-2" y="39" width="12" height="34" rx="6"/>
-    <rect x="-10" y="67" width="12" height="34" rx="6"/>
-    <rect x="-2" y="67" width="12" height="34" rx="6"/>
-    <rect x="-10" y="95" width="12" height="34" rx="6"/>
-    <rect x="-2" y="95" width="12" height="34" rx="6"/>
-    <rect x="-10" y="123" width="12" height="34" rx="6"/>
-    <rect x="-2" y="123" width="12" height="34" rx="6"/>
+  <!-- Chain centred on the cube seam that bisects the M V -->
+  <g fill="none" stroke="url(#mint)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="244" y="214" width="12" height="34" rx="6"/>
+    <rect x="254" y="214" width="12" height="34" rx="6"/>
+    <rect x="244" y="242" width="12" height="34" rx="6"/>
+    <rect x="254" y="242" width="12" height="34" rx="6"/>
+    <rect x="244" y="270" width="12" height="34" rx="6"/>
+    <rect x="254" y="270" width="12" height="34" rx="6"/>
   </g>
 
   <g filter="url(#glow)" opacity="0.45">
