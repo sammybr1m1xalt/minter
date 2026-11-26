@@ -997,6 +997,7 @@ Rarity is a property of the metadata, not a market value.
 
     minter --reveal-scan <contract> --rarity --slug <slug> --listings
     minter --reveal-scan <contract> --rarity --slug <slug> --snipe --token-id N [--yes]
+    minter --snipe [contract|ipfs-link] --token-id 1,2,3 [--count 2] [--yes]
     minter --snipe [contract|ipfs-link] [--token-id N] [--slug S] [--yes]
 
 A trailing numeric positional after `--snipe` is also read as the token id, so
@@ -1032,6 +1033,19 @@ sample in the same pass, so a cheap listed token gets a real rarity score next
 to its price instead of a bare "listed" line with no context. A `rare + listed`
 table collects those rows. No OpenSea key means prices stay unknown — never
 "not listed".
+
+Multiple ids enter BATCH mode: `--token-id` is repeatable, comma-separated, or
+just a row of numeric positionals. One reveal scan and one collection listing
+page probe them all, the report shows each token's traits and price, and the
+user is asked how many to proceed with (`--count N` for headless). The chosen
+orders are re-read, then bought in ONE transaction via
+`POST /api/v2/listings/cross_chain_fulfillment_data` with the exact listing
+hashes and same-chain native payment. Verified live with two orders: one tx to
+Seaport using `fulfillAvailableAdvancedOrders` (`0x87201b41`). A response with
+more than one transaction is refused rather than half-broadcast; ERC20 payment
+and cross-chain swaps need extra approval/swap steps and are not sent here.
+`fulfillAvailableAdvancedOrders` may skip unavailable orders (`maximumFulfilled`),
+so the receipt must be checked to see how many actually filled.
 
 Both snipe forms load the wallet exactly as the wizard does, re-read the
 token's listing, walk RPC endpoints until one answers with the right chain id,
