@@ -1162,16 +1162,19 @@ waiting for a receipt that will never exist.
 
 ## Verification scripts
 
+The harnesses are not shipped on `main`. They live on the `test` branch in
+`scripts/verify`:
+
+    git checkout test
     cd scripts/verify && ./run-all.sh
 
- Twenty-five checks, no framework — each prints its own PASS/FAIL. `run.js` is the
-mock JSON-RPC server and the fire-path harness; the others cover the audit
-fixes, the GQL∥REST race, the stage window, `--confirm`, `--scan`, the reveal
-scan and the Scatter paths. `npm run build` first.
+Each script prints its own PASS/FAIL; `run.js` is the mock JSON-RPC server and
+the fire-path harness. `npm run build` first. Three latency probes sit outside
+the default run because they print timings rather than verdicts and need a real
+endpoint: `t0-cost.js`, `rpc-floor.js`, `cold-start.js` (all take `MEASURE_RPC`).
 
-Three latency probes sit outside the default run because they print timings
-rather than verdicts and need a real endpoint: `t0-cost.js`, `rpc-floor.js`,
-`cold-start.js` (all take `MEASURE_RPC`).
+Keep the harnesses on `test` and the shipping code on `main`; do not merge
+`test` into `main` just to restore the folder.
 
 ## Security
 
