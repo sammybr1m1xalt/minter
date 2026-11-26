@@ -918,8 +918,26 @@ export async function buildSeaDropGenericTx(
   amount: bigint
 ): Promise<GenericMintPlan | null> {
   if (!(amount > 0n) || amount > BigInt(Number.MAX_SAFE_INTEGER)) return null;
-  const built = await buildLocalMintPlanOnProvider(provider, contract, Number(amount), 6000);
-  if (!built.plan) return null;
+  const built = await buildLocalMintPlanOnProvider(provider, contract, Number(amount), 10_000);
+  if (!built.plan) {
+    // "no public drop" is a verdict: this is not a SeaDrop collection. A READ
+    // FAILURE is not — falling through to the generic EOA-restricted selector
+    // would simulate the wrong entry point and hide the transport error.
+    if (/^no public drop/.test(built.reason)) return null;
+    const screen = await screenMintContract(contract, provider, { timeoutMs: 8000 });
+    return {
+      to: contract,
+      data: "0x",
+      value: 0n,
+      selector: "(seadrop-read-unknown)",
+      price: 0n,
+      gas: { gasLimit: 0n },
+      simulationReverted: false,
+      simulationError: built.reason,
+      screenRefused: true,
+      screen,
+    };
+  }
   const plan = built.plan;
   const screen = await screenMintContract(contract, provider, { timeoutMs: 8000 });
   const blocked = screen.verdict !== "pass" && screen.verdict !== "warn";
@@ -934,7 +952,7 @@ export async function buildSeaDropGenericTx(
         simulationError = `simulation inconclusive: ${e?.shortMessage ?? e?.message ?? "unknown"}`;
       } else {
         simulationReverted = true;
-        simulationError = e?.shortMessage ?? e?.reason ?? e?.info?.error?.message ?? e?.message ?? "unknown revert";
+        simulationError = decodeMintRevert(e);
       }
     }
   }
@@ -953,6 +971,70 @@ export async function buildSeaDropGenericTx(
     screenRefused: blocked,
     screen,
   };
+}
+
+// Verified custom errors from ERC721SeaDrop and the SeaDrop 1.0 singleton.
+// Signatures only — ethers derives each selector, so a typo cannot silently
+// mislabel a revert with a hand-typed hash. This registry is generic to the
+// mint class, not to any one contract.
+const MINT_REVERT_SIGNATURES = [
+  "error CreatorPayoutAddressCannotBeZeroAddress()",
+  "error DuplicateFeeRecipient()",
+  "error DuplicatePayer()",
+  "error FeeRecipientCannotBeZeroAddress()",
+  "error FeeRecipientNotAllowed()",
+  "error FeeRecipientNotPresent()",
+  "error IncorrectPayment(uint256,uint256)",
+  "error InvalidFeeBps(uint256)",
+  "error InvalidProof()",
+  "error InvalidSignature(address)",
+  "error InvalidSignedEndTime(uint256,uint256)",
+  "error InvalidSignedFeeBps(uint256,uint256)",
+  "error InvalidSignedMaxTokenSupplyForStage(uint256,uint256)",
+  "error InvalidSignedMaxTotalMintableByWallet(uint256,uint256)",
+  "error InvalidSignedMintPrice(uint256,uint256)",
+  "error InvalidSignedStartTime(uint256,uint256)",
+  "error MintQuantityCannotBeZero()",
+  "error MintQuantityExceedsMaxMintedPerWallet(uint256,uint256)",
+  "error MintQuantityExceedsMaxSupply(uint256,uint256)",
+  "error MintQuantityExceedsMaxTokenSupplyForStage(uint256,uint256)",
+  "error NotActive(uint256,uint256,uint256)",
+  "error OnlyINonFungibleSeaDropToken(address)",
+  "error PayerCannotBeZeroAddress()",
+  "error PayerNotAllowed()",
+  "error PayerNotPresent()",
+  "error SignatureAlreadyUsed()",
+  "error SignedMintsMustRestrictFeeRecipients()",
+  "error SignerCannotBeZeroAddress()",
+  "error SignerNotPresent()",
+  "error TokenGatedDropStageNotPresent()",
+  "error TokenGatedNotTokenOwner(address,address,uint256)",
+  "error TokenGatedTokenIdAlreadyRedeemed(address,address,uint256)",
+  "error CannotExceedMaxSupplyOfUint64(uint256)",
+  "error MintERC2309QuantityExceedsLimit()",
+  "error MintToZeroAddress()",
+  "error MintZeroQuantity()",
+  "error OnlyAllowedSeaDrop()",
+  "error OnlyOwner()",
+];
+const REVERT_IFACE = new Interface(MINT_REVERT_SIGNATURES);
+
+/** Name a custom revert from its raw data; fall back to the selector. */
+export function decodeMintRevert(e: any): string {
+  const raw = e?.data ?? e?.info?.error?.data ?? e?.error?.data;
+  if (typeof raw === "string" && raw.startsWith("0x") && raw.length >= 10) {
+    try {
+      const parsed = REVERT_IFACE.parseError(raw);
+      if (parsed) {
+        const args = parsed.args.map((a: any) => (typeof a === "bigint" ? a.toString() : String(a)));
+        return args.length ? `${parsed.name}(${args.join(",")})` : parsed.name;
+      }
+    } catch {
+      // not a known mint error — report the selector rather than "unknown"
+    }
+    return `execution reverted (custom error ${raw.slice(0, 10)})`;
+  }
+  return e?.shortMessage ?? e?.reason ?? e?.info?.error?.message ?? e?.message ?? "unknown revert";
 }
 
 export async function buildGenericMintTx(
@@ -1014,7 +1096,7 @@ export async function buildGenericMintTx(
       simulationError = `simulation inconclusive: ${e?.shortMessage ?? e?.message ?? "unknown"}`;
     } else {
       simulationReverted = true;
-      simulationError = e?.shortMessage ?? e?.reason ?? e?.info?.error?.message ?? e?.message ?? "unknown revert";
+      simulationError = decodeMintRevert(e);
     }
   }
 

@@ -1,8 +1,8 @@
 "use strict";
-/* Regression: a SeaDrop free drop must be planned against the SeaDrop
- * singleton, not by calling the collection's mintSeaDrop from an EOA. */
+/* Regression: SeaDrop plans target the singleton, and sold-out reverts are
+ * named instead of "unknown custom error". */
 require("dotenv").config({ quiet: true, path: "/home/anon/minter/.env" });
-const { JsonRpcProvider } = require("ethers");
+const { AbiCoder, JsonRpcProvider } = require("ethers");
 const M = require("/home/anon/minter/dist/mint-generic.js");
 const S = require("/home/anon/minter/dist/seadrop-public.js");
 
@@ -22,8 +22,11 @@ const rpc = process.env.RPC_URL_ETHEREUM || process.env.RPC_URL;
   provider.destroy();
   ok("targets SeaDrop singleton", plan?.to?.toLowerCase() === S.SEADROP_ADDRESS.toLowerCase(), `to=${plan?.to}`);
   ok("uses mintPublic entrypoint", /mintPublic/.test(plan?.selector || ""), `selector=${plan?.selector}`);
-  ok("simulation passes from the buyer", plan?.simulationReverted === false, `err=${plan?.simulationError || "none"}`);
   ok("public mint is priced free", plan?.value === 0n, `value=${String(plan?.value)}`);
+  const raw = "0xe12d2314" + new AbiCoder().encode(["uint256", "uint256"], [3000n, 3000n]).slice(2);
+  ok("decoder names sold-out revert", /MintQuantityExceedsMaxSupply\(3000,3000\)/.test(M.decodeMintRevert({ data: raw })), `decoded=${M.decodeMintRevert({ data: raw })}`);
+  const err = plan?.simulationError || "";
+  ok("revert is decoded, not unknown", plan?.simulationReverted === false || /MintQuantityExceedsMaxSupply|mint quantity exceeds max supply/i.test(err), `err=${err}`);
   console.log(`\n--- ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e?.shortMessage || e?.message || e); process.exit(1); });

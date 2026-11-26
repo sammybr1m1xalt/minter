@@ -747,6 +747,8 @@ async function targetOne(
     }
     if (plan.simulationReverted) {
       console.error(chalk.yellow(`   simulation reverted: ${plan.simulationError ?? "unknown"}`));
+    } else if (plan.simulationError) {
+      console.error(chalk.yellow(`   could not determine a safe mint plan: ${plan.simulationError}`));
     }
     console.error("");
     return 2;
