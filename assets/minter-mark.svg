@@ -46,14 +46,18 @@
   </g>
 
   <!-- Chain motif in the cube top face -->
-  <!-- Rounded chain links balanced above and below the M V -->
+  <!-- Longer rounded chain below the top face, within the M uprights -->
   <g fill="none" stroke="url(#mint)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round">
-    <rect x="248" y="292" width="12" height="20" rx="6"/>
-    <rect x="256" y="292" width="12" height="20" rx="6"/>
-    <rect x="248" y="306" width="12" height="20" rx="6"/>
-    <rect x="256" y="306" width="12" height="20" rx="6"/>
-    <rect x="248" y="320" width="12" height="20" rx="6"/>
-    <rect x="256" y="320" width="12" height="20" rx="6"/>
+    <rect x="248" y="250" width="12" height="18" rx="6"/>
+    <rect x="256" y="250" width="12" height="18" rx="6"/>
+    <rect x="248" y="268" width="12" height="18" rx="6"/>
+    <rect x="256" y="268" width="12" height="18" rx="6"/>
+    <rect x="248" y="286" width="12" height="18" rx="6"/>
+    <rect x="256" y="286" width="12" height="18" rx="6"/>
+    <rect x="248" y="304" width="12" height="18" rx="6"/>
+    <rect x="256" y="304" width="12" height="18" rx="6"/>
+    <rect x="248" y="322" width="12" height="18" rx="6"/>
+    <rect x="256" y="322" width="12" height="18" rx="6"/>
   </g>
 
   <g filter="url(#glow)" opacity="0.45">
