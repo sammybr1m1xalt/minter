@@ -297,7 +297,7 @@ async function main(): Promise<void> {
 
   // --snipe is the ONLY spend path in this branch. It owns wallet loading,
   // gas estimation, balance checks, id targeting and confirmation.
-  if ((args.includes("--snipe") || args.includes("--buy")) && !args.includes("--reveal-scan")) {
+  if (args.includes("--snipe") || args.includes("--buy")) {
     try {
       const code = await runSnipeCli(args.filter((a) => a !== "--snipe"));
       closePrompts();
