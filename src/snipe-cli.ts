@@ -85,6 +85,7 @@ function emptyListing(tokenId: string, error: string): ListingSummary {
   return {
     tokenId, orderHash: null, protocolAddress: null, chain: null, maker: null,
     currency: null, value: null, decimals: null, price: null, error,
+    collection: null, paymentToken: null,
   };
 }
 
@@ -291,6 +292,7 @@ export async function runSnipeCli(args: string[]): Promise<number> {
       top: o.top,
       pick: 0,
       listings: true,
+      verifyIpfs: false,
       opensea: false,
       yes: false,
       slug: o.slug,

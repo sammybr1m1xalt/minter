@@ -30,6 +30,7 @@ function parseArgs(args: string[]): {
   top: number;
   pick: number;
   listings: boolean;
+  verifyIpfs: boolean;
   yes: boolean;
   slug: string | null;
 } {
@@ -48,6 +49,7 @@ function parseArgs(args: string[]): {
   let top = 20;
   let pick = 0;
   let listings = false;
+  let verifyIpfs = false;
   let yes = false;
   let slug: string | null = null;
   for (let i = 0; i < args.length; i++) {
@@ -68,6 +70,7 @@ function parseArgs(args: string[]): {
     else if (a === "--top") top = Number(args[++i] ?? 20) || 20;
     else if (a === "--pick") pick = Number(args[++i] ?? 0) || 0;
     else if (a === "--listings") listings = true;
+    else if (a === "--verify-ipfs") verifyIpfs = true;
     else if (a === "--yes" || a === "-y") yes = true;
     else if (a === "--slug") slug = args[++i] ?? null;
     else if (a === "--help" || a === "-h") {
@@ -91,6 +94,9 @@ function parseArgs(args: string[]): {
                      rarest token (scanner -> rarity -> position -> fire)
   --listings         with --rarity, also check whether the rarest ids are listed,
                      where, and for how much
+  --verify-ipfs      with --rarity, hash direct-CID metadata bytes against the
+                     CID before scoring; mismatches are dropped, path-based
+                     documents report UNKNOWN (off by default; no extra reads)
   --slug <slug>      override the collection slug (an address can resolve to
                      several OpenSea collections; the resolver refuses to guess)
                      (--limit defaults to 100; --limit 0 scores everything)
@@ -102,7 +108,7 @@ whatever IPFS or Arweave CIDs those already point at.`);
       if (!contract) contract = a;
     }
   }
-  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, deep: !noDeep, ids, gateway, opensea, ipfsLink, rarity, limit, concurrency, top, pick, listings, yes, slug };
+  return { contract, chainKey, rpcs: rpcs.filter(Boolean), blocks, deep: !noDeep, ids, gateway, opensea, ipfsLink, rarity, limit, concurrency, top, pick, listings, verifyIpfs, yes, slug };
 }
 
 // ── OpenSea comparison (opt-in) ─────────────────────────────────────────────
@@ -244,6 +250,7 @@ function emptyListing(tokenId: string, error: string): ListingSummary {
   return {
     tokenId, orderHash: null, protocolAddress: null, chain: null, maker: null,
     currency: null, value: null, decimals: null, price: null, error,
+    collection: null, paymentToken: null,
   };
 }
 
@@ -306,6 +313,7 @@ export async function runRarity(o: {
   top: number;
   pick: number;
   listings: boolean;
+  verifyIpfs: boolean;
   opensea: boolean;
   yes: boolean;
   slug: string | null;
@@ -451,6 +459,7 @@ export async function runRarity(o: {
           ? [dir.gateway, ...DEFAULT_GATEWAYS.filter((g) => g !== dir.gateway)]
           : undefined,
       requestTimeoutMs: 8_000,
+      verifyIpfs: o.verifyIpfs,
       concurrency: o.concurrency,
       limit: o.limit ?? 100,
       timeoutMs: 600_000,
@@ -502,6 +511,13 @@ export async function runRarity(o: {
     // still reported — from the cache — but coverage is unknown, not zero.
     console.log(
       `  scored:    ${report.scored} from cache in ${(crawl.elapsedMs / 1000).toFixed(1)}s (directory index unavailable — coverage unknown)`
+    );
+  }
+  if (o.verifyIpfs) {
+    console.log(
+      chalk.gray(
+        `  cid check: ${crawl.cidVerified} verified, ${crawl.cidMismatched} mismatch(es) dropped, ${crawl.cidUnknown} unknown`
+      )
     );
   }
   if (crawl.failed > 0) console.log(chalk.yellow(`  failed:    ${crawl.failed} entries could not be read`));
@@ -660,6 +676,7 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
       top: parsed.top,
       pick: parsed.pick,
       listings: parsed.listings,
+      verifyIpfs: parsed.verifyIpfs,
       opensea: parsed.opensea,
       yes: parsed.yes,
       slug: parsed.slug,

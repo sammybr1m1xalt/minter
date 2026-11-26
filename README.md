@@ -1047,10 +1047,13 @@ orders are re-read, then bought in ONE transaction via
 `POST /api/v2/listings/cross_chain_fulfillment_data` with the exact listing
 hashes and same-chain native payment. Verified live with two orders: one tx to
 Seaport using `fulfillAvailableAdvancedOrders` (`0x87201b41`). A response with
-more than one transaction is refused rather than half-broadcast; ERC20 payment
-and cross-chain swaps need extra approval/swap steps and are not sent here.
+more than one transaction is refused rather than half-broadcast; cross-chain
+swaps need extra steps and are not sent here.
 `fulfillAvailableAdvancedOrders` may skip unavailable orders (`maximumFulfilled`),
-so the receipt must be checked to see how many actually filled.
+so the receipt must be checked to see how many actually filled. The spend
+path now waits for a bounded receipt and reads ERC-721/ERC-1155 transfer logs
+to the buyer; a mined transaction missing one of the chosen ids is reported as
+`fulfillment failed`, never as a clean success. A timeout stays `timeout`.
 
 Both snipe forms load the wallet exactly as the wizard does, re-read the
 token's listing, walk RPC endpoints until one answers with the right chain id,
@@ -1072,6 +1075,12 @@ another holds eleven thousand. Rarity then uses that answering gateway first
 with short per-request deadlines. Measured on `official-rebelkin`: a cold run
 dropped from roughly ten minutes to under a minute. A directory listing smaller
 than `totalSupply` is reported as PARTIAL, not as proof of the full mapping.
+
+`--verify-ipfs` hashes direct-CID metadata bytes against the CID from the
+contract before scoring; mismatches are dropped and counted. A path-based
+`/ipfs/<directory>/<id>` URL does not expose the child CID, so those documents
+report `UNKNOWN` rather than a false mismatch. The flag is off by default and
+adds no requests to a normal scan.
 
 Before gas estimation, the vended buy transaction is checked for null/invalid
 addresses and bytes32 fields. A null tuple field now names itself instead of
@@ -1099,9 +1108,14 @@ address and reverts. The real send already used the wallet, so the estimate now
 passes the buyer address explicitly. Verified on a live advanced order: the
 same calldata estimated at 205787 gas with `from` and reverted without it.
 
-- Only native-priced listings are sent. An ERC20-priced listing returns value
-  `"0"` and pulls payment with `transferFrom`, so it needs a spender approval
-  first — that is reported, not guessed.
+- ERC20-priced listings are supported for single-token snipes. Live probing on
+  `netnet-gear` (USDG) showed `value: "0"` with the payment token at
+  `protocol_data.parameters.consideration[].token` (`itemType: 1`);
+  `price.current` carries no address. The tool approves the exact base-unit
+  amount to the spender derived from the vended `fulfillerConduitKey` — through
+  `ConduitController.getConduit` for a non-zero key, or Seaport itself for a
+  zero key — then sends the fill with zero native value. Batch ERC20 payment is
+  refused until that endpoint shape is verified.
 - `calldata_suffix` is **not** the selector: it is the first four bytes of
   `keccak256("api.opensea.io")` (verified: `0xcdb44011`), appended as trailing
   calldata so the fill is attributed to OpenSea. Seaport reads arguments by
