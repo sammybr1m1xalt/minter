@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/minter-logo.svg" alt="Minter — on-chain mint automation" width="640">
+</p>
+
 # NFT Sniper
 
 A command-line tool for sniping NFT mints. It targets OpenSea's SeaDrop across
