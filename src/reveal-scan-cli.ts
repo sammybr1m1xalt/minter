@@ -79,7 +79,9 @@ function parseArgs(args: string[]): {
   --no-deep          disable ABI getters / address hops / event decoding
   --ids 1,2,3        token ids to sample (default 1..5)
   --gateway <url>    pin a single IPFS gateway
-  --opensea          also ask OpenSea's public token endpoint and compare
+  --opensea          with --rarity: list prices for the rarest ids from ONE
+                     collection page (no per-token OpenSea calls); without
+                     --rarity: compare OpenSea metadata with the chain
   --ipfs <link>      view an ipfs:// link, a CID, or a gateway URL (no contract)
   --rarity           score the mapping: trait rarities + the rarest token ids
   --limit <n>        with --rarity, stop after n tokens
@@ -304,6 +306,7 @@ export async function runRarity(o: {
   top: number;
   pick: number;
   listings: boolean;
+  opensea: boolean;
   yes: boolean;
   slug: string | null;
   contract: string | null;
@@ -380,7 +383,7 @@ export async function runRarity(o: {
   }
 
   // Listing prices belong IN the rarity table, not in a detached second list.
-  if (o.listings && o.contract) {
+  if ((o.listings || o.opensea) && o.contract) {
     const key = (await getValidApiKey({ timeoutMs: 8000 }).catch(() => null))?.api_key ?? "";
     if (!key) {
       console.log(chalk.yellow("\n  Listings: no usable OpenSea key — prices stay unknown."));
@@ -409,7 +412,11 @@ export async function runRarity(o: {
   // Listed ids are crawled in the SAME pass as the rarity sample: a second
   // crawl re-walks providers and re-detects tokenURI, costing more than the
   // extra reads themselves.
-  const listedIds = [...listingByToken.values()]
+  // Only --listings adds listed ids to the metadata crawl. --opensea alone
+  // joins the rarity rows it already has against the one listing page; adding
+  // 50 extra metadata fetches there was the measured 9s regression.
+  const listedIds = o.listings ? [...listingByToken.values()] : [];
+  const extraListedIds = listedIds
     .filter((l) => !l.error && Number.isFinite(Number(l.tokenId)))
     .map((l) => Number(l.tokenId))
     .filter((id, i, all) => all.indexOf(id) === i)
@@ -425,7 +432,7 @@ export async function runRarity(o: {
       chainId: onchain.chainId,
       totalSupply: Number(onchain.totalSupply),
       probeTokenId: onchain.sampledTokenUris.find((s) => s.uri?.startsWith("data:"))?.tokenId,
-      extraIds: listingsCtx ? listedIds : [],
+      extraIds: listingsCtx ? extraListedIds : [],
       limit: o.limit ?? 100,
       concurrency: o.concurrency,
       timeoutMs: 600_000,
@@ -571,7 +578,7 @@ export async function runRarity(o: {
     console.log(chalk.gray(`  (the mint starts at tokenId - quantity + 1, so quantity shifts the range)`));
   }
   // ── Listings (read-only; snipe lives in snipe-cli.ts) ────────────────
-  if (listingsCtx) {
+  if (listingsCtx && o.listings) {
     console.log();
     console.log(chalk.bold.white("  Listings"));
     console.log(chalk.gray(`  collection: ${listingsCtx.slug}  (prices from ${listingsCtx.source} listings)`));
@@ -579,6 +586,21 @@ export async function runRarity(o: {
     console.log();
     console.log(chalk.gray("  Only OpenSea is checked. Reservoir — the aggregator that would have"));
     console.log(chalk.gray("  covered Blur/LooksRare/X2Y2 — was sunset on 2025-10-15."));
+  }
+
+  if (o.opensea && listingsCtx) {
+    console.log();
+    console.log(chalk.bold.white("  OpenSea — listings for the rarest tokens"));
+    const topRows = report.rows.slice(0, o.top);
+    for (const row of topRows) {
+      const l = listingByToken.get(String(row.tokenId)) ?? emptyListing(String(row.tokenId), "price unknown");
+      console.log(
+        `    token ${String(row.tokenId).padStart(6)}  score ${row.score.toFixed(1).padStart(8)}  ${formatRarityListing(l)}`
+      );
+    }
+    console.log(
+      chalk.gray(`  source: one ${listingsCtx.source} listing page for ${listingsCtx.slug}; no per-token OpenSea calls`)
+    );
   }
 
   console.log();
@@ -638,6 +660,7 @@ export async function runRevealScanCli(args: string[]): Promise<number> {
       top: parsed.top,
       pick: parsed.pick,
       listings: parsed.listings,
+      opensea: parsed.opensea,
       yes: parsed.yes,
       slug: parsed.slug,
       contract: parsed.contract,
