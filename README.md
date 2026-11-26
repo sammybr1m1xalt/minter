@@ -25,7 +25,7 @@ Multi-wallet: paste as many keys as you like and they all fire in parallel.
 
 - **Node.js 18 or newer** — check with `node --version`.
 - A wallet with the native token of the chain you're minting on
-  (ETH on Ethereum/Base/Robinhood/Soneium, USDC on Arc).
+  (ETH on Ethereum/Base/Robinhood/Soneium/Ink, USDC on Arc, BNB on Longyu).
 
 ---
 
@@ -156,7 +156,7 @@ neither loses your keys nor scatters logs:
 | Step | What it wants |
 |---|---|
 | **1. Private keys** | Paste one per line, hidden as you type. Blank line to finish. Each key is confirmed back to you by its wallet address, so you can check you pasted the right one. |
-| **2. Chain** | Ethereum, Base, Robinhood Chain, Arc, or Soneium. |
+| **2. Chain** | Ethereum, Base, Robinhood Chain, Arc, Soneium, Ink or Longyu. |
 | **3. Quantity** | How many NFTs **per wallet**. Checked against the phase's real cap at step 11b. |
 | **4. NFT link** | An OpenSea / Scatter / Zora / Manifold link, a collection slug, or a raw `0x` contract address. Chain aliases work too: `0xabc… on base`, `slug on arc`, `slug eth`. A contract address or item link always works with no API key. |
 | **5. RPC** | Paste a full URL, or just your Alchemy key and it expands automatically. Blank uses `.env`, then public nodes. Every endpoint is checked for its chain ID — any on the wrong chain is dropped, not blasted at. |
@@ -198,7 +198,7 @@ neither loses your keys nor scatters logs:
 | `--when-open` | Poll the chain and fire the moment the stage opens |
 | `--max-price <price>` | Max total price in ETH, `"free"`, `"0.05/unit"`, `"0.05total"`, or `"any"` (no cap) |
 | `--wallets <spec>` | `all` \| `N` \| `1,3,4` — 1-based. An unknown spec, an out-of-range index, a duplicate or `0` is **refused** naming the problem, not clamped or silently narrowed. Indices are applied in wallet order however you type them |
-| `--chain <key>` | `ethereum` \| `base` \| `robinhood` \| `arc` \| `soneium` |
+| `--chain <key>` | `ethereum` \| `base` \| `robinhood` \| `arc` \| `soneium` \| `ink` \| `longyu` |
 | `--quantity <n>` | NFTs per wallet (default 1) |
 | `--doctor` | Health report: config, wallets, key pool, sessions, RPC per chain (read-only, exits 1 on a blocker) |
 | `--logger [file]` | Read a run log as a digest — newest, a file, or `-` for stdin |
@@ -295,6 +295,12 @@ is exercised against a scripted chain and API.
 | Robinhood Chain | 4663 | ETH | robinhoodchain.blockscout.com |
 | Arc | 5042 | USDC | explorer.arc.io |
 | Soneium | 1868 | ETH | soneium.blockscout.com |
+| Ink | 57073 | ETH | explorer.inkonchain.com |
+| Longyu | 668800 | BNB | explorer.longyu.network |
+
+Longyu was verified live (`eth_chainId` = `0xa3480`, explorer HTTP 200). OpenSea's
+live `/api/v2/chains` does not list it, so OpenSea stage/payload flows are NOT
+available there; RPC, explorer links and generic contract probing are.
 
 ---
 
