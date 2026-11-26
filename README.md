@@ -996,8 +996,15 @@ Rarity is a property of the metadata, not a market value.
 ### Listings (`--listings`, `--snipe`, `--buy`)
 
     minter --reveal-scan <contract> --rarity --slug <slug> --listings
-    minter --reveal-scan <contract> --rarity --slug <slug> --snipe [--yes]
-    minter --reveal-scan <contract> --rarity --slug <slug> --buy <tokenId> [--yes]
+    minter --reveal-scan <contract> --rarity --slug <slug> --snipe --token-id N [--yes]
+    minter --snipe [contract|ipfs-link] [--token-id N] [--slug S] [--yes]
+
+`--buy <tokenId>` is an alias for `--snipe --token-id <tokenId>`. Both forms
+route to `src/snipe-cli.ts`, which owns every money-moving step. With a token
+id it scrapes metadata and the listing for that id ALONE and does not build a
+rarity table; with no id it runs the read-only rarity report first and asks
+which reported+listed id to buy. Rarity percentile is `UNKNOWN` in the
+targeted form — one token cannot establish trait frequencies.
 
 Once the table knows which ids are rare, `--listings` asks whether they are
 already listed, and for how much. The price is printed **in the rarity row**,
@@ -1024,18 +1031,13 @@ to its price instead of a bare "listed" line with no context. A `rare + listed`
 table collects those rows. No OpenSea key means prices stay unknown — never
 "not listed".
 
-`--snipe` is now a standalone command, not a modifier on `--reveal-scan`:
-
-    minter --snipe [contract|ipfs-link] [--token-id N] [--slug S] [--yes]
-
-It runs the rarity report read-only, asks which REPORTED and LISTED id to buy
-(or takes `--token-id N` headlessly), loads the wallet exactly as the wizard
-does, re-reads that token's listing, walks RPC endpoints until one answers
-with the right chain id, estimates gas with the buyer as `from`, checks that
-the wallet can cover price + gas, and only then asks for confirmation.
-`--reveal-scan --rarity --listings` never loads a wallet, estimates gas or
-sends anything — it only reports prices. Only ids present in the reported
-rarity table and actually listed on OpenSea can be chosen.
+Both snipe forms load the wallet exactly as the wizard does, re-read the
+token's listing, walk RPC endpoints until one answers with the right chain id,
+estimate gas with the buyer as `from`, check that the wallet covers price +
+gas, fetch the Seaport buy payload, and only then ask for confirmation. No
+wallet is loaded for a plain `--reveal-scan --rarity --listings` run — that
+path only reports prices. Only ids actually listed on OpenSea can be bought;
+in the picker form they must also be present in the reported rarity table.
 
 The independent reads in the reveal scan (baseURI, uri, contractURI,
 totalSupply and the tokenURI sample), the CID inspections, the ABI getter
